@@ -25,6 +25,40 @@ builder.UseWolverine(opts =>
     opts.Durability.HealthCheckPollingTime = TimeSpan.FromSeconds(2);
     opts.Durability.CheckAssignmentPeriod = TimeSpan.FromSeconds(5);
 
+    // The GH-3987/GH-3959 proposal settings only exist on the patched build
+    // (6.33.0-proposal.*). Set them reflectively from env vars so this same
+    // program runs unchanged against released 5.39, stock main, and the
+    // proposal build -- on builds without the property the knob is just
+    // reported as unavailable.
+    void trySet(string property, object value)
+    {
+        var prop = opts.Durability.GetType().GetProperty(property);
+        if (prop?.CanWrite == true)
+        {
+            prop.SetValue(opts.Durability, value);
+            Console.WriteLine($"CONFIG {property}={value}");
+        }
+        else
+        {
+            Console.WriteLine($"CONFIG {property} not available on this Wolverine build");
+        }
+    }
+
+    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STABILITY_WINDOW_SECONDS"), out var window) && window > 0)
+    {
+        trySet("AssignmentStabilityWindow", TimeSpan.FromSeconds(window));
+    }
+
+    if (Environment.GetEnvironmentVariable("SIM_CAPACITY_AWARE") == "true")
+    {
+        trySet("CapacityAwareAssignment", true);
+
+        if (double.TryParse(Environment.GetEnvironmentVariable("SIM_OVERLOAD_THRESHOLD"), out var threshold) && threshold > 0)
+        {
+            trySet("NodeOverloadThreshold", threshold);
+        }
+    }
+
     opts.Services.AddSingleton<IAgentFamily, SimAgentFamily>();
 });
 

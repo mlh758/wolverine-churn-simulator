@@ -54,7 +54,7 @@ No local .NET SDK is needed — the app builds inside the
 
 > ⚠️ **kubectl context**: every script pins `--context=minikube` explicitly.
 > Do not run bare `kubectl apply` from this repo — if your default kubeconfig
-> context points at a real cluster (e.g. a production GKE context), that is
+> context points at a real cluster), that is
 > where the manifests would land. Keep the pin if you edit the scripts.
 
 ## Running the baseline (reproduce GH-3987)
