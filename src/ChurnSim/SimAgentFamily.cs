@@ -106,6 +106,16 @@ public class SimAgent : IAgent
     {
         _ballast = null;
         Status = AgentStatus.Stopped;
+
+        if (_agentMb > 0)
+        {
+            // A real projection agent's buffers leave the process when it stops. Model that:
+            // aggressively compact and return the freed ballast to the OS so the node's resident
+            // set (what the capacity monitor measures) tracks the live agent population in both
+            // directions. Without this the GC retains the segments and RSS never falls.
+            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        }
+
         _logger.LogInformation("AGENT-STOP {AgentUri} at {Timestamp:O}", Uri, DateTimeOffset.UtcNow);
         return Task.CompletedTask;
     }
