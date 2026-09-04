@@ -158,6 +158,27 @@ containerd), 3 replicas, `maxSurge: 1` / `maxUnavailable: 0`,
 | 2 | 200 | 250 ms | 433 | 2.17× | ~1 min | none observed |
 | 3 | 500 | 500 ms | 2,821 | 5.6× | 4–5 min | 6 duplicated agents, minutes of missing/unassigned agents |
 
+## Phase 2 results — locally built Wolverine 6.33 (main) variants
+
+Same cluster, same 500-agents/500 ms rollout shape as run 3. Builds packed
+into `localfeed/` from two worktrees: `6.33.0-stock.1` (pristine
+`origin/main`) and `6.33.0-proposal.1` (the GH-3987/GH-3959 implementation).
+
+### Run A — stock main (6.33.0-stock.1), churn shape
+
+- **501 `AssignmentChanged` / 501 `AgentStarted` for 500 agents — 1.0×,
+  the theoretical minimum.** Churn settled within ~2 minutes, assignments
+  167/168/167, and the per-pod log cross-reference found **zero duplicated
+  and zero missing agents**.
+- Honest headline: **main has already fixed the GH-3987 churn amplification
+  for this scenario** — the pending-assignment ledger (GH-3698), command
+  batching (GH-3604/D3, GH-3749), and duplicate healer (GH-2602) landed
+  after 5.39 and account for the 5.6× → 1.0× drop. What main does *not*
+  address: divergence shapes outside this run's reach (raced deaths
+  mid-evaluation, leader handover mid-deploy — see the formal model's
+  counterexamples) and the GH-3959 overload cascade, which is where the
+  proposal's remaining value lies.
+
 ## Phase 2 (planned)
 
 Rebuild the image against a locally patched Wolverine implementing the
