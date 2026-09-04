@@ -14,6 +14,9 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.0" />
     <PackageReference Include="WolverineFx.Postgresql" Version="$(WolverineVersion)" />
+    <!-- 6.x core no longer ships the Roslyn runtime compiler (GH-2876) -->
+    <PackageReference Include="WolverineFx.RuntimeCompilation" Version="$(WolverineVersion)"
+                      Condition="$(WolverineVersion.StartsWith('6'))" />
   </ItemGroup>
 
 </Project>
