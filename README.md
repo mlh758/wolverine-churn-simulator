@@ -115,7 +115,21 @@ containerd), 3 replicas, `maxSurge: 1` / `maxUnavailable: 0`,
 
 ### Run 2 — 200 agents, 250 ms start delay each
 
-- *(see below — filled in from the measurement run)*
+- One rolling deploy (~75 s): **433 `AssignmentChanged`** rows against a
+  theoretical minimum of ~200 — **2.17× amplification** (vs 1.1× in run 1).
+- `AssignmentChanged` (433) was more than double `AgentStarted` (201): the
+  leader kept reassigning agents whose previous moves hadn't landed yet — the
+  assignment ledger churning ahead of reality, which is the GH-3987 signature.
+- Churn continued past the rollout: 50 / 359 / 24 rows across the three
+  minutes spanning the deploy — the trailing 24 are post-deploy rebalance
+  flapping after the topology had stopped changing.
+- The cluster settled healthy (67/67/66 running, matching
+  `wolverine_node_assignments`), so the "assigned but not running" wedge —
+  a race, not a certainty — did not fire in this run.
+
+### Run 3 — 500 agents, 500 ms start delay each
+
+- *(filled in from the measurement run)*
 
 ## Phase 2 (planned)
 
