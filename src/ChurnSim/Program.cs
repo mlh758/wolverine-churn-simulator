@@ -44,6 +44,11 @@ builder.UseWolverine(opts =>
         }
     }
 
+    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_BATCH_SIZE"), out var batch) && batch > 0)
+    {
+        trySet("AgentStartBatchSize", batch);
+    }
+
     if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STABILITY_WINDOW_SECONDS"), out var window) && window > 0)
     {
         trySet("AssignmentStabilityWindow", TimeSpan.FromSeconds(window));
