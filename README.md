@@ -129,7 +129,34 @@ containerd), 3 replicas, `maxSurge: 1` / `maxUnavailable: 0`,
 
 ### Run 3 — 500 agents, 500 ms start delay each
 
-- *(filled in from the measurement run)*
+- One rolling deploy: **2,821 `AssignmentChanged`** rows (final, after
+  convergence) against a minimum of ~500 — **5.6× amplification**. The curve
+  across runs is super-linear: 1.1× → 2.17× → 5.6× as agent count and start
+  latency grow. Extrapolated to the issue reporter's scale (hundreds of
+  projection agents with multi-second catch-up starts), the reported 24k rows
+  for one 3-pod rollout is consistent.
+- **Degraded window**: 3 minutes after the rollout finished, only ~373 of 500
+  agents were running, the distribution was badly skewed (167/168/40), and
+  ~125 agents had *no assignment row at all*, with churn still flowing at
+  ~500 rows/minute. Convergence to 167/168/167 took **4–5 minutes** after the
+  deploy ended.
+- **Duplicate agents (permanent until the next reshuffle)**: after
+  convergence, cross-referencing per-pod `AGENT-START`/`AGENT-STOP` logs
+  showed **6 agents concurrently running on two pods**
+  (`sim://agent477..480`, `497`, `498`) — the stop for the old copy never
+  landed, the assignment table claims a single owner, and nothing in 5.39
+  ever notices. This is the "assignment table diverges from reality"
+  failure GH-3987 describes (and the duplicate-agent shape of GH-2602);
+  detection requires the node-side assigned-vs-running reconciliation the
+  proposal adds.
+
+### Summary
+
+| run | agents | start delay | AssignmentChanged | amplification | settle after deploy | divergence |
+|---|---|---|---|---|---|---|
+| 1 | 20 | 0 | 22 | 1.1× | immediate | none |
+| 2 | 200 | 250 ms | 433 | 2.17× | ~1 min | none observed |
+| 3 | 500 | 500 ms | 2,821 | 5.6× | 4–5 min | 6 duplicated agents, minutes of missing/unassigned agents |
 
 ## Phase 2 (planned)
 
