@@ -47,5 +47,6 @@ spec:
               memory: 128Mi
             limits:
               # The overload runs' kill line: .NET's default GC heap hard limit is
-              # 75% of this, so ~288Mi of ballast is the practical ceiling per pod
-              memory: 384Mi
+              # 75% of this (384Mi), which is what the default load monitor measures
+              # WorkingSet against — so ~380Mi resident is where allocations fail
+              memory: 512Mi
