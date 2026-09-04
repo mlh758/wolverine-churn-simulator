@@ -192,6 +192,27 @@ into `localfeed/` from two worktrees: `6.33.0-stock.1` (pristine
   roster settled, none of those moves were needed at all.
 - No evenness cost: final distribution 167/168/167, identical to stock.
 
+### Run C1 — stock main, overload shape (GH-3959)
+
+Config: 60 agents × 10 MB resident ballast each, 384 Mi pod memory limit
+(.NET's GC heap hard limit ≈ 288 Mi), paced starts (500 ms, batch 5). After a
+90 s healthy settle at 3 replicas (20 agents ≈ 200 MB each), one node is
+killed (`scale --replicas=2`), so the survivors' fair share (30 × 10 MB +
+runtime) no longer fits.
+
+- Result over the next 6 minutes: **no convergence, ever.** Only 55 of 60
+  agents running; the other 5 cycled through failed starts
+  (`OutOfMemoryException` allocating ballast in `StartAsync`), exhausted
+  their local budgets, and were **released 143 times** as the two survivors
+  ping-ponged agents neither could hold. `AssignmentChanged` flowed at a
+  sustained **~90 rows/minute** with no end in sight — GH-3959's
+  control-plane flood.
+- Caveat for honesty: the sim allocates ballast *inside* `StartAsync`, which
+  Wolverine catches — so the failure expressed as a release/reassign thrash
+  loop rather than pod death. Real projection agents allocate after startup,
+  where the same arithmetic ends in the cgroup OOM killer and the incident's
+  cascading pod deaths.
+
 ## Phase 2 (planned)
 
 Rebuild the image against a locally patched Wolverine implementing the
