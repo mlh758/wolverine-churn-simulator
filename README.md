@@ -97,11 +97,25 @@ minutes, and measure again — a healthy cluster should write ~zero
 
 ## Results
 
-*(filled in as runs complete)*
+All runs on stock WolverineFx 5.39.0, minikube v1.39.0 (rootless podman,
+containerd), 3 replicas, `maxSurge: 1` / `maxUnavailable: 0`,
+`minReadySeconds: 15`.
 
-### Baseline: stock Wolverine 5.39.0, one rolling deploy
+### Run 1 — 20 agents, instant starts
 
-- TBD
+- Steady state (2 min window): **0** `AssignmentChanged` rows — no churn at rest.
+- One rolling deploy (~90 s, all 3 pods replaced):
+  **22 `AssignmentChanged`, 22 `AgentStarted`, 5 `AgentStopped`** against a
+  theoretical minimum of 20 (every agent must restart somewhere when all pods
+  are replaced). Assignments settled 7/8/7 and matched what pods actually ran.
+- Conclusion: with few agents that start instantly, 5.39's assignment plane is
+  near-optimal. The GH-3987 pathology needs the ingredients the reporter had:
+  **many agents** and **slow agent starts** (projections catching up), which
+  stretch the overlap windows across many evaluation cycles.
+
+### Run 2 — 200 agents, 250 ms start delay each
+
+- *(see below — filled in from the measurement run)*
 
 ## Phase 2 (planned)
 

@@ -32,9 +32,11 @@ spec:
             - name: POSTGRES_CONNECTION
               value: "Host=pg;Database=churnsim;Username=postgres;Password=postgres"
             - name: SIM_AGENT_COUNT
-              value: "20"
+              value: "200"
             - name: SIM_AGENT_MB
               value: "0"
+            - name: SIM_START_DELAY_MS
+              value: "250"
             # ROLLOUT_STAMP is bumped by scripts/rollout.sh to force a new
             # pod template hash => a genuine rolling deploy with no code change
             - name: ROLLOUT_STAMP

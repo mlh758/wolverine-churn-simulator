@@ -17,6 +17,7 @@ public class SimAgentFamily : IStaticAgentFamily
     private readonly ILogger<SimAgentFamily> _logger;
     private readonly int _count;
     private readonly int _agentMb;
+    private readonly int _startDelay;
 
     public SimAgentFamily(ILogger<SimAgentFamily> logger)
     {
@@ -26,6 +27,11 @@ public class SimAgentFamily : IStaticAgentFamily
         // Optional per-agent memory weight (MB) so overload scenarios (GH-3959)
         // can be simulated later by giving each running agent a real footprint
         _agentMb = int.TryParse(Environment.GetEnvironmentVariable("SIM_AGENT_MB"), out var mb) ? mb : 0;
+
+        // Optional startup delay per agent, mimicking projection agents that need
+        // to catch up before they're "running" -- the slow starts that stretch
+        // GH-3987's rollout overlap windows
+        _startDelay = int.TryParse(Environment.GetEnvironmentVariable("SIM_START_DELAY_MS"), out var d) ? d : 0;
     }
 
     public string Scheme => SchemeName;
@@ -37,7 +43,7 @@ public class SimAgentFamily : IStaticAgentFamily
 
     public ValueTask<IAgent> BuildAgentAsync(Uri uri, IWolverineRuntime wolverineRuntime)
     {
-        return new ValueTask<IAgent>(new SimAgent(uri, _logger, _agentMb));
+        return new ValueTask<IAgent>(new SimAgent(uri, _logger, _agentMb, _startDelay));
     }
 
     public ValueTask<IReadOnlyList<Uri>> SupportedAgentsAsync()
@@ -61,20 +67,27 @@ public class SimAgent : IAgent
 {
     private readonly ILogger _logger;
     private readonly int _agentMb;
+    private readonly int _startDelayMs;
     private byte[]? _ballast;
 
-    public SimAgent(Uri uri, ILogger logger, int agentMb)
+    public SimAgent(Uri uri, ILogger logger, int agentMb, int startDelayMs)
     {
         Uri = uri;
         _logger = logger;
         _agentMb = agentMb;
+        _startDelayMs = startDelayMs;
     }
 
     public Uri Uri { get; }
     public AgentStatus Status { get; private set; } = AgentStatus.Stopped;
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
+        if (_startDelayMs > 0)
+        {
+            await Task.Delay(_startDelayMs, cancellationToken);
+        }
+
         if (_agentMb > 0)
         {
             _ballast = new byte[_agentMb * 1024 * 1024];
@@ -87,7 +100,6 @@ public class SimAgent : IAgent
 
         Status = AgentStatus.Running;
         _logger.LogInformation("AGENT-START {AgentUri} at {Timestamp:O}", Uri, DateTimeOffset.UtcNow);
-        return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
