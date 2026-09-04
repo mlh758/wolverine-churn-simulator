@@ -267,6 +267,28 @@ Same config as C1′ plus `SIM_CAPACITY_AWARE=true`, `SIM_OVERLOAD_THRESHOLD=85`
   (unassigned agents, visible in `wolverine_node_assignments`) instead of
   expressed as a dying cluster.
 
+### Run D — recovery: scale the collapsed cluster back out (1→3)
+
+The missing half of C2″: does the waiting state *recover*? Starting from the
+capacity-limited single node (20 of 60 running, 40 waiting), scale back to 3
+replicas:
+
+- **Placement was immediate**: within the first evaluation cycle after the
+  new nodes joined, assignment rows went 22 → 61 — 43 of the run's 50
+  `AssignmentChanged` rows landed in the first minute, 7 in the second,
+  zero after. Urgent placement of waiting agents is never gated.
+- **Final state**: 59 of 60 agents running at 19/19/21, node loads
+  79.5/82.5/84.4%, stable for the rest of the window. The old survivor kept
+  its agents (10 stops total — modest post-stability rebalancing, not a
+  reshuffle).
+- **The 60th agent stayed waiting — correctly.** All three nodes sit inside
+  the 75–85 hold band, so placing it would push someone to the shed line.
+  That is the design being honest that this fleet is provisioned at its
+  edge: the remedy is capacity or a higher threshold, not churn. (It is the
+  model's "an agent waits unassigned *only* when no live node has headroom"
+  property, with the implementation's definition of headroom being the
+  receive line.)
+
 ### Overload comparison
 
 | | stock main | proposal (capacity-aware) |
