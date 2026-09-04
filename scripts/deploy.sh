@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.local/bin:$PATH"
-KUBECTL="minikube kubectl --"
+KUBECTL="minikube kubectl -- --context=minikube"
 
 echo "== Building image =="
 podman build -t localhost/churnsim:local .

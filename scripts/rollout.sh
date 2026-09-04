@@ -4,7 +4,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
-KUBECTL="minikube kubectl --"
+KUBECTL="minikube kubectl -- --context=minikube"
 
 STAMP="${1:-$(date +%s)}"
 echo "== Rolling deploy with stamp $STAMP =="
