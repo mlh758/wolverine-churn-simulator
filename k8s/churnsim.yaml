@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: churnsim
+spec:
+  replicas: 3
+  # Typical production rolling-deploy shape: surge one pod at a time,
+  # never dip below the desired replica count. minReadySeconds paces the
+  # rollout the way a real readiness gate would, so old pods drain while
+  # new pods have already joined the Wolverine cluster -- the exact
+  # overlap window GH-3987 describes.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 15
+  selector:
+    matchLabels:
+      app: churnsim
+  template:
+    metadata:
+      labels:
+        app: churnsim
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: churnsim
+          image: localhost/churnsim:local
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_CONNECTION
+              value: "Host=pg;Database=churnsim;Username=postgres;Password=postgres"
+            - name: SIM_AGENT_COUNT
+              value: "20"
+            - name: SIM_AGENT_MB
+              value: "0"
+            # ROLLOUT_STAMP is bumped by scripts/rollout.sh to force a new
+            # pod template hash => a genuine rolling deploy with no code change
+            - name: ROLLOUT_STAMP
+              value: "initial"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
