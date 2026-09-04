@@ -213,6 +213,41 @@ runtime) no longer fits.
   where the same arithmetic ends in the cgroup OOM killer and the incident's
   cascading pod deaths.
 
+### Run C1′ — stock main, 3→1 collapse (GH-3959 shape, final form)
+
+Config: 60 agents × 10 MB, 512 Mi limit (GC budget 384 Mi — a single node can
+hold roughly 28 agents before managed allocations fail), paced starts. From a
+healthy 3-node steady state, scale straight to **one** replica — the
+incident's cascading-loss endgame.
+
+- The survivor accepted assignments for everything, ran out of memory
+  starting them (`System.OutOfMemoryException` in the logs), and the leader
+  kept re-deciding: **~125 `AssignmentChanged` rows per minute, sustained,
+  with no convergence for the full 5-minute observation** (655 rows total,
+  zero recorded successful starts after the collapse). 39 of 60 agents held
+  assignment rows; the process survived only because the sim's allocation
+  failure is catchable — with post-start allocation the same arithmetic is
+  the OOM killer and the full cascade.
+
+### Run C2′ — first capacity-aware attempt: two monitor lessons (kept for honesty)
+
+The first two capacity-aware runs failed informatively, both in the *load
+monitor*, and both fixes are part of the proposal now:
+
+1. `GC.GetGCMemoryInfo().MemoryLoadBytes / TotalAvailableMemoryBytes` reads
+   **&gt;100% on a healthy node inside a cgroup** (page cache is counted;
+   `TotalAvailableMemoryBytes` is the GC budget = 75% of the limit, verified
+   empirically) and barely falls when agents stop — every node advertised
+   ~112% forever and the leader shed healthy nodes to zero. The monitor now
+   measures `Environment.WorkingSet / TotalAvailableMemoryBytes`.
+2. Even then, a saturated node **latched** overloaded: freed ballast stays in
+   the GC's retained segments, so RSS doesn't fall on shed. Two-sided fix:
+   the sim agent now returns memory to the OS on stop (as a real projection
+   agent's buffers would), and Wolverine gained a **10-point hysteresis
+   band** — a node stops *receiving* placements at `threshold − 10` and
+   starts *shedding* at `threshold`, so the two passes can't oscillate
+   around one line (observed: assignment rows flapping 18→29→39→10→22/min).
+
 ## Phase 2 (planned)
 
 Rebuild the image against a locally patched Wolverine implementing the
