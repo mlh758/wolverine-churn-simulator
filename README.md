@@ -179,6 +179,19 @@ into `localfeed/` from two worktrees: `6.33.0-stock.1` (pristine
   counterexamples) and the GH-3959 overload cascade, which is where the
   proposal's remaining value lies.
 
+### Run B — proposal (6.33.0-proposal.1), churn shape, `AssignmentStabilityWindow=15s`
+
+- **501 `AssignmentChanged` / 501 `AgentStarted` / 0 `AgentStopped`** — every
+  agent moved exactly once, all churn inside a single minute (stock main took
+  two minutes and issued 125 explicit stop commands shuffling running agents
+  between survivors mid-rollout).
+- The gate is visible doing its job: the leader logged
+  `Deferring 84 rebalancing move(s) until the cluster topology has been
+  stable for 00:00:15` on each mid-rollout evaluation — 84 running agents it
+  would previously have shuffled on an intermediate roster — and after the
+  roster settled, none of those moves were needed at all.
+- No evenness cost: final distribution 167/168/167, identical to stock.
+
 ## Phase 2 (planned)
 
 Rebuild the image against a locally patched Wolverine implementing the
