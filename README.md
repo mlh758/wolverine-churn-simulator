@@ -276,10 +276,41 @@ Same config as C1′ plus `SIM_CAPACITY_AWARE=true`, `SIM_OVERLOAD_THRESHOLD=85`
 | Survivor state | thrash loop (failed starts, releases) | steady at ~80% load |
 | Agents | 39/60 rows, ~28 actually running, flapping | 19/60 running **stably**, 41 explicitly waiting |
 
-## Phase 2 (planned)
+## Reproducing the phase 2 runs
 
-Rebuild the image against a locally patched Wolverine implementing the
-proposal (stability-gated rebalance + node-side assigned-vs-running reconcile
-+ per-node capacity ceiling with shed), rerun the same scripts, compare the
-tables. See `formal/rolling-deploy/README.md` in the Wolverine repo for the
-verified design.
+The proposal implementation lives on the Wolverine branch
+`gh-3987-3959-assignment` (three commits off `main`): the
+`AssignmentStabilityWindow` gate, the node-side assigned-vs-running
+reconciliation sweep, and capacity-aware assignment (WorkingSet-based
+`INodeLoadMonitor`, `load_factor` heartbeat column on PostgreSQL, hysteresis
+band, shed pass, waiting state). The formally verified design it follows is
+`formal/rolling-deploy/README.md` in the Wolverine repo.
+
+`localfeed/` is gitignored; regenerate the packages from two Wolverine
+worktrees, then deploy by version:
+
+```bash
+# stock baseline from pristine main
+git -C ~/GitHub/wolverine worktree add ../wolverine-stock --detach origin/main
+for p in src/Wolverine/Wolverine.csproj \
+         src/Persistence/Wolverine.RDBMS/Wolverine.RDBMS.csproj \
+         src/Persistence/Wolverine.Postgresql/Wolverine.Postgresql.csproj \
+         src/Wolverine.RuntimeCompilation/Wolverine.RuntimeCompilation.csproj; do
+  (cd ~/GitHub/wolverine-stock && dotnet pack $p -p:Version=6.33.0-stock.1 -o ~/GitHub/wolverine-deploy-sim/localfeed)
+  (cd ~/GitHub/wolverine-proposal && dotnet pack $p -p:Version=6.33.0-proposal.3 -o ~/GitHub/wolverine-deploy-sim/localfeed)
+done
+
+./scripts/deploy.sh 6.33.0-stock.1       # or 6.33.0-proposal.3
+```
+
+Churn runs (A/B): `reset-metrics.sh` → `rollout.sh <stamp>` → settle →
+`measure.sh`; for the proposal add
+`kubectl set env deployment/churnsim SIM_STABILITY_WINDOW_SECONDS=15`.
+
+Overload runs (C1′/C2″): `kubectl set env deployment/churnsim
+SIM_AGENT_COUNT=60 SIM_AGENT_MB=10 SIM_START_DELAY_MS=500 SIM_BATCH_SIZE=5`
+(plus, for the proposal, `SIM_CAPACITY_AWARE=true SIM_OVERLOAD_THRESHOLD=85`),
+settle, `reset-metrics.sh`, then `kubectl scale deployment/churnsim
+--replicas=1` and watch `wolverine_node_records`, `wolverine_node_assignments`
+and the `load_factor` column for the observation window. Use
+`reset-schema.sh` between different Wolverine builds.
