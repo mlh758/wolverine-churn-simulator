@@ -248,6 +248,34 @@ monitor*, and both fixes are part of the proposal now:
    starts *shedding* at `threshold`, so the two passes can't oscillate
    around one line (observed: assignment rows flapping 18→29→39→10→22/min).
 
+### Run C2″ — proposal (6.33.0-proposal.3), 3→1 collapse, capacity-aware
+
+Same config as C1′ plus `SIM_CAPACITY_AWARE=true`, `SIM_OVERLOAD_THRESHOLD=85`
+(receive line 75), `AssignmentStabilityWindow=15s`.
+
+- Healthy 3-node steady state advertised **78–81%** load (arithmetic checks
+  out: ~300 MB resident / 384 MB GC budget).
+- After the 3→1 collapse the lone survivor read ~82%, inside the hold band:
+  it kept its own ~20 agents and **refused the 40 orphans**, which waited
+  unassigned. Load held 80–83% for the whole 7-minute observation.
+- **Totals: 2 `AssignmentChanged` rows in 7 minutes** (one early shed as load
+  brushed the threshold, one settle) versus stock's **655 in 5 minutes** —
+  a ~300× reduction in control-plane churn. **Zero pod restarts, zero
+  `OutOfMemoryException`**, no release ping-pong.
+- This is the model's cascade floor made empirical: one node's loss cannot
+  push the survivors past their advertised capacity; the deficit is explicit
+  (unassigned agents, visible in `wolverine_node_assignments`) instead of
+  expressed as a dying cluster.
+
+### Overload comparison
+
+| | stock main | proposal (capacity-aware) |
+|---|---|---|
+| AssignmentChanged during collapse | 655 in 5 min, sustained ~125/min, never converges | **2 in 7 min, converged** |
+| OutOfMemoryException | continuous | **none** |
+| Survivor state | thrash loop (failed starts, releases) | steady at ~80% load |
+| Agents | 39/60 rows, ~28 actually running, flapping | 19/60 running **stably**, 41 explicitly waiting |
+
 ## Phase 2 (planned)
 
 Rebuild the image against a locally patched Wolverine implementing the
