@@ -14,6 +14,17 @@ builder.UseWolverine(opts =>
 {
     opts.ServiceName = "churnsim";
 
+    // Announce who this pod is, so SafetyLab can attribute an advisory-lock holder in
+    // pg_stat_activity (which knows only a client_addr) back to a Wolverine node id. Without
+    // this the monitor can see that *a* lock is held and *a* node claims leadership, but not
+    // whether they are the same node -- which is the whole question in a split-brain.
+    // POD_NAME / POD_IP come from the downward API in k8s/churnsim.yaml.
+    Console.WriteLine(
+        $"SIM-IDENTITY nodeId={opts.UniqueNodeId} " +
+        $"podName={Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName} " +
+        $"podIp={Environment.GetEnvironmentVariable("POD_IP") ?? "unknown"} " +
+        $"at {DateTimeOffset.UtcNow:O}");
+
     // No message handlers needed -- the point is the agent assignment plane
     opts.Discovery.DisableConventionalDiscovery();
 

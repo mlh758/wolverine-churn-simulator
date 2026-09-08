@@ -2,3 +2,8 @@ bin/
 obj/
 *.tar
 localfeed/
+
+# SafetyLab captures and the locally-built checker binary
+runs/
+.tools/
+tests/fixtures/

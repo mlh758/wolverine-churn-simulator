@@ -31,6 +31,16 @@ spec:
           env:
             - name: POSTGRES_CONNECTION
               value: "Host=pg;Database=churnsim;Username=postgres;Password=postgres"
+            # Downward API: SafetyLab joins pg_stat_activity.client_addr back to a Wolverine
+            # node id through the SIM-IDENTITY line the app logs from these two values.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: SIM_AGENT_COUNT
               value: "500"
             - name: SIM_AGENT_MB

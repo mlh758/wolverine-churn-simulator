@@ -1,0 +1,18 @@
+# SafetyLab runs in-cluster so it watches Postgres over the same network the app does --
+# no port-forward tunnel whose own hiccups would show up in the history as DB outages.
+# Deliberately separate from the ChurnSim image: it takes no Wolverine dependency and must
+# not be rebuilt when the version under test changes.
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+COPY nuget.config .
+COPY localfeed ./localfeed
+COPY src/SafetyLab/SafetyLab.csproj .
+RUN dotnet restore
+COPY src/SafetyLab/ .
+RUN dotnet publish -c Release -o /app --no-restore
+
+FROM mcr.microsoft.com/dotnet/runtime:10.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "safetylab.dll"]
+CMD ["monitor"]
