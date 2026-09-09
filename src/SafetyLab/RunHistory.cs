@@ -24,10 +24,44 @@ public sealed class RunHistory
     public required IReadOnlyList<AgentEventRecord> AgentEvents { get; init; }
     public required IReadOnlyList<MarkRecord> Marks { get; init; }
 
-    public const string LeaderUri = "wolverine://leader";
-    public const long DefaultLeaderLockId = 9999999;
+    // Uri.ToString() normalises an authority-only URI with a trailing slash, so what Wolverine
+    // actually writes is "wolverine://leader/" -- and likewise "sim://agent1/". Match both forms:
+    // the first live run was checked against the unslashed literal and every leader-side check
+    // silently passed for want of a row to fail on.
+    public const string LeaderUri = "wolverine://leader/";
 
-    public long LeaderLockId => Meta?.LeaderLockId ?? DefaultLeaderLockId;
+    public static bool IsLeaderUri(string id)
+        => id == LeaderUri || id == "wolverine://leader";
+
+    /// <summary>
+    /// Wolverine's PostgreSQL leadership lock is <c>schemaName.GetDeterministicHashCode()</c>
+    /// (<c>PostgresqlNodePersistence._lockId</c>), NOT the <c>LeaderLockId = 9999999</c> constant
+    /// that sits in the same class and is unused by the leadership path. Watching 9999999 finds
+    /// nothing, and "nothing" reads as "no violation" on every leader check — which is exactly
+    /// what happened on the first live run, and exactly what the S1 sentinel exists to catch.
+    ///
+    /// JasperFx.Core's deterministic string hash, reimplemented rather than referenced so the
+    /// monitor keeps no Wolverine dependency.
+    /// </summary>
+    public static int LockIdForSchema(string schema)
+    {
+        unchecked
+        {
+            var hash1 = (5381 << 16) + 5381;
+            var hash2 = hash1;
+
+            for (var i = 0; i < schema.Length; i += 2)
+            {
+                hash1 = ((hash1 << 5) + hash1) ^ schema[i];
+                if (i == schema.Length - 1) break;
+                hash2 = ((hash2 << 5) + hash2) ^ schema[i + 1];
+            }
+
+            return hash1 + hash2 * 1566083941;
+        }
+    }
+
+    public long LeaderLockId => Meta?.LeaderLockId ?? LockIdForSchema("wolverine");
 
     public IEnumerable<Sample> Good => Samples.Where(x => x.Error is null);
 
@@ -141,12 +175,19 @@ public sealed class RunHistory
     public string? PodForNode(Guid nodeId)
         => Identities.LastOrDefault(x => x.NodeId == nodeId)?.PodName;
 
-    /// <summary>The leader lock's granted holders in a sample. More than one would be a Postgres bug.</summary>
+    /// <summary>
+    /// The leader lock's granted holders in a sample. More than one would be a Postgres bug.
+    /// <c>pg_locks.objid</c> is an unsigned <c>oid</c>, so a schema whose hash is negative appears
+    /// as the 2^32 complement — compare on the low 32 bits rather than the signed value.
+    /// </summary>
     public IEnumerable<LockRow> LeaderLockHolders(Sample sample)
-        => sample.Locks.Where(x => x.ObjId == LeaderLockId && x.Granted);
+    {
+        var wanted = (uint)LeaderLockId;
+        return sample.Locks.Where(x => (uint)x.ObjId == wanted && x.Granted);
+    }
 
     public static AssignmentRow? LeaderRow(Sample sample)
-        => sample.Assignments.FirstOrDefault(x => x.Id == LeaderUri);
+        => sample.Assignments.FirstOrDefault(x => IsLeaderUri(x.Id));
 
     public static IEnumerable<AssignmentRow> SimAssignments(Sample sample)
         => sample.Assignments.Where(x => x.Id.StartsWith("sim://", StringComparison.Ordinal));

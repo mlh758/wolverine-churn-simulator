@@ -1,0 +1,18 @@
+# Keep host build output out of the image context.
+#
+# Both Dockerfiles restore from the .csproj alone (for layer caching) and then COPY the
+# project directory over it with --no-restore to follow. If the host has ever built these
+# projects locally, that second COPY drops a host obj/project.assets.json -- full of
+# /home/<user>/.nuget paths that do not exist in the container -- on top of the container's
+# own restore, and publish fails with NETSDK1064 "package ... was not found". It looks like
+# a missing package; it is a leaked assets file.
+#
+# This became reachable the moment the repo grew a local dev shell with a .NET SDK in it.
+**/bin/
+**/obj/
+
+# Not build inputs.
+runs/
+.tools/
+tests/fixtures/
+.git/

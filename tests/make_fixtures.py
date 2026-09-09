@@ -22,8 +22,13 @@ T0 = datetime(2026, 9, 8, 12, 0, 0, tzinfo=timezone.utc)
 TICK = timedelta(seconds=1)
 DURATION = 240  # samples, i.e. four minutes
 
-LEADER_LOCK = 9999999
-LEADER_URI = "wolverine://leader"
+# The real values, confirmed against a live cluster: Wolverine locks on
+# schemaName.GetDeterministicHashCode() ("wolverine" -> 832201495), not the unused
+# LeaderLockId = 9999999 constant, and Uri.ToString() gives the leader row a trailing slash.
+# Both were wrong in the first version of these fixtures, and both wrongnesses cancelled out
+# into a green ledger -- the fixtures agreed with the checker instead of with Wolverine.
+LEADER_LOCK = 832201495
+LEADER_URI = "wolverine://leader/"
 
 NODES = [
     # (pod name, pod ip, node uuid, node number, backend pid)
@@ -32,7 +37,7 @@ NODES = [
     ("churnsim-c", "10.0.0.13", "33333333-3333-3333-3333-333333333333", 3, 103),
 ]
 
-AGENTS = [f"sim://agent{i}" for i in range(1, 7)]
+AGENTS = [f"sim://agent{i}/" for i in range(1, 7)]
 
 
 def iso(t):
@@ -177,16 +182,16 @@ def orphan_lock(tick, w):
 def stranded(tick, w):
     """GH-3987: the row says node C owns agent3, but pod-c never started it."""
     if tick >= 60:
-        w.running = {k: v for k, v in w.running.items() if k != "sim://agent3"}
+        w.running = {k: v for k, v in w.running.items() if k != "sim://agent3/"}
 
 
 def no_converge(tick, w):
     """Two agents are never placed after the rollout — the assignment plane gave up."""
     if tick >= 60:
         w.placement = {k: v for k, v in w.placement.items()
-                       if k not in ("sim://agent5", "sim://agent6")}
+                       if k not in ("sim://agent5/", "sim://agent6/")}
         w.running = {k: v for k, v in w.running.items()
-                     if k not in ("sim://agent5", "sim://agent6")}
+                     if k not in ("sim://agent5/", "sim://agent6/")}
 
 
 def split_leader(tick, w):
@@ -237,9 +242,9 @@ def build_dup():
 
     # pod-b starts agent1 while pod-a is still running it, and keeps it for 60s.
     pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=100)), "event": "start",
-                 "agentUri": "sim://agent1", "podName": "churnsim-b"})
+                 "agentUri": "sim://agent1/", "podName": "churnsim-b"})
     pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=160)), "event": "stop",
-                 "agentUri": "sim://agent1", "podName": "churnsim-b"})
+                 "agentUri": "sim://agent1/", "podName": "churnsim-b"})
 
     write(os.path.join(directory, "history.jsonl"), history)
     write(os.path.join(directory, "pods.jsonl"), sorted(pods, key=lambda r: r["ts"]))

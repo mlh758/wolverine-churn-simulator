@@ -3,9 +3,31 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Wolverine;
 using Wolverine.Postgresql;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Wolverine.Runtime.Agents;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+// Export Wolverine's spans to Jaeger when asked. NodeAgentController wraps every assignment
+// evaluation in a `wolverine_node_assignments` span and agent commands ride the ordinary message
+// pipeline, so a trace shows the leader's dispatch, the receiving node's execution, and the gap
+// between the two -- which is what state sampling and log scraping cannot show. Off unless
+// SIM_OTLP_ENDPOINT is set, so a default run stays comparable with earlier results.
+var otlp = Environment.GetEnvironmentVariable("SIM_OTLP_ENDPOINT");
+if (!string.IsNullOrWhiteSpace(otlp))
+{
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(r => r.AddService(
+            serviceName: "churnsim",
+            serviceInstanceId: Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName))
+        .WithTracing(t => t
+            .AddSource("Wolverine")
+            .SetSampler(new AlwaysOnSampler())
+            .AddOtlpExporter(o => o.Endpoint = new Uri(otlp)));
+
+    Console.WriteLine($"CONFIG OTLP tracing -> {otlp}");
+}
 
 var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
                        ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
@@ -60,9 +82,17 @@ builder.UseWolverine(opts =>
         trySet("AgentStartBatchSize", batch);
     }
 
+    // The "hold the rebalance until the roster stops moving" idea exists under two names: the
+    // proposal called it AssignmentStabilityWindow, and GH-4367 landed it upstream as
+    // AssignmentSettlePeriod. One env var drives whichever the build under test actually has, so
+    // the same knob compares a proposal build against upstream main.
+    //
+    // Note both default to zero -- upstream's gate is OFF out of the box, so a run without this
+    // variable is measuring stock behaviour, not GH-4367's.
     if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STABILITY_WINDOW_SECONDS"), out var window) && window > 0)
     {
         trySet("AssignmentStabilityWindow", TimeSpan.FromSeconds(window));
+        trySet("AssignmentSettlePeriod", TimeSpan.FromSeconds(window));
     }
 
     if (Environment.GetEnvironmentVariable("SIM_CAPACITY_AWARE") == "true")

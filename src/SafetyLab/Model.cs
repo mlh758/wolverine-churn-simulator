@@ -80,6 +80,17 @@ public record AgentEventRecord(DateTimeOffset Ts, string Event, string AgentUri,
     public string Kind => "agent";
 }
 
+/// <summary>
+/// A control-plane log line from a node's Wolverine.Runtime.Agents.* categories — the leader
+/// deciding placements, batches being dispatched and confirmed, leadership changing hands.
+/// Captured because the samples show the assignment table's *state* but never say why it moved,
+/// and "why did the last 29 agents take three and a half minutes" is not answerable from state.
+/// </summary>
+public record ControlEventRecord(DateTimeOffset Ts, string PodName, string Level, string Category, string Message)
+{
+    public string Kind => "control";
+}
+
 /// <summary>A phase marker written by the scripts, e.g. rollout-start / rollout-end.</summary>
 public record MarkRecord(DateTimeOffset Ts, string Label)
 {

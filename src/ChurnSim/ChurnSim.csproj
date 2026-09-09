@@ -19,4 +19,16 @@
                       Condition="$(WolverineVersion.StartsWith('6'))" />
   </ItemGroup>
 
+  <!-- OpenTelemetry, so Wolverine's own spans can be read out of Jaeger instead of inferred
+       from state samples. Only switched on when SIM_OTLP_ENDPOINT is set, so the default run
+       is unchanged and comparable to earlier results.
+
+       NU1902 advisories are accepted here deliberately: they are transitive gRPC/protobuf issues,
+       every published version of the exporter carries some, and this rig is a throwaway minikube
+       cluster with no ingress. Do not copy this reference into anything that ships. -->
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.13.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.13.1" />
+  </ItemGroup>
+
 </Project>

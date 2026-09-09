@@ -23,7 +23,12 @@ spec:
         - name: safetylab
           image: localhost/safetylab:local
           imagePullPolicy: Never
-          args: ["monitor", "--tick-ms", "200", "--schema", "wolverine"]
+          # 1s, not something faster. Every sample carries the whole assignment table, so at 500
+          # agents a sample is ~65 KB and a 200ms tick writes ~200 MB for a ten-minute run --
+          # with no added resolution, since the control plane itself only ticks at 2-5s and the
+          # checkers' grace windows are 15s. Drop this for small-agent-count runs where you want
+          # to catch a fast handover.
+          args: ["monitor", "--tick-ms", "1000", "--schema", "wolverine"]
           env:
             - name: POSTGRES_CONNECTION
               # Its own connection, and a small pool: the monitor must never be the reason

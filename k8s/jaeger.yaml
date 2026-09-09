@@ -1,0 +1,62 @@
+# Jaeger all-in-one, for reading Wolverine's own spans rather than inferring behaviour from
+# state samples and log lines.
+#
+# Wolverine emits a "Wolverine" ActivitySource, and NodeAgentController wraps each assignment
+# evaluation in a `wolverine_node_assignments` span. Control-plane agent commands travel as
+# ordinary Wolverine messages, so they get send/receive spans with parent linkage — which means
+# a trace shows the leader's dispatch, the receiving node's execution, and the gap between them.
+# That gap is exactly the open question the state samples cannot answer: when the last agents are
+# placed 5 at a time 40 seconds apart, is the batch acknowledgement being lost and the reply
+# window burned, or is something else pacing it?
+#
+# NodeAssignmentHealthCheckTracingEnabled defaults to true with no sampling throttle, so no
+# Wolverine configuration is needed — only an OTLP exporter on the app side.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.62.0
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+            # In-memory storage is fine and deliberate: a run is minutes long and the traces are
+            # pulled out to a run directory afterwards. Cap it so a long soak cannot balloon the
+            # pod and perturb the very cluster we are measuring.
+            - name: MEMORY_MAX_TRACES
+              value: "200000"
+          ports:
+            - containerPort: 16686   # query UI + HTTP API
+            - containerPort: 4317    # OTLP gRPC
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: query
+      port: 16686
+      targetPort: 16686
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317

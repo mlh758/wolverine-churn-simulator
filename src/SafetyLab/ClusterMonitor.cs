@@ -29,6 +29,9 @@ public sealed class ClusterMonitor
     private NpgsqlConnection? _conn;
     private long _seq;
 
+    /// <summary>Roughly once a minute at a 1s tick — cheap, and it makes any capture self-describing.</summary>
+    private const int MetaEveryNSamples = 60;
+
     public ClusterMonitor(string connectionString, string schema, long leaderLockId, TimeSpan tick, TextWriter output)
     {
         _connectionString = connectionString;
@@ -41,8 +44,9 @@ public sealed class ClusterMonitor
     public async Task RunAsync(CancellationToken token)
     {
         var serverVersion = await probeServerVersionAsync(token);
-        writeLine(new MetaRecord(DateTimeOffset.UtcNow, (int)_tick.TotalMilliseconds, _leaderLockId, _schema,
-            serverVersion));
+        var meta = new MetaRecord(DateTimeOffset.UtcNow, (int)_tick.TotalMilliseconds, _leaderLockId, _schema,
+            serverVersion);
+        writeLine(meta);
 
         // PeriodicTimer rather than a delay loop: a sample that takes 300ms must not push the
         // whole schedule out by 300ms. A tick missed because the previous one overran shows up
@@ -51,6 +55,16 @@ public sealed class ClusterMonitor
 
         while (!token.IsCancellationRequested)
         {
+            // Re-emit meta periodically. The monitor pod is long-lived and captures attach with
+            // `kubectl logs --since`, so a capture that starts mid-life would otherwise never see
+            // the one meta line written at startup -- and a history without meta loses the declared
+            // tick and lock id, which is how the first live run reported 1,900 phantom sampling
+            // gaps against an assumed default tick.
+            if (_seq % MetaEveryNSamples == 0)
+            {
+                writeLine(meta);
+            }
+
             await sampleOnceAsync(token);
 
             try

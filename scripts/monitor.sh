@@ -26,7 +26,13 @@ TOOLS=".tools/safetylab"
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
 ensure_tool() {
-    [ -x "$TOOLS/safetylab" ] && return 0
+    # Rebuild when any source is newer than the binary. A plain existence check silently ran a
+    # stale checker after every source edit -- including, once, re-reporting a run against the
+    # very bug that had just been fixed.
+    if [ -x "$TOOLS/safetylab" ] && [ -z "$(find src/SafetyLab -name '*.cs' -newer "$TOOLS/safetylab" -print -quit)" ]; then
+        return 0
+    fi
+
     command -v dotnet >/dev/null || {
         echo "no dotnet on PATH -- run this inside 'nix develop'" >&2
         exit 2
@@ -84,12 +90,19 @@ cmd_start() {
     pod=$($KUBECTL get pod -l app=safetylab -o jsonpath='{.items[0].metadata.name}')
     [ -n "$pod" ] || { echo "no safetylab pod -- run './scripts/monitor.sh deploy' first" >&2; exit 2; }
 
-    $KUBECTL logs -f --since=1s "$pod" >> "$dir/history.jsonl" 2>/dev/null &
+    # setsid + disown, not a bare `&`. These outlive `start` on purpose, and the follower loop
+    # never exits on its own -- so under any caller that waits for its children (`bash -c`, a
+    # script, CI) a bare background job makes `start` hang forever instead of returning. Detaching
+    # them into their own session also means a Ctrl-C aimed at this script cannot take the capture
+    # down mid-rollout.
+    setsid $KUBECTL logs -f --since=1s "$pod" >> "$dir/history.jsonl" 2>/dev/null &
     echo $! > "$dir/.pids/monitor"
+    disown 2>/dev/null || true
 
     # Follow churnsim pods, picking up new ones as a rollout creates them.
-    followers_loop "$dir" &
+    setsid bash "$0" __followers "$dir" >/dev/null 2>&1 &
     echo $! > "$dir/.pids/followers"
+    disown 2>/dev/null || true
 
     echo "capturing into $dir (monitor pod $pod)"
     echo "  ./scripts/monitor.sh mark <label>   to timestamp a phase"
@@ -109,8 +122,19 @@ followers_loop() {
 
             # Whole log, not --since: a pod's SIM-IDENTITY line is written at startup and the
             # identity map is what makes S3/S4/S6/S7 possible at all.
-            ( $KUBECTL logs -f "$pod" 2>/dev/null \
-                | "$TOOLS/safetylab" harvest --pod "$pod" >> "$dir/pods.$pod.jsonl" ) &
+            #
+            # Retry rather than attach once. A pod shows up in `get pods` while still
+            # ContainerCreating, and `kubectl logs -f` against it fails immediately -- so a
+            # single attempt marks the pod as followed, captures nothing, and leaves that node
+            # invisible to every pod-side check. That is not hypothetical: it produced a false
+            # S4 ("leader lock held by an address that never announced itself") on a healthy
+            # cluster, because the pod holding leadership was one the capture never attached to.
+            # Loop until the pod is actually gone.
+            ( while $KUBECTL get pod "$pod" >/dev/null 2>&1; do
+                  $KUBECTL logs -f --timestamps "$pod" 2>/dev/null \
+                      | "$TOOLS/safetylab" harvest --pod "$pod" >> "$dir/pods.$pod.jsonl"
+                  sleep 2
+              done ) &
             echo $! >> "$dir/.pids/pods"
         done
         sleep 2
@@ -133,10 +157,33 @@ cmd_stop() {
     sleep 3
 
     if [ -d "$dir/.pids" ]; then
-        while read -r pid; do kill "$pid" 2>/dev/null; done < <(cat "$dir/.pids"/* 2>/dev/null)
-        # The followers loop spawns children of its own; take the group down with it.
-        pkill -P "$(cat "$dir/.pids/followers" 2>/dev/null)" 2>/dev/null
+        # Kill process GROUPS, not pids. `start` detaches with setsid, so each recorded pid is a
+        # group leader with children (kubectl | safetylab harvest) that a plain `kill` leaves
+        # running -- and a leaked follower keeps appending the NEXT run's pods into this run's
+        # directory, which is how a finished capture silently grew for another twenty minutes and
+        # picked up a different experiment's pods.
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+        done < <(cat "$dir/.pids"/* 2>/dev/null)
+
+        sleep 1
+
+        # Anything still standing after the group kill.
+        while read -r pid; do
+            [ -n "$pid" ] || continue
+            kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+        done < <(cat "$dir/.pids"/* 2>/dev/null)
+
         rm -rf "$dir/.pids"
+    fi
+
+    # Prove it: a stop that did not stop is worse than no stop at all, because the run directory
+    # keeps changing under the checker.
+    local leaked
+    leaked=$(ps ax -o args= 2>/dev/null | grep -c "[s]afetylab harvest" || true)
+    if [ "${leaked:-0}" -gt 0 ]; then
+        echo "WARNING: $leaked harvest process(es) survived the stop; run directory may keep growing" >&2
     fi
 
     rm -f "$ACTIVE"
@@ -152,6 +199,8 @@ cmd_check() {
 }
 
 case "${1:-}" in
+    # Internal: the detached follower loop re-enters the script here.
+    __followers) shift; followers_loop "$@" ;;
     deploy) shift; cmd_deploy "$@" ;;
     start)  shift; cmd_start "$@" ;;
     mark)   shift; cmd_mark "$@" ;;

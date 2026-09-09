@@ -134,9 +134,14 @@ sleep 120                                # let it settle, so L1 has a tail to ju
 ```
 
 A run directory (`runs/<name>/`) is a durable artifact and stays checkable after the cluster
-is gone: `history.jsonl` (server-side samples at a 200ms tick), `pods.<pod>.jsonl` (node
-identities and `AGENT-START`/`AGENT-STOP` residencies), `marks.jsonl` (phase boundaries).
-`check --json` emits the same results for scripting; exit code is 1 if anything failed.
+is gone: `history.jsonl` (server-side samples), `pods.<pod>.jsonl` (node identities,
+`AGENT-START`/`AGENT-STOP` residencies, and `Wolverine.Runtime.Agents.*` control-plane log lines),
+`marks.jsonl` (phase boundaries). `check --json` emits the same results for scripting; exit code
+is 1 if anything failed.
+
+That the raw samples are kept, rather than just verdicts, is the point: when two identifier bugs
+were found in the checker itself, every affected run was simply re-checked from disk instead of
+re-run against the cluster.
 
 ### Two gotchas
 
@@ -162,6 +167,24 @@ $ nix develop --command ./tests/selftest.sh
 
 Add a checker, add a fixture and a ledger row.
 
+## Tracing (Jaeger)
+
+State samples show *what* the assignment table did; they never say *why*. Wolverine publishes a
+`Wolverine` ActivitySource and wraps every assignment evaluation in a `wolverine_node_assignments`
+span, and agent commands ride the ordinary message pipeline — so a trace shows the leader's
+dispatch, the receiving node's execution, and the gap between them. No Wolverine code or
+configuration changes are needed: health-check tracing is on by default and unthrottled.
+
+```bash
+kubectl apply -f k8s/jaeger.yaml
+kubectl set env deployment/churnsim SIM_OTLP_ENDPOINT=http://jaeger:4317
+./scripts/traces.sh 30          # span durations + percentiles for the last 30 min
+kubectl port-forward svc/jaeger 16686:16686   # then browse localhost:16686
+```
+
+ChurnSim only wires up OpenTelemetry when `SIM_OTLP_ENDPOINT` is set, so a run without it stays
+byte-for-byte comparable with earlier results.
+
 ## Knobs
 
 | Knob | Where | Default | Meaning |
@@ -172,125 +195,18 @@ Add a checker, add a fixture and a ledger row.
 | memory `limits` | `k8s/churnsim.yaml` | 512Mi | the OOM kill-line for overload scenarios |
 | `HealthCheckPollingTime` / `CheckAssignmentPeriod` | `Program.cs` | 2s / 5s | tightened from 10s/30s so a short rollout spans several control-plane cycles |
 
-## Results — 5.39, the original pathology (historical)
+## Why this exists
 
-Kept only as provenance for *why* the proposal exists; stock `main` is the
-baseline everything below compares against. All on WolverineFx 5.39.0,
-3 replicas, `maxSurge: 1` / `maxUnavailable: 0`, `minReadySeconds: 15`.
+**[docs/experiments.md](docs/experiments.md)** is the intent: what we are hunting, the experiment
+catalogue, what counts as a finding versus an artifact, and what is currently open.
+**[docs/harness-traps.md](docs/harness-traps.md)** is the list of ways this rig has produced
+confident wrong answers — read it before trusting a number.
 
-| run | agents | start delay | AssignmentChanged | amplification | settle after deploy | divergence |
-|---|---|---|---|---|---|---|
-| 1 | 20 | 0 | 22 | 1.1× | immediate | none |
-| 2 | 200 | 250 ms | 433 | 2.17× | ~1 min | none observed |
-| 3 | 500 | 500 ms | 2,821 | 5.6× | 4–5 min | 6 duplicated agents, minutes of missing/unassigned agents |
+## Results
 
-The curve is super-linear — the GH-3987 pathology needs **many agents** and
-**slow starts** (projections catching up), which stretch the overlap windows
-across many evaluation cycles. Extrapolated to the reporter's scale, their
-24k rows for one 3-pod rollout is consistent.
-
-Run 3's most useful finding was not the churn count: after convergence, a
-cross-reference of per-pod `AGENT-START`/`AGENT-STOP` logs showed **6 agents
-running concurrently on two pods** (`sim://agent477..480`, `497`, `498`). The
-stop for the old copy never landed, the assignment table claimed a single
-owner, and nothing in 5.39 ever noticed. That is the divergence SafetyLab's
-**S5** now checks for on every run instead of by hand.
-
-## Results — stock main vs the proposal
-
-Builds packed into `localfeed/` from two Wolverine worktrees:
-`6.33.0-stock.1` (pristine `origin/main`) and `6.33.0-proposal.*` (the
-GH-3987/GH-3959 implementation).
-
-### Churn shape — 500 agents, 500 ms starts, one rolling deploy
-
-| | stock main | proposal (`AssignmentStabilityWindow=15s`) |
-|---|---|---|
-| `AssignmentChanged` for 500 agents | 501 — **1.0×, the theoretical minimum** | 501 — 1.0× |
-| `AgentStarted` / `AgentStopped` | 501 / **125** | 501 / **0** |
-| Churn window | ~2 min | under 1 min |
-| Final distribution | 167/168/167 | 167/168/167 |
-| Duplicated or missing agents | none | none |
-
-**Main has already fixed the GH-3987 churn amplification for this scenario** —
-the pending-assignment ledger (GH-3698), command batching (GH-3604/D3,
-GH-3749) and the duplicate healer (GH-2602) all landed after 5.39 and account
-for the 5.6× → 1.0× drop. Say that plainly before claiming anything for the
-proposal.
-
-What the proposal adds here is the 125 → 0 stops: stock shuffles running
-agents between survivors on intermediate rosters, and the gate declines to.
-The leader logs it — `Deferring 84 rebalancing move(s) until the cluster
-topology has been stable for 00:00:15` on each mid-rollout evaluation — and
-once the roster settled, **none of those 84 moves were needed at all**. No
-evenness cost. What neither build addresses is divergence outside this run's
-reach (raced deaths mid-evaluation, leader handover mid-deploy — see the
-formal model's counterexamples).
-
-### Cascading overload (GH-3959) — 3→1 collapse, then recovery
-
-60 agents × 10 MB resident ballast, 512 Mi pod limit (GC budget 384 Mi, so one
-node holds roughly 28 agents), paced starts. From a healthy 3-node steady
-state, scale straight to **one** replica — the incident's cascading-loss
-endgame — then back out to three.
-
-**Stock main:** the survivor accepted assignments for everything, ran out of
-memory starting them (`System.OutOfMemoryException`), and the leader kept
-re-deciding: **~125 `AssignmentChanged` rows per minute, sustained, no
-convergence across the full 5-minute observation** (655 rows total, zero
-successful starts after the collapse). 39 of 60 agents held assignment rows.
-
-**Proposal** (`SIM_CAPACITY_AWARE=true`, `SIM_OVERLOAD_THRESHOLD=85`, receive
-line 75), collapse → hold → recovery in one run:
-
-- Healthy 3-node steady state advertised **78–81%** load (~300 MB resident /
-  384 MB GC budget — the arithmetic checks out).
-- After the collapse the lone survivor read ~82%, inside the hold band: it
-  kept its ~20 agents and **refused the 40 orphans**, which waited unassigned.
-  Load held 80–83% for a 7-minute observation. **Totals: 2
-  `AssignmentChanged` rows in 7 minutes** versus stock's 655 in 5 — a ~300×
-  reduction — with **zero pod restarts and zero `OutOfMemoryException`**.
-- **Recovery was immediate.** Scaling back to 3 replicas, assignment rows went
-  22 → 61 within the first evaluation cycle after the new nodes joined: 43 of
-  the run's 50 `AssignmentChanged` rows in the first minute, 7 in the second,
-  zero after. Urgent placement of waiting agents is never gated. Final state
-  59/60 running at 19/19/21, loads 79.5/82.5/84.4%, stable; the old survivor
-  kept its agents (10 stops total).
-- **The 60th agent stayed waiting — correctly.** All three nodes sit inside
-  the 75–85 hold band, so placing it would push someone to the shed line. The
-  design is being honest that this fleet is provisioned at its edge; the
-  remedy is capacity or a higher threshold, not churn.
-
-This is the model's cascade floor made empirical: one node's loss cannot push
-the survivors past their advertised capacity, and the deficit shows up as
-explicit unassigned agents rather than as a dying cluster.
-
-| | stock main | proposal (capacity-aware) |
-|---|---|---|
-| `AssignmentChanged` during collapse | 655 in 5 min, ~125/min, never converges | **2 in 7 min, converged** |
-| `OutOfMemoryException` | continuous | **none** |
-| Survivor state | thrash loop (failed starts, releases) | steady at ~80% load |
-| Agents | 39/60 rows, ~28 running, flapping | 19/60 running **stably**, 41 explicitly waiting |
-| Recovery on scale-out | not reached | 40 agents placed in one cycle, 59/60 running |
-
-### Two load-monitor lessons, kept because they cost real runs
-
-The first capacity-aware attempts failed in the *monitor*, and both fixes are
-part of the proposal:
-
-1. `GC.GetGCMemoryInfo().MemoryLoadBytes / TotalAvailableMemoryBytes` reads
-   **&gt;100% on a healthy node inside a cgroup** (page cache is counted;
-   `TotalAvailableMemoryBytes` is the GC budget = 75% of the limit, verified
-   empirically) and barely falls when agents stop — every node advertised
-   ~112% forever and the leader shed healthy nodes to zero. The monitor now
-   measures `Environment.WorkingSet / TotalAvailableMemoryBytes`.
-2. Even then a saturated node **latched** overloaded: freed ballast stays in
-   the GC's retained segments, so RSS does not fall on shed. Two-sided fix —
-   the sim agent returns memory to the OS on stop (as a real projection
-   agent's buffers would), and Wolverine gained a **10-point hysteresis
-   band**: a node stops *receiving* at `threshold − 10` and starts *shedding*
-   at `threshold`, so the two passes cannot oscillate around one line
-   (observed before the fix: assignment rows flapping 18→29→39→10→22/min).
+Measured runs live in **[RESULTS.md](RESULTS.md)**, dated newest first — 5.39's original
+pathology, stock `main` versus the proposal on churn shape, and the GH-3959 overload
+collapse-and-recovery.
 
 ## Reproducing the phase 2 runs
 

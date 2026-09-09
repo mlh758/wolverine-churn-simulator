@@ -101,7 +101,7 @@ public static class Checkers
     {
         var violations = Condense(history.Good, TimeSpan.Zero, sample =>
         {
-            var rows = sample.Assignments.Where(x => x.Id == RunHistory.LeaderUri).ToArray();
+            var rows = sample.Assignments.Where(x => RunHistory.IsLeaderUri(x.Id)).ToArray();
             return rows.Length > 1 ? $"{rows.Length} '{RunHistory.LeaderUri}' assignment rows" : null;
         });
 
@@ -463,13 +463,20 @@ public static class Checkers
             };
         }
 
-        var tick = TimeSpan.FromMilliseconds(history.Meta?.TickMs ?? 200);
+        // Prefer the monitor's declared tick, but fall back to the observed median interval
+        // rather than a guess. A capture started with `kubectl logs --since` can miss the meta
+        // line entirely, and assuming a faster tick than was really used turns every ordinary
+        // interval into a reported "blind spot" -- 1,900 false violations on the first live run.
+        var tick = history.Meta is { TickMs: > 0 } meta
+            ? TimeSpan.FromMilliseconds(meta.TickMs)
+            : ObservedTick(history.Samples);
         var threshold = tick * 3;
         var first = history.Samples[0].Ts;
         var last = history.Samples[^1].Ts;
 
         notes.Add($"{history.Samples.Count} samples over {(last - first).TotalMinutes:F1} min at a " +
-                  $"{tick.TotalMilliseconds:F0}ms tick");
+                  $"{tick.TotalMilliseconds:F0}ms tick" +
+                  (history.Meta is null ? " (inferred — no meta record in this capture)" : ""));
 
         var errors = history.Samples.Count(x => x.Error is not null);
         if (errors > 0)
@@ -505,6 +512,28 @@ public static class Checkers
 
         notes.Add($"{history.Identities.Count} node identity record(s), " +
                   $"{history.AgentEvents.Count} agent event(s), {history.Marks.Count} phase marker(s)");
+
+        // Per-pod log coverage. wolverine_nodes.description is the pod name, so the samples
+        // themselves name every pod that ever registered -- and any pod with no identity record
+        // is one the log capture never attached to. Every pod-side check (S5/S6/S7, and S4's
+        // address-to-node attribution) is blind to that pod, so this has to be a violation and
+        // not a note: an uncaptured pod once produced a false S4 on a healthy cluster.
+        var registered = history.Good
+            .SelectMany(x => x.Nodes)
+            .Select(x => x.Description)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .ToHashSet();
+
+        var captured = history.Identities.Select(x => x.PodName).ToHashSet();
+        var uncaptured = registered.Where(x => !captured.Contains(x)).OrderBy(x => x).ToArray();
+
+        if (uncaptured.Length > 0)
+        {
+            violations.Add(new Violation(first, last,
+                $"{uncaptured.Length} pod(s) registered as nodes but were never captured: " +
+                string.Join(", ", uncaptured) +
+                " — every pod-side check is blind to them"));
+        }
 
         return new CheckResult("C0", "Observation coverage", violations, notes);
     }
@@ -586,6 +615,21 @@ public static class Checkers
             start = null;
             detail = null;
         }
+    }
+
+    /// <summary>Median inter-sample interval — robust to the gaps we are trying to measure.</summary>
+    private static TimeSpan ObservedTick(IReadOnlyList<Sample> samples)
+    {
+        if (samples.Count < 3) return TimeSpan.FromMilliseconds(200);
+
+        var deltas = new List<double>(samples.Count - 1);
+        for (var i = 1; i < samples.Count; i++)
+        {
+            deltas.Add((samples[i].Ts - samples[i - 1].Ts).TotalMilliseconds);
+        }
+
+        deltas.Sort();
+        return TimeSpan.FromMilliseconds(Math.Max(1, deltas[deltas.Count / 2]));
     }
 
     private static IReadOnlyList<Violation> Order(IEnumerable<Violation> violations)
