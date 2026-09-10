@@ -1,4 +1,5 @@
 using ChurnSim;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Wolverine;
@@ -8,6 +9,52 @@ using OpenTelemetry.Trace;
 using Wolverine.Runtime.Agents;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+// Startup lines are written before a logger exists, but they must not break the log stream:
+// DuckDB reads the pod log as newline-delimited JSON, and a single bare-text line makes the whole
+// file unparseable. Emit them in the same shape the JSON console formatter uses.
+var jsonLogs = Environment.GetEnvironmentVariable("SIM_JSON_LOGS") == "true";
+void emit(string category, string message, IDictionary<string, object?> state)
+{
+    if (!jsonLogs)
+    {
+        Console.WriteLine(message);
+        return;
+    }
+
+    var payload = new Dictionary<string, object?>
+    {
+        ["Timestamp"] = DateTimeOffset.UtcNow.ToString("O"),
+        ["EventId"] = 0,
+        ["LogLevel"] = "Information",
+        ["Category"] = category,
+        ["Message"] = message,
+        ["State"] = state
+    };
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(payload));
+}
+
+// Structured stdout, so a node-level collector can ingest logs without regex and without the app
+// paying for an exporter. .NET's JSON formatter emits each message-template parameter as a named
+// field under "State", so `LogInformation("Successfully started agent {AgentUri} on node
+// {NodeNumber}", ...)` arrives queryable instead of as prose to be pattern-matched.
+//
+// Deliberately NOT in-process OTLP log export: this rig hunts races and timing cadences, and an
+// exporter's batching threads and allocations sit inside the process under measurement. Writing a
+// differently-formatted line to stdout costs the same as writing the old one.
+if (Environment.GetEnvironmentVariable("SIM_JSON_LOGS") == "true")
+{
+    builder.Logging.ClearProviders();
+    builder.Logging.AddJsonConsole(o =>
+    {
+        o.UseUtcTimestamp = true;
+        o.TimestampFormat = "O";              // without this the formatter emits no timestamp at all
+        o.IncludeScopes = false;
+        o.JsonWriterOptions = new System.Text.Json.JsonWriterOptions { Indented = false };
+    });
+    emit("ChurnSim.Startup", "CONFIG json console logging enabled",
+        new Dictionary<string, object?> { ["Setting"] = "SIM_JSON_LOGS", ["Value"] = "true" });
+}
 
 // Export Wolverine's spans to Jaeger when asked. NodeAgentController wraps every assignment
 // evaluation in a `wolverine_node_assignments` span and agent commands ride the ordinary message
@@ -26,7 +73,8 @@ if (!string.IsNullOrWhiteSpace(otlp))
             .SetSampler(new AlwaysOnSampler())
             .AddOtlpExporter(o => o.Endpoint = new Uri(otlp)));
 
-    Console.WriteLine($"CONFIG OTLP tracing -> {otlp}");
+    emit("ChurnSim.Startup", $"CONFIG OTLP tracing -> {otlp}",
+        new Dictionary<string, object?> { ["Setting"] = "SIM_OTLP_ENDPOINT", ["Value"] = otlp });
 }
 
 var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
@@ -41,11 +89,16 @@ builder.UseWolverine(opts =>
     // this the monitor can see that *a* lock is held and *a* node claims leadership, but not
     // whether they are the same node -- which is the whole question in a split-brain.
     // POD_NAME / POD_IP come from the downward API in k8s/churnsim.yaml.
-    Console.WriteLine(
-        $"SIM-IDENTITY nodeId={opts.UniqueNodeId} " +
-        $"podName={Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName} " +
-        $"podIp={Environment.GetEnvironmentVariable("POD_IP") ?? "unknown"} " +
-        $"at {DateTimeOffset.UtcNow:O}");
+    var podName = Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName;
+    var podIp = Environment.GetEnvironmentVariable("POD_IP") ?? "unknown";
+    emit("ChurnSim.Startup",
+        $"SIM-IDENTITY nodeId={opts.UniqueNodeId} podName={podName} podIp={podIp} at {DateTimeOffset.UtcNow:O}",
+        new Dictionary<string, object?>
+        {
+            ["NodeId"] = opts.UniqueNodeId.ToString(),
+            ["PodName"] = podName,
+            ["PodIp"] = podIp
+        });
 
     // No message handlers needed -- the point is the agent assignment plane
     opts.Discovery.DisableConventionalDiscovery();
@@ -69,11 +122,13 @@ builder.UseWolverine(opts =>
         if (prop?.CanWrite == true)
         {
             prop.SetValue(opts.Durability, value);
-            Console.WriteLine($"CONFIG {property}={value}");
+            emit("ChurnSim.Startup", $"CONFIG {property}={value}",
+                new Dictionary<string, object?> { ["Setting"] = property, ["Value"] = value?.ToString() });
         }
         else
         {
-            Console.WriteLine($"CONFIG {property} not available on this Wolverine build");
+            emit("ChurnSim.Startup", $"CONFIG {property} not available on this Wolverine build",
+                new Dictionary<string, object?> { ["Setting"] = property, ["Value"] = null });
         }
     }
 

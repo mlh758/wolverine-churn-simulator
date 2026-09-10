@@ -18,7 +18,16 @@
         # is containerised too, but `safetylab check` runs on the host over a captured
         # run directory, and wanting a local SDK for that is the whole reason it exists.
         default = pkgs.mkShell {
-          packages = [ pkgs.dotnetCorePackages.sdk_10_0 pkgs.podman pkgs.kubectl pkgs.jq ];
+          packages = [
+            pkgs.dotnetCorePackages.sdk_10_0
+            pkgs.podman
+            pkgs.kubectl
+            pkgs.jq
+            # SQL over the captured JSON logs, on the host. Deliberately not an in-cluster
+            # database: ClickHouse sized itself from the node's advertised host RAM (rootless
+            # podman does not enforce minikube's --memory) and took the machine down.
+            pkgs.duckdb
+          ];
 
           env = {
             DOTNET_CLI_TELEMETRY_OPTOUT = "1";

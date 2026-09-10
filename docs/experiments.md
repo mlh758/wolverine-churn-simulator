@@ -62,9 +62,17 @@ distributed, one owner each — while the cluster reports itself converged. Any 
 table sees perfect health. Only the pod log stream shows it, which is why S5/S7 read it and why
 `orphans.py` exists.
 
-Open: the mechanism. Duplicate pairs are always two *new* pods from the same ReplicaSet, never an
-old/new handover, so it is not drain timing. Size scaling with batch size points at the batched
-`StartAgents` dispatch path rather than individual agents racing.
+**Mechanism — found 2026-09-09, see RESULTS.md.** Duplicates are created at the *leadership
+handover*, not by drain timing. The outgoing leader places agents onto the node that is about to
+become leader; those starts happen before the assignment rows catch up; the new leader's first
+evaluation sees them as unplaced and issues "start on peer" rather than "move from here to peer".
+Evidence: the incoming leader logged 179 starts and **0 stops** on itself while issuing 42 stops to
+each peer. Nothing afterwards corrects it, because the table only ever recorded the new placements
+and reads as a balanced 500 — no actor knows the extra copies exist.
+
+That makes a node-side reconcile sweep (a node comparing its own running set against its persisted
+assignments) the natural fix, and it is what `mine:gh-3987-3959-fixes` adds. Testing whether it
+converges rather than prevents is `scripts/heal-test.sh` — see E5.
 
 ### Thread B — leadership algorithm misbehaviour
 
@@ -141,6 +149,11 @@ a permanent regression test.
 - **Finding:** any non-zero `duplicated` that survives the 120 s post-settle reconcile window.
 - **Artifact:** a dirty start. Recorded as `SKIP-dirty-start`, never as a pass — and the
   pre-snapshot is *kept*, because a dirty start is itself the previous rollout's duplicate.
+- **Evidence:** every snapshot writes each pod's raw JSON log alongside the running/assigned diff,
+  and iterations that diverge keep it (clean ones are reclaimed). A duplicate is only detected
+  after the fact, and its pods are replaced by the next iteration, so without this the answer to
+  *why* is gone by the time anyone looks. Query a divergent iteration straight from its snapshot:
+  `./scripts/logq.sh runs/duplicate-rate/iterN/post "<sql>"`.
 - **Caveat:** runs at whatever `SIM_*` knobs the deployment carries; check them. At time of
   writing `AgentStartBatchSize=5`, not the shipping default of 50, inherited from the GH-3959
   overload runs. Whether the rate holds at the default is the obvious follow-up.
@@ -156,6 +169,19 @@ suspicion, prefer the measurement with the fewest moving parts.
 The gate arm was dropped because the bug has since been seen with the gate both **on** (the
 original observation) and **off** (a later rollout left 5 orphans), and 8 runs per arm could never
 have separated the arms anyway.
+
+### E5 — does a duplicate heal? (`scripts/heal-test.sh`)
+
+- **Question:** given that duplication still happens, does the cluster converge back to a correct
+  state or stay wrong?
+- **Why a separate script:** `duplicate-rate.sh` looks once after the dust settles, which is the
+  wrong instrument for a fix whose claim is convergence. `LocalAgentReconciliationThreshold`
+  defaults to 3 and ChurnSim health-checks every 2 s, so a heal lands in ~6 s and an end-state
+  snapshot would read clean — indistinguishable from "no duplicate happened".
+- **Method:** sample the running-vs-assigned comparison every 15 s through the whole settle window.
+  Classifies each rollout `never` / `HEALED` (with heal time) / `PERSISTED`. Keeps sampling after
+  duplicates clear, so heal-then-recur is distinguishable from a durable heal.
+- **Baseline:** stock 6.35.0 is known to PERSIST — a duplicate was still live 40 minutes later.
 
 ### E3 — convergence tail
 

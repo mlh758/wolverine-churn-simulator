@@ -24,6 +24,8 @@ export PATH="$HOME/.local/bin:$PATH"
 K="minikube kubectl -- --context=minikube"
 
 ITERS="${1:-12}"
+# A settle at or above this keeps its raw logs even when the iteration is otherwise clean.
+SLOW_SETTLE="${SLOW_SETTLE:-120}"
 OUT="runs/duplicate-rate"
 TSV="$OUT/results.tsv"
 mkdir -p "$OUT"
@@ -35,12 +37,19 @@ psql_t()    { $K exec "$(pgpod)" -- psql -U postgres -d churnsim -qAt -c "$1" 2>
 placed()    { psql_t "select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';" | tr -d '[:space:]'; }
 
 # Snapshot both sides into a directory and diff them.
+#
+# The raw pod log is KEPT, not piped away. A duplicate is detected after the fact and its pods are
+# replaced by the next iteration, so without this the evidence for *why* it happened is gone by the
+# time anyone looks. Same single `kubectl logs` fetch either way: write it down, then derive the
+# running set from the file. The snapshot directory is then directly queryable --
+# `scripts/logq.sh runs/duplicate-rate/iterN/post "<sql>"` globs exactly these raw.*.jsonl files.
 snapshot() {
     local dir="$1"
     mkdir -p "$dir"
     : > "$dir/running.tsv"
     for p in $(live_pods); do
-        $K logs "$p" 2>/dev/null | python3 scripts/running_agents.py --pod "$p" >> "$dir/running.tsv"
+        $K logs "$p" > "$dir/raw.$p.jsonl" 2>/dev/null
+        python3 scripts/running_agents.py --pod "$p" < "$dir/raw.$p.jsonl" >> "$dir/running.tsv"
     done
     psql_t "select a.id || chr(9) || n.description
               from wolverine.wolverine_node_assignments a
@@ -51,11 +60,19 @@ snapshot() {
 }
 
 # Wait for full placement, then for it to hold still for three consecutive polls.
+#
+# Records the placement count at every poll to $2 when given. Two runs have now produced an
+# iteration that took *exactly* 831 s to settle against 30-51 s for every other iteration, on
+# independent clusters -- a deterministic stall, not a slow tail. The count alone cannot say
+# whether placement is stuck flat and then jumps (a timeout expiring, e.g. the 10-minute
+# AgentReleaseCooldown) or crawls (batch pacing). The series can.
 wait_settled() {
-    local start last=-1 stable=0 n
+    local start last=-1 stable=0 n series="${2:-/dev/null}"
     start=$(date +%s)
+    : > "$series"
     for _ in $(seq 1 120); do
         n=$(placed)
+        printf '%s\t%s\n' "$(( $(date +%s) - start ))" "${n:-}" >> "$series"
         if [ "${n:-0}" = "500" ]; then
             if [ "$n" = "$last" ]; then
                 stable=$(( stable + 1 ))
@@ -94,12 +111,15 @@ for i in $(seq 1 "$ITERS"); do
     pre=$(snapshot "$OUT/iter$i/pre")
     if ! grep -q "duplicated=0 orphaned=0 missing=0" <<<"$pre"; then
         printf '%s\tSKIP-dirty-start\t-\t-\t-\t-\t-\t-\n' "$i" >> "$TSV"
-        echo "  dirty start: $pre"; tail -1 "$TSV"; continue
+        echo "  dirty start: $pre"
+        echo "     evidence kept: $OUT/iter$i/pre/raw.*.jsonl"
+        tail -1 "$TSV"; continue
     fi
 
     # The measured event.
+    mkdir -p "$OUT/iter$i"
     ./scripts/rollout.sh "$(date +%s)" >/dev/null 2>&1
-    settle=$(wait_settled)
+    settle=$(wait_settled "" "$OUT/iter$i/placement.tsv")
     sleep 120   # let any late reconcile happen before judging
 
     post=$(snapshot "$OUT/iter$i/post")
@@ -113,7 +133,16 @@ for i in $(seq 1 "$ITERS"); do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$i" "$result" "$run" "$asg" "$dup" "$orp" "$mis" "$settle" >> "$TSV"
     tail -1 "$TSV"
-    if [ "$result" != clean ]; then sed -n '2,8p' "$OUT/iter$i/post/report.txt"; fi
+
+    if [ "$result" = clean ] && [ "${settle:-0}" -lt "$SLOW_SETTLE" ]; then
+        # Nothing to explain: reclaim the raw logs, keep running/assigned/report as the record.
+        rm -f "$OUT/iter$i"/*/raw.*.jsonl
+    elif [ "$result" = clean ]; then
+        echo "     SLOW SETTLE ${settle}s (>= ${SLOW_SETTLE}s) — evidence kept: $OUT/iter$i/"
+    else
+        sed -n '2,8p' "$OUT/iter$i/post/report.txt"
+        echo "     evidence kept: $OUT/iter$i/{pre,post}/raw.*.jsonl"
+    fi
 done
 
 echo

@@ -8,155 +8,161 @@ README every time a new one lands.
 alone moved a convergence time by minutes, and a knob left set from a previous experiment is the
 easiest way to publish a comparison that is really measuring something else.
 
-## 2026-09-09 — duplicate-agent rate: ~1 in 4 rolling deploys
+## 2026-09-09 — mlh758:gh-3987-3959-fixes converges: 8 duplicates, 8 healed, 0 persisted
 
-`6.35.0-stock.1` (`origin/main` @ `c0b0ce61c`), 500 agents, 500 ms starts, 3 replicas,
-`maxSurge:1`/`maxUnavailable:0`, GH-4367 settle gate off. Two runs of 12 iterations,
-`scripts/duplicate-rate.sh`. Raw data in `runs/duplicate-rate-batch5/` and `runs/duplicate-rate/`.
+`6.35.0-fixes.1` — `mine:gh-3987-3959-fixes` rebased onto `origin/main` @ `c0b0ce61c`, so it
+differs from the stock baseline only by its two commits. `LocalAgentReconciliationThreshold` at its
+default of 3; `CapacityAwareAssignment` off, so this tests the node-side reconcile sweep alone.
+8 rollouts, `scripts/heal-test.sh`, data in `runs/heal-test/`.
 
-**10 duplicate events in 42 rolling deploys — ~24%.**
-
-| | `AgentStartBatchSize=5` | `=50` (shipping default) |
+| | stock 6.35.0 | fixes build |
 |---|---|---|
-| duplicate events | 3 / 23 — 13% (CI 5–32%) | 7 / 19 — **37%** (CI 19–59%) |
-| duplicate sizes | 1, 5, 5 | 2, 8, 10, 11, 12, 15, 24 |
-| median settle | 81 s | 40 s (one 831 s outlier) |
+| rollouts | — | 8 |
+| duplicated | ~1 in 4 | 1 |
+| overlaps healed | 7 | **8** |
+| overlaps **persisted** | **36** (one iteration) | **0** |
+
+**The sweep is demonstrably what heals it**, not luck. Every overlap has a matching log line:
+7 × "stopping the local copy", 1 × "restoring this node's claim" — 8 actions for 8 overlaps.
+
+Trace of one (`sim://agent144/`):
+
+| time | node | event |
+|---|---|---|
+| 23:26:20.594 | 178 | started |
+| 23:26:22.401 | 179 | started — duplicate exists |
+| 23:26:27.873 | 178 | `running on node 178 but its durable assignment belongs to node 179; stopping the local copy` |
+| 23:26:27.874 | 178 | stopped |
+
+5.5 s from duplicate to heal, and heal times clustered at 4.5–6.0 s across all 8 — matching
+`LocalAgentReconciliationThreshold` (3) × ChurnSim's 2 s health-check almost exactly.
+
+This is the fix working on the mechanism identified separately: duplicates are created when a new
+leader cannot see agents already running on itself, so the only actor positioned to notice is the
+node comparing its own running set against its durable assignments. That is what the sweep does.
+
+**Caveats.** Only 1 of 8 rollouts duplicated, against ~23% on stock — too few runs to say anything
+about the *rate*, and the fix does not claim to change it. The heal claim rests on 8 overlaps in
+one rollout; what makes it more than a small sample is the per-overlap log evidence, which shows
+causation rather than coincidence. Longer runs would be needed before quoting a heal rate.
+
+## 2026-09-09 — mechanism: duplicates are created at the leadership handover
+
+Stock `6.35.0-stock.1`, 500 agents, default batch size, GH-4367 gate off. From the run in
+`evidence/dupes-2026-09-09-stock635/` (iteration 2: 537 running vs 500 assigned, 37 duplicated),
+queried with `scripts/logq.sh` over the retained JSON pod logs.
+
+**One agent's full trace** (`sim://agent114/`):
+
+| time | node | event |
+|---|---|---|
+| 21:03:47.7 | 79 | started |
+| 21:03:56.2 | 79 | **stopped** — clean handover, the normal path works |
+| 21:04:00.0 | — | **Node 81 assumes leadership** |
+| 21:04:00.9 | 81 | started |
+| 21:04:02.3 | 80 | started — never stopped |
+
+**Starts per second, by pod, across the handover.** Before 21:04:00 only `48ww4` (Node 81) is
+starting agents — 19, 20, then 30 per second, absorbing ~69. At the instant it becomes leader, all
+three nodes begin starting simultaneously.
+
+**Starts vs stops over the whole window:**
+
+| pod | starts | stops |
+|---|---|---|
+| `48ww4` — became leader at 21:04:00 | 179 | **0** |
+| `9bgxb` | 83 | 42 |
+| `hzp8p` | 110 | 42 |
+
+The incoming leader issued 42 stops to each peer and **zero to itself**.
+
+**The reading.** The outgoing leader had been placing agents onto `48ww4` — the only node taking
+them during the rollout window. Those starts happened, but the assignment rows had not caught up.
+When `48ww4` became leader and evaluated the grid, it saw those agents as *unplaced* rather than
+as running-here, so it emitted plain "start on peer" commands instead of "move from here to peer".
+The local copies were never told to stop, and nothing afterwards notices: the table records the
+new placements and reads as a perfectly balanced 500.
+
+This is the pending-assignment gap at a leadership handover. It matches every property observed:
+duplicate pairs are always same-generation pods (not old/new drain overlap), the table always looks
+immaculate, and the state never self-heals — no actor is positioned to correct it, because the
+table never knew about the extra copies. A node-side reconcile sweep comparing a node's own running
+set against its persisted assignments is the only place the discrepancy is visible.
+
+**Correction to an earlier note:** extra copies do *not* reliably pile onto a single pod. That held
+for the small events; in this 37-agent event the excess was spread 12 / 23 / 2.
+
+## 2026-09-09 — duplicate rate: ~1 in 4 rolling deploys, but noisy
+
+Stock `6.35.0-stock.1` (`origin/main` @ `c0b0ce61c`), 500 agents, 500 ms starts, 3 replicas,
+GH-4367 gate off. Four runs of `scripts/duplicate-rate.sh`.
+
+**20 duplicate events in 88 rolling deploys — ~23%.**
+
+| run | batch size | events / deploys | rate |
+|---|---|---|---|
+| A | 5 | 3 / 23 | 13% |
+| B | 50 (default) | 7 / 19 | 37% |
+| C | 50 | 3 / 21 | 14% |
+| D | 50 | 7 / 25 | 28% |
+
+**Per-run rates are not worth comparing.** Runs C and D are the same cluster, same image, same
+config, back to back — 14% then 28%, and D's first half alone was 56%. A single ~12-iteration run
+gives an unstable estimate, so treat "roughly 1 in 4" as the claim and ignore differences between
+individual runs.
 
 Each iteration performs two deploys — a `rollout restart` and a `rollout.sh` — and the pre- and
-post-snapshots observe both. The two are mechanically identical operations. Every dirty pre-state
-was verified as newly created by that deploy: the duplicates always sat on the ReplicaSet the
+post-snapshots observe both. Both are mechanically the same operation, so all are counted. Every
+dirty pre-state was verified as created by that deploy: duplicates always sat on the ReplicaSet the
 deploy had just made, never on the previous one.
 
-**Batch size makes it worse, not better.** The rate difference is suggestive but not established
-(Fisher exact p = 0.143). The size difference is clear: at batch 50 a single deploy left 24 agents
-running twice, against a maximum of 5 at batch 5. The earlier 13% figure was measured on the more
-favourable configuration; at defaults it is closer to 2 in 5.
+**Duplicate size scales with batch size.** At `AgentStartBatchSize=5` no event exceeded 5 agents;
+at the default 50, single events reached 22, 24 and 37. That points at the batched `StartAgents`
+dispatch path rather than agents racing individually — consistent with the mechanism found
+separately (see the mechanism entry above).
 
-**Shape.** The assignment table stayed at exactly 500 rows naming a single owner every time — the
-extra copies are invisible to it, and the cluster reports itself converged. Duplicate pairs were
-always two *new* pods from the same ReplicaSet, never an old/new handover overlap, so this is not
-drain timing.
+**Caveats.** Gate off only. Minikube, 3 replicas on one node. The rig deploys far more often than
+production, which could inflate the rate if the race is sensitive to deploys in close succession.
 
-**Caveats.** Gate off only. n = 42 across both configs; treat "roughly 1 in 4" as the claim.
-Minikube, 3 replicas on one node. The rig deploys more often than production, which could inflate
-the rate if the race is sensitive to deploys in close succession.
+## 2026-09-09 — first duplicate observed; GH-4367 settle gate
 
-**Why it matters.** For a Marten projection this is two daemons on one shard, indefinitely, on
-default settings. A duplicate was still present on a live cluster 40 minutes after the run.
+`6.35.0-stock.1` (`origin/main` @ `c0b0ce61c`, includes
+[#4367](https://github.com/JasperFx/wolverine/pull/4367)). 500 agents, 500 ms starts, 3 replicas,
+`AgentStartBatchSize=5` (not the default). Four runs: gate off, gate on, and two with the gate on.
 
-## 2026-09-09 — stock main 6.35.0, GH-4367 settle gate off vs on
+**Where the duplicate divergence was first caught.** Five agents (`sim://agent40/`, 42, 43, 44, 46)
+were started on one pod and started *again* on another 28 seconds later, with the stop for the
+first copy never arriving. Verified against the live cluster ~40 minutes after the run:
 
-**Build:** `6.35.0-stock.1`, packed from `origin/main` at `c0b0ce61c` (includes
-[#4367](https://github.com/JasperFx/wolverine/pull/4367), the `AssignmentSettlePeriod` gate).
-ChurnSim on net10.0. 500 agents, 500 ms start delay, 3 replicas, one rolling deploy, 10-minute
-settle tail. Both arms captured with SafetyLab and identical in every respect except the gate.
-
-**Headline: a duplicate-agent divergence that has not healed.** On the gate-on arm, five agents
-(`sim://agent40/`, `42`, `43`, `44`, `46`) were started on pod `g7m9n` and then started *again*
-on `zjrj4` 28 seconds later — and the stop for the first copy never came. Verified against the
-live cluster ~40 minutes after the run:
-
-| pod | agents actually running | assignment rows |
+| pod | running | assignment rows |
 |---|---|---|
 | `g7m9n` | **172** | 167 |
 | `vhv9q` | 166 | 166 |
 | `zjrj4` | 167 | 167 |
 
-505 running, 500 assigned. Meanwhile the assignment table is *immaculate* — 500 rows, evenly
-spread 167/166/167, `sim://agent40/` assigned to `zjrj4` alone — and the cluster reports itself
-converged. This is the GH-3987 "assignment table diverges from reality" shape, and the same
-duplicate-agent shape seen on 5.39 in the 2026-09-03 run: the stop for the old copy never lands,
-the table claims a single owner, and nothing notices.
+505 running, 500 assigned, and the assignment table evenly spread at 167/166/167 with the
+duplicated agents each showing a single owner. SafetyLab's **S6 passed** — every *assigned* agent
+was running where assigned, which is all the table can show — while **S5 and S7 failed**, because
+they read the pod log stream. That asymmetry is the whole reason those checks exist.
 
-Note which checks caught it. **S6 passed** — every *assigned* agent was running on its assigned
-node, which is all you can see by walking the assignment table. **S5 and S7 failed**, because
-they read the pod log stream instead. An orphan runner is invisible to the table by construction.
+**The settle gate.** One run per arm, so treat this as directional only:
 
-**Churn:**
-
-| | gate off (stock default) | gate on, `AssignmentSettlePeriod=15s` |
+| | gate off | gate on (15 s) |
 |---|---|---|
 | `AssignmentChanged` | 803 | 742 |
-| `AgentStarted` | 645 | 531 |
-| `AgentStopped` | **247** | **66** |
-| Converged after rollout-end | 83 s | 44 s |
-| SafetyLab | all 9 pass | **S5, S7 fail** (5 duplicated agents) |
+| `AgentStopped` | 247 | 66 |
+| converged after rollout-end | 83 s | 44 s |
 
-The gate's effect on stops is large and in the expected direction — 247 → 66, the same
-"stop shuffling agents between survivors on intermediate rosters" effect the proposal showed.
-Convergence was also faster with it on.
+The stop count is the interesting one — stock shuffles running agents between survivors on
+intermediate rosters and the gate declines to. But n=1 per arm, and the duplicate landed on a
+gate-on run, so this says nothing about the gate's effect on duplication.
 
-**Caveats — read these before quoting any number above.**
-
-- **n = 1 per arm.** The duplicate appeared on the gate-on arm, but one run each cannot show the
-  gate *causes* duplicates. It is at least as likely to be luck of the draw on a race that either
-  arm can lose. Do not report "the settle gate causes duplicate agents" from this data.
-- **`AgentStartBatchSize=5`, not the default 50.** Left set from the GH-3959 overload runs and
-  resurrected by `kubectl apply`'s three-way merge after being removed. Consistent across both
-  arms, so the A/B stands, but neither arm is a pristine-default baseline. It also dominates the
-  convergence tail — see below.
-- An earlier run in the same session was mislabelled: `kubectl set env VAR-` removals were
-  silently undone by `deploy.sh`, so a run believed to be gate-off actually had the gate on. Both
-  arms here verify the gate state from the pod's own `CONFIG` log line before measuring.
-
-**Convergence tail, and where 286 s went.** An earlier gate-on run took 286 s to converge. The
-capture shows it is not idle: the two survivors refill at 5 agents per ~2 s until 471 of 500 are
-placed (~70 s), then the last 29 agents go in batches of exactly 5, exactly 40 s apart, for 3.5
-minutes. Batch size 5 is the non-default knob above. The 40 s cadence matches
-`AgentBatchTimeouts.ReplyWindowFor(5)` = `30s + 5×1s` = 35 s plus ChurnSim's
-`CheckAssignmentPeriod` of 5 s, exactly, six times running — while the agents themselves start
-within ~1 s of each batch. That constant's own doc comment says "the window is a backstop, not a
-pace-setter"; here it is pacing. **Not proven**: that the batch acknowledgement is being lost and
-the leader is burning the full window. Confirming it needs the leader's own control-plane logging,
-which this capture did not collect — that is why SafetyLab now harvests
-`Wolverine.Runtime.Agents.*` log lines and why a Jaeger pod is being stood up to read the
-`wolverine_node_assignments` spans directly.
-
-**Third run, with tracing and control-plane logging on** (`runs/traced`, same build and config):
-681 `AssignmentChanged`, 501 started, 67 stopped, **all nine checks pass, converged in 46 s**.
-
-Four runs were taken this session. The full record, chronological:
-
-| # | run | gate | converged | S5 (duplicate agents) |
-|---|---|---|---|---|
-| 1 | `settle15-firstattempt` | on | **286 s** | pass |
-| 2 | `stock-default` | off | 83 s | pass |
-| 3 | `settle15` | on | 44 s | **FAIL — 5 duplicates** |
-| 4 | `traced` | on | 46 s | pass |
-
-What this does and does not support:
-
-- **The 286 s tail is an outlier, not characteristic.** Runs 2–4 converged in 83 s, 44 s and 46 s.
-  Do not quote "convergence takes ~5 minutes".
-- **The duplicate divergence occurred once, in run 3, and exactly one run followed it.** That is
-  not enough to call it a race that "usually" does not reproduce, and nowhere near enough to
-  attribute it to the settle gate: gate-on saw 1 duplicate in 3 runs, gate-off 0 in 1 run.
-- **Fast convergence and the duplicates are probably the same event, not independent ones.**
-  Run 3 converged fastest *and* carried the duplicates. L1 measures convergence against the
-  assignment table — one leader, 500 agents placed once, stable — and on run 3 every bit of that
-  was true while five agents ran on two nodes each. The table converged quickly precisely because
-  it had stopped tracking reality; the orphan copies were never in it to reconcile. This is the
-  case for S5/S7 reading the pod log stream rather than the table.
-- **Not settled: what paces the slow tail.** Jaeger did not answer it. Wolverine emits only three
-  operations here — `wolverine_node_assignments`,
-  `Wolverine.RDBMS.Transport.PollDatabaseControlQueue` and `wolverine.stopping.listener` — and the
-  assignment-evaluation spans top out at **96 ms**, so the leader is demonstrably *not* blocking
-  inside an evaluation. There are no send/receive spans for the agent commands, so the
-  dispatch-to-confirmation gap is invisible to tracing.
-
-  The control-plane log capture is the instrument that works. It surfaced the right line:
-
-  ```
-  warn  Node 34 confirmed 0 of 5 requested agents; 5 did not report started
-        and remain unconfirmed: sim://agent475/, ...
-  ```
-
-  Batches of exactly 5 with zero confirmed — the shape the 40 s cadence predicts. But in run 4 all
-  three such warnings fired within 3 ms of that pod's own "Application stopping signal received",
-  so they are in-flight batches abandoned at pod termination during the rolling deploy: expected,
-  and not evidence about steady-state pacing. Settling it needs a run that actually exhibits the
-  slow tail with control logging on. Run 4 did not (46 s), so the capture is in place but the
-  question is open.
+**Convergence is unrelated to duplication.** Convergence across the four runs was 286 s, 83 s,
+44 s, 46 s; the 44 s run is the one that duplicated. The 286 s outlier was the last 29 agents going
+in batches of exactly 5, exactly 40 s apart — which matches
+`AgentBatchTimeouts.ReplyWindowFor(5)` (`30s + 5×1s`) plus `CheckAssignmentPeriod` of 5 s, six
+times running, while the agents themselves started within ~1 s of each batch. Intermittent and
+unexplained; see the separate 831 s note.
 
 ## 2026-09-04 — stock main 6.33 vs the GH-3987/GH-3959 proposal
 

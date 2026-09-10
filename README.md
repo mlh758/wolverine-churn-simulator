@@ -167,6 +167,26 @@ $ nix develop --command ./tests/selftest.sh
 
 Add a checker, add a fixture and a ledger row.
 
+## Structured logs and SQL
+
+ChurnSim writes JSON logs when `SIM_JSON_LOGS=true` — each line a JSON object whose `State` holds
+the message-template parameters as named fields, so `AgentUri` and `NodeNumber` arrive queryable
+instead of embedded in prose. Capture and query them on the host:
+
+```bash
+./scripts/capture-logs.sh runs/foo     # raw.<pod>.jsonl per pod, no transformation
+./scripts/logq.sh runs/foo             # schema + summary
+./scripts/logq.sh runs/foo "select json_extract_string(state,'\$.AgentUri') as agent,
+                                   count(distinct pod) as pods
+                              from logs where message like 'AGENT-START%'
+                             group by 1 having count(distinct pod) > 1;"
+```
+
+DuckDB reads the files directly, so this is full SQL — window functions, self-joins — with no
+database to run. An in-cluster ClickHouse was tried and abandoned: it sized itself from the node's
+advertised *host* RAM, which rootless podman does not constrain, and took the machine down. See
+[docs/harness-traps.md](docs/harness-traps.md).
+
 ## Tracing (Jaeger)
 
 State samples show *what* the assignment table did; they never say *why*. Wolverine publishes a

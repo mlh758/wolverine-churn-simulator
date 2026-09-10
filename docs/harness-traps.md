@@ -23,6 +23,24 @@ Both were caught only by the deliberate sentinel in S1 — *"was the thing we ar
 observed at all?"* **Any new checker needs one.** A green run over an empty set is the default
 failure mode of this entire approach, not an edge case.
 
+## The one that took the machine down
+
+**The minikube node advertises HOST cpu and memory.** Under rootless podman,
+`.status.allocatable` reports 31 GB / 32 CPU regardless of `minikube start --memory=6g --cpus=4`.
+Anything that sizes itself from "available memory" or CPU count sizes for the whole machine.
+
+ClickHouse did exactly that twice: first aborting in `BackgroundSchedulePool` after sizing thread
+pools for 32 cores, then — with `max_server_memory_usage_to_ram_ratio 0.3` — sizing for ~9 GB
+against a 2 Gi container limit. Together with an OTel Collector reading every historical pod log
+directory and retrying into a backend that never came up, it OOM-killed the minikube container out
+of existence and took the host with it. Fedora did not recover; the machine needed a reboot.
+
+**Rule: no memory-sizing infrastructure in this cluster.** Pod `limits` do constrain well-behaved
+apps — churnsim's 512Mi limit works, and the GH-3959 overload runs depend on it — but they do not
+save you from an app that reads host capacity and pre-allocates. Analysis belongs on the host:
+structured JSON logs plus DuckDB (`scripts/logq.sh`) gives full SQL with nothing running in the
+cluster at all. "The node reports 31 GB free" is not headroom; it is the absence of enforcement.
+
 ## Kubernetes selectors
 
 **Terminating pods report `status.phase=Running`** for their whole
