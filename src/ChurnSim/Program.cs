@@ -150,6 +150,20 @@ builder.UseWolverine(opts =>
         trySet("AssignmentSettlePeriod", TimeSpan.FromSeconds(window));
     }
 
+    // For the synthetic-self-guard runs: shrink the stale line toward the (2s) heartbeat cadence so
+    // that GC pauses / start storms make peers eject live nodes' rows, opening the read-miss window
+    // where a node's own snapshot omits its row and the reconcile sweep must sit the tick out.
+    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STALE_NODE_TIMEOUT_SECONDS"), out var stale) && stale > 0)
+    {
+        trySet("StaleNodeTimeout", TimeSpan.FromSeconds(stale));
+    }
+
+    // Node-side reconcile sweep threshold (consecutive ticks). Only exists on sweep builds; 0 disables.
+    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_RECONCILE_THRESHOLD"), out var reconcile))
+    {
+        trySet("LocalAgentReconciliationThreshold", reconcile);
+    }
+
     if (Environment.GetEnvironmentVariable("SIM_CAPACITY_AWARE") == "true")
     {
         trySet("CapacityAwareAssignment", true);

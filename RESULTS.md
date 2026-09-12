@@ -8,6 +8,114 @@ README every time a new one lands.
 alone moved a convergence time by minutes, and a knob left set from a previous experiment is the
 easiest way to publish a comparison that is really measuring something else.
 
+**Target framework: net10.0, as of 2026-09-11.** ChurnSim targets net10.0 and every number from
+that date forward is taken on it. net8 and net9 are both near end of support and net11 is already
+out, so pinning the rig to one current LTS-track runtime is what keeps runs comparable to each
+other rather than to a retired baseline. Entries dated before 2026-09-11 were taken on net9.0
+unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
+kept alongside it — git history has them.
+
+## 2026-09-11 — GH-3959 collapse on net10.0: the new baseline, and the settle gate does not help
+
+`6.35.0-cap3959.1` — `mine:gh-3987-3959-fixes` rebased onto `origin/main` @ `cd776ae32`, which
+already contains the GH-3987 reconcile sweep (#4404) and its hardening (#4407). The branch adds
+capacity-aware assignment and nothing else, so **all four arms below are the same image** and the
+only differences are `CapacityAwareAssignment` and `AssignmentSettlePeriod`. Every setting was
+verified from each pod's own `CONFIG` output. net10.0.
+
+Scenario unchanged: 60 agents × 10 MB ballast, 512 Mi pod limit (GC budget 384 Mi),
+`SIM_START_DELAY_MS=500`, `SIM_BATCH_SIZE=5`, healthy 3-node steady state at 20/20/20, then scale
+straight to **one** replica and hold it there.
+
+| | capacity off, gate off | capacity off, gate 15 s | capacity on, gate off | capacity on + gate 15 s |
+|---|---|---|---|---|
+| `AssignmentChanged` in window | 777 / 6 min (**130/min**) | 741 / 6 min (**124/min**) | **1** / 7 min | **0** / 6 min |
+| Converges | no | no | yes | yes |
+| `OutOfMemoryException` | 2289 | ~2190 | **0** | **0** |
+| Assignment rows | 36/60 | 37/60 | 19/60 + 41 waiting | 19/60 + 41 waiting |
+| Agents running on survivor | 16 → **0** | **0** | **19, stable** | **19, stable** |
+| Survivor load advertised | none | none | 84.0 → 77.3% | 83.2 → 80.5% |
+| Pod restarts | 0 | 0 | 0 | 0 |
+
+**The GH-4367 settle gate does not help a collapse, and structurally cannot.** 124/min against
+130/min is the same number; both arms run out of memory, place nothing, and never converge. This
+is not a tuning failure that a longer period would fix — `trackMembershipAndDecideWait` in
+`NodeAgentController.HeartBeat.cs` ends the wait the moment it sees a departure:
+
+```csharp
+if (departed > 0)
+{
+    endWait();
+    return false;
+}
+```
+
+The gate is a **join debouncer**. It exists so a rolling deploy's arrivals do not each trigger a
+rebalance, and that is the shape it was measured helping (2026-09-04, 125 → 0 stops). A node that
+leaves and stays gone — maintenance, resource exhaustion, the cascading-loss endgame — is never
+waited out, by design: its agents are running nowhere, and holding placement back would extend the
+outage. So the gate and capacity-awareness address disjoint failure modes and neither substitutes
+for the other.
+
+*Caveat on the evidence:* the gate's own hold message is `LogDebug` and the rig logs at
+Information, so its absence from the collapse logs is consistent with but not proof of the gate
+never engaging. The code path above and the identical churn slopes are the actual evidence.
+
+**The two features compose.** With both on, the collapse produced **zero** `AssignmentChanged`
+rows in six minutes — marginally cleaner than capacity-alone's 1 — with the survivor holding 19
+agents at a flat ~81% and no OOM. No interaction, no regression.
+
+**Recovery** (capacity on, scale back to 3, nothing reset): rows 19 → 58 inside the first
+evaluation cycle, 52 `AssignmentChanged` all in that cycle, then **flat for 5 minutes**. Final
+19/20/19 at 79.2/81.6/79.8%, 58 running, 0 OOM. The old survivor kept its 19 agents — the
+scale-out placed the waiting orphans rather than reshuffling what was already running.
+
+**58/60, not 60/60, is correct.** All three nodes sit inside the 75–85 hold band, so placing the
+last two would push a node to the shed line. The rig is provisioned at its edge on purpose; the
+remedy is capacity or a higher threshold, not churn.
+
+*Method note:* the headline rate is the **slope inside the observation window**, not the running
+total. Totals depend on how much time elapsed between `scale --replicas=1` and the first sample,
+which differed between arms and is not a property of the build.
+
+## 2026-09-10 — the GH-4367 settle gate does not reduce duplication
+
+Stock `6.35.0-stock.1`, 500 agents, 500 ms starts, 3 replicas, default batch size. Two runs of
+`scripts/heal-test.sh` back to back on the same cluster, gate state verified from each pod's own
+`CONFIG` output. Data in `runs/heal-test-stock-gate10/` and `runs/heal-test/`.
+
+| | gate off | gate on (`AssignmentSettlePeriod=10s`) |
+|---|---|---|
+| rollouts | 8 | 7 (+1 skipped) |
+| duplicated | 1 (12%) | 3 (43%) |
+| overlaps | 6 | 18 |
+| overlaps healed | 0 | 0 |
+
+**No evidence the gate helps.** Fisher exact p = 0.282. The point estimates run the *wrong* way,
+but per-run rates on this rig have ranged 12–56% with nothing changed, so that is noise, not a
+finding — do not read this as the gate making things worse.
+
+The reasoning for expecting help was sound: the gate holds `EvaluateAssignmentsAsync` back until
+the node set stops changing, and in the mechanism trace the new leader dispatched 0.9 s after
+assuming leadership. Delaying that first evaluation should have let the assignment rows catch up.
+It did not measurably. The race is at the handover itself, and a settle period does not close it.
+
+**One new failure mode, gate-on only.** Iteration 7 never reached 500 placed within 20 minutes and
+was skipped — a `SKIP-no-settle`, which has not appeared in any of the five gate-off runs. Possibly
+related to the 831 s stall, possibly the gate holding assignment back. One occurrence; a lead, not
+a claim.
+
+**Healing, now measured on the same instrument throughout:**
+
+| build | overlaps | healed |
+|---|---|---|
+| stock 6.35.0 (both gate arms) | 24 | **0** |
+| `gh-3987-3959-fixes` | 8 | **8** |
+
+Fisher exact p = 9.5e-08. Stock never heals a duplicate; the reconcile sweep heals every one, in
+4.5–6.0 s, with a matching log line per overlap. That contrast is the most solid result in this
+file — same script, same cluster, within hours of each other.
+
 ## 2026-09-09 — mlh758:gh-3987-3959-fixes converges: 8 duplicates, 8 healed, 0 persisted
 
 `6.35.0-fixes.1` — `mine:gh-3987-3959-fixes` rebased onto `origin/main` @ `c0b0ce61c`, so it
@@ -197,49 +305,7 @@ formal model's counterexamples).
 
 ### Cascading overload (GH-3959) — 3→1 collapse, then recovery
 
-60 agents × 10 MB resident ballast, 512 Mi pod limit (GC budget 384 Mi, so one
-node holds roughly 28 agents), paced starts. From a healthy 3-node steady
-state, scale straight to **one** replica — the incident's cascading-loss
-endgame — then back out to three.
-
-**Stock main:** the survivor accepted assignments for everything, ran out of
-memory starting them (`System.OutOfMemoryException`), and the leader kept
-re-deciding: **~125 `AssignmentChanged` rows per minute, sustained, no
-convergence across the full 5-minute observation** (655 rows total, zero
-successful starts after the collapse). 39 of 60 agents held assignment rows.
-
-**Proposal** (`SIM_CAPACITY_AWARE=true`, `SIM_OVERLOAD_THRESHOLD=85`, receive
-line 75), collapse → hold → recovery in one run:
-
-- Healthy 3-node steady state advertised **78–81%** load (~300 MB resident /
-  384 MB GC budget — the arithmetic checks out).
-- After the collapse the lone survivor read ~82%, inside the hold band: it
-  kept its ~20 agents and **refused the 40 orphans**, which waited unassigned.
-  Load held 80–83% for a 7-minute observation. **Totals: 2
-  `AssignmentChanged` rows in 7 minutes** versus stock's 655 in 5 — a ~300×
-  reduction — with **zero pod restarts and zero `OutOfMemoryException`**.
-- **Recovery was immediate.** Scaling back to 3 replicas, assignment rows went
-  22 → 61 within the first evaluation cycle after the new nodes joined: 43 of
-  the run's 50 `AssignmentChanged` rows in the first minute, 7 in the second,
-  zero after. Urgent placement of waiting agents is never gated. Final state
-  59/60 running at 19/19/21, loads 79.5/82.5/84.4%, stable; the old survivor
-  kept its agents (10 stops total).
-- **The 60th agent stayed waiting — correctly.** All three nodes sit inside
-  the 75–85 hold band, so placing it would push someone to the shed line. The
-  design is being honest that this fleet is provisioned at its edge; the
-  remedy is capacity or a higher threshold, not churn.
-
-This is the model's cascade floor made empirical: one node's loss cannot push
-the survivors past their advertised capacity, and the deficit shows up as
-explicit unassigned agents rather than as a dying cluster.
-
-| | stock main | proposal (capacity-aware) |
-|---|---|---|
-| `AssignmentChanged` during collapse | 655 in 5 min, ~125/min, never converges | **2 in 7 min, converged** |
-| `OutOfMemoryException` | continuous | **none** |
-| Survivor state | thrash loop (failed starts, releases) | steady at ~80% load |
-| Agents | 39/60 rows, ~28 running, flapping | 19/60 running **stably**, 41 explicitly waiting |
-| Recovery on scale-out | not reached | 40 agents placed in one cycle, 59/60 running |
+Reran on net10.0 — **see the 2026-09-11 entry**, which supersedes what was here.
 
 ### Two load-monitor lessons, kept because they cost real runs
 

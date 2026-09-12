@@ -270,9 +270,9 @@ and the `load_factor` column for the observation window. Use
 `reset-schema.sh` between different Wolverine builds. For the recovery half,
 scale back to `--replicas=3` without resetting anything and keep watching.
 
-> The published numbers above were taken with ChurnSim on net9.0. It targets
-> **net10.0** now (which also floats `Microsoft.Extensions.Hosting` to 10.0.0,
-> since WolverineFx's own floor moved). The assignment plane does not depend on
-> the target framework, so the comparisons are expected to hold — but a rerun
-> has not been done, so treat any new absolute number as a fresh baseline
-> rather than something directly comparable to a row above.
+> **ChurnSim targets net10.0, and that is the baseline.** net8 and net9 are both near end of
+> support and net11 is already out, so the rig stays pinned to one current runtime rather than
+> tracking a retired one. The overload scenario was rerun on net10.0 on 2026-09-11 and reproduces
+> the net9.0 shape; that entry in RESULTS.md replaced the older numbers outright. Entries dated
+> before 2026-09-11 were taken on net9.0 unless they say otherwise; compare within a framework,
+> not across.
