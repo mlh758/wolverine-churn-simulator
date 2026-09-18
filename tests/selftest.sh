@@ -19,6 +19,13 @@ LEDGER=(
   "no-converge:L1"
   "split-leader:S3"
   "gap:C0"
+  # The RavenDB arm. raven-clean pins that the leader-side checkers read compare-exchange
+  # evidence rather than only pg_locks -- without it they would pass a RavenDB run vacuously,
+  # which is the same way the first live PostgreSQL run passed every leader check.
+  "raven-clean:"
+  "raven-expired-lock:S8 L1"
+  "raven-split-key:S1 L1"
+  "raven-truncated:C0"
 )
 
 BIN="${SAFETYLAB_BIN:-}"
@@ -41,9 +48,9 @@ for row in "${LEDGER[@]}"; do
   expected=$(echo "$expected" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
 
   if [ "$actual" = "$expected" ]; then
-    printf '  ok   %-14s -> [%s]\n' "$fixture" "$actual"
+    printf '  ok   %-18s -> [%s]\n' "$fixture" "$actual"
   else
-    printf '  FAIL %-14s -> expected [%s], got [%s]\n' "$fixture" "$expected" "$actual"
+    printf '  FAIL %-18s -> expected [%s], got [%s]\n' "$fixture" "$expected" "$actual"
     failures=$((failures + 1))
   fi
 done

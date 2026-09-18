@@ -3,12 +3,12 @@ kind: Deployment
 metadata:
   name: churnsim
 spec:
+  # Deliberately the SAME deployment name, labels and rolling-update shape as k8s/churnsim.yaml.
+  # The two arms are mutually exclusive -- one cluster under test at a time -- and keeping the
+  # names identical means every script's `deployment/churnsim` and `-l app=churnsim` selector
+  # works unchanged on both. Diff this file against churnsim.yaml: everything except the
+  # backend-specific env block should be identical, and if it is not, the arms are not comparable.
   replicas: 3
-  # Typical production rolling-deploy shape: surge one pod at a time,
-  # never dip below the desired replica count. minReadySeconds paces the
-  # rollout the way a real readiness gate would, so old pods drain while
-  # new pods have already joined the Wolverine cluster -- the exact
-  # overlap window GH-3987 describes.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -31,13 +31,17 @@ spec:
           env:
             # Declares which arm this is. ChurnSim compares it against the backend the image was
             # BUILT for and refuses to start on a mismatch, so a stale image cannot quietly
-            # produce numbers filed under the wrong store. See k8s/churnsim-ravendb.yaml.
+            # produce numbers filed under the wrong store.
             - name: SIM_BACKEND
-              value: "postgres"
-            - name: POSTGRES_CONNECTION
-              value: "Host=pg;Database=churnsim;Username=postgres;Password=postgres"
-            # Downward API: SafetyLab joins pg_stat_activity.client_addr back to a Wolverine
-            # node id through the SIM-IDENTITY line the app logs from these two values.
+              value: "ravendb"
+            - name: RAVENDB_URLS
+              value: "http://ravendb:8080"
+            - name: RAVENDB_DATABASE
+              value: "churnsim"
+            # Downward API. On the PostgreSQL arm POD_IP is what joins a pg_stat_activity backend
+            # back to a node; RavenDB's lock names its owner outright and needs no such join, but
+            # both are still logged because SIM-IDENTITY is what gives S6/S7 their node-to-pod map
+            # on either backend.
             - name: POD_NAME
               valueFrom:
                 fieldRef:

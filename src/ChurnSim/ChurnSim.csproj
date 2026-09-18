@@ -9,14 +9,33 @@
     <!-- Overridden by the Docker build arg: 5.39.0 (released), 6.33.0-stock.1
          (pristine main), or 6.33.0-proposal.1 (GH-3987/GH-3959 implementation) -->
     <WolverineVersion Condition="'$(WolverineVersion)' == ''">5.39.0</WolverineVersion>
+
+    <!-- Which message store this image is built against: 'postgres' (default) or 'ravendb'.
+         A build-time switch rather than a runtime one because the package references differ:
+         a locally packed WolverineFx.RavenDb only exists if that project was packed, and a
+         PostgreSQL run must not be made to depend on it. The deployment declares the same
+         value in SIM_BACKEND and Program.cs refuses to start on a mismatch. -->
+    <SimBackend Condition="'$(SimBackend)' == ''">postgres</SimBackend>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
-    <PackageReference Include="WolverineFx.Postgresql" Version="$(WolverineVersion)" />
     <!-- 6.x core no longer ships the Roslyn runtime compiler (GH-2876) -->
     <PackageReference Include="WolverineFx.RuntimeCompilation" Version="$(WolverineVersion)"
                       Condition="$(WolverineVersion.StartsWith('6'))" />
+  </ItemGroup>
+
+  <!-- Exactly one backend's package and wiring file compiles. Both files define
+       `internal static class SimBackend`, so Program.cs calls SimBackend.Configure with no
+       conditional compilation of its own. -->
+  <ItemGroup Condition="'$(SimBackend)' != 'ravendb'">
+    <PackageReference Include="WolverineFx.Postgresql" Version="$(WolverineVersion)" />
+    <Compile Remove="RavenDbBackend.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SimBackend)' == 'ravendb'">
+    <PackageReference Include="WolverineFx.RavenDb" Version="$(WolverineVersion)" />
+    <Compile Remove="PostgresBackend.cs" />
   </ItemGroup>
 
   <!-- OpenTelemetry, so Wolverine's own spans can be read out of Jaeger instead of inferred

@@ -1,44 +1,47 @@
 #!/usr/bin/env bash
-# Quantify assignment churn from the wolverine_node_records table and from
-# agent start/stop log lines across all current + prior pods.
+# Quantify assignment churn from the store's node-record history and from agent start/stop log
+# lines across all current pods. Works on either arm: scripts/backend.sh reads SIM_BACKEND off
+# the deployment and routes each question to psql or to `safetylab query`.
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.local/bin:$PATH"
-KUBECTL="minikube kubectl -- --context=minikube"
+K="minikube kubectl -- --context=minikube"
+source scripts/backend.sh
 
-PGPOD=$($KUBECTL get pod -l app=pg -o jsonpath='{.items[0].metadata.name}')
+echo "== backend: $(sim_backend) =="
 
-psql() {
-  $KUBECTL exec "$PGPOD" -- psql -U postgres -d churnsim -qAt -c "$1"
-}
+echo
+echo "== node records by event type =="
+# Captured once and reused for the totals below. On RavenDB this is a full scan of the
+# NodeRecords collection, and a long run has tens of thousands of them -- asking twice is a
+# minute of wall clock for an answer we already have.
+records=$(db_records)
+echo "$records"
 
-echo "== node_records by event type =="
-$KUBECTL exec "$PGPOD" -- psql -U postgres -d churnsim -c \
-  "select event_name, count(*) from wolverine.wolverine_node_records group by 1 order by 2 desc;"
-
+echo
 echo "== AssignmentChanged rows per minute =="
-$KUBECTL exec "$PGPOD" -- psql -U postgres -d churnsim -c \
-  "select date_trunc('minute', timestamp) as minute, count(*)
-     from wolverine.wolverine_node_records
-    where event_name = 'AssignmentChanged'
-    group by 1 order by 1;"
+db_per_minute AssignmentChanged
 
+echo
 echo "== currently registered nodes =="
-$KUBECTL exec "$PGPOD" -- psql -U postgres -d churnsim -c \
-  "select node_number, description from wolverine.wolverine_nodes order by node_number;"
+db_nodes
 
+echo
 echo "== current agent assignments per node =="
-$KUBECTL exec "$PGPOD" -- psql -U postgres -d churnsim -c \
-  "select node_id, count(*) from wolverine.wolverine_node_assignments group by 1;"
+db_per_node
 
+echo
 echo "== agent starts/stops seen in live pod logs =="
-for pod in $($KUBECTL get pods -l app=churnsim -o jsonpath='{.items[*].metadata.name}'); do
-  starts=$($KUBECTL logs "$pod" 2>/dev/null | grep -c 'AGENT-START' || true)
-  stops=$($KUBECTL logs "$pod" 2>/dev/null | grep -c 'AGENT-STOP' || true)
+for pod in $($K get pods -l app=churnsim -o jsonpath='{.items[*].metadata.name}'); do
+  starts=$($K logs "$pod" 2>/dev/null | grep -c 'AGENT-START' || true)
+  stops=$($K logs "$pod" 2>/dev/null | grep -c 'AGENT-STOP' || true)
   echo "$pod: starts=$starts stops=$stops"
 done
 
+# The durable record is the source of truth: the logs of replaced pods are gone.
 echo
-echo "total AssignmentChanged: $(psql "select count(*) from wolverine.wolverine_node_records where event_name = 'AssignmentChanged'")"
-echo "total AgentStarted:      $(psql "select count(*) from wolverine.wolverine_node_records where event_name = 'AgentStarted'")"
-echo "total AgentStopped:      $(psql "select count(*) from wolverine.wolverine_node_records where event_name = 'AgentStopped'")"
+for event in AssignmentChanged AgentStarted AgentStopped; do
+  count=$(awk -F'\t' -v e="$event" '$1 == e { print $2 }' <<<"$records")
+  printf 'total %-18s %s\n' "$event:" "${count:-0}"
+done

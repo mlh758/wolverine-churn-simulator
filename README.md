@@ -15,21 +15,74 @@ and measure again.
 
 ## What it is
 
-- **`src/ChurnSim`** — a .NET 10 console host using released
-  `WolverineFx.Postgresql` (5.39.0) with PostgreSQL-backed durability. It
-  registers a custom `IStaticAgentFamily` (`sim://agent1..N`) whose
-  `EvaluateAssignmentsAsync` calls `AssignmentGrid.DistributeEvenly` — the
-  same distribution the Marten projection/subscription agents use, so the
-  assignment plane behaves exactly like a production critter-stack app with
-  N projections. Each agent logs `AGENT-START` / `AGENT-STOP`; an optional
-  `SIM_AGENT_MB` knob gives each running agent a real memory footprint for
-  overload (GH-3959) scenarios.
-- **`k8s/`** — a single-pod PostgreSQL and a 3-replica `churnsim` Deployment
-  with a production-shaped rolling update (`maxSurge: 1`,
+- **`src/ChurnSim`** — a .NET 10 console host running Wolverine against one of
+  two message stores (see [Backends](#backends) below). It registers a custom
+  `IStaticAgentFamily` (`sim://agent1..N`) whose `EvaluateAssignmentsAsync`
+  calls `AssignmentGrid.DistributeEvenly` — the same distribution the Marten
+  projection/subscription agents use, so the assignment plane behaves exactly
+  like a production critter-stack app with N projections. Each agent logs
+  `AGENT-START` / `AGENT-STOP`; an optional `SIM_AGENT_MB` knob gives each
+  running agent a real memory footprint for overload (GH-3959) scenarios.
+- **`k8s/`** — a single-pod store (PostgreSQL or RavenDB) and a 3-replica
+  `churnsim` Deployment with a production-shaped rolling update (`maxSurge: 1`,
   `maxUnavailable: 0`, `minReadySeconds: 15`) so old pods drain while new
   pods have already joined the Wolverine cluster.
 - **`scripts/`** — build/deploy, trigger a rolling deploy, and measure churn
-  from the `wolverine_node_records` table plus pod logs.
+  from the store's node-record history plus pod logs.
+
+## Backends
+
+The same simulation runs against two stores, because Wolverine's leader election
+is not the same algorithm on both and the difference is the interesting part.
+
+| | PostgreSQL | RavenDB |
+|---|---|---|
+| Leadership lock | session-scoped advisory lock, id `schemaName.GetDeterministicHashCode()` | compare-exchange document `wolverine/leader/<service>` with a **5-minute expiry** |
+| Released by | the holding backend's death, server-side, immediately | **nothing** — a peer must notice the expiry and CAS-replace it |
+| Lock names its owner | no; a `client_addr`, resolved through the pod identity map | yes, a node id in the document |
+| Assignments | one row per agent, PK-enforced | one `AgentAssignments` document per agent, id-enforced |
+| Reading them | `SELECT` | a query, which carries `IsStale` and a page limit |
+| Store clock | `now()` | the HTTP `Date` header, second resolution |
+
+The consequence worth stating plainly: **on RavenDB a leader that dies ungracefully
+leaves the lock behind for up to five minutes, and no actor in the server clears
+it.** The failure mode is not two leaders — it is *no* leader, for as long as
+nobody looks, and it is invisible from inside every node because
+`HasLeadershipLock()` reads a local field and never asks the server who owns the
+key. That is what SafetyLab's **S8** exists to measure, and it has no PostgreSQL
+counterpart at all.
+
+The backend is a **build-time** choice: `ChurnSim.csproj` selects both the message
+store package and the wiring file (`PostgresBackend.cs` / `RavenDbBackend.cs`) from
+`-p:SimBackend=`, so an image is single-backend by construction. The deployment
+declares the same value in `SIM_BACKEND` and ChurnSim **refuses to start on a
+mismatch** — a mislabelled arm has cost this rig three launches already.
+
+```bash
+./scripts/deploy.sh                              # postgres (default), WolverineFx 5.39.0
+./scripts/deploy.sh 6.39.0 --backend ravendb     # the RavenDB arm
+```
+
+Everything downstream is arm-agnostic: `scripts/backend.sh` reads `SIM_BACKEND` off
+the deployment and routes each measurement to `psql` or to `safetylab query`, so
+`measure.sh`, `reset-metrics.sh`, `reset-schema.sh`, `duplicate-rate.sh` and
+`heal-test.sh` all work unchanged on either.
+
+Two constraints specific to the RavenDB arm:
+
+- **It needs a Wolverine build from after 2026-07-02**, when the native
+  `ravendb://` control queue landed. Balanced durability needs a control endpoint
+  and there is no fallback — `UseTcpForControlEndpoint()` advertises
+  `tcp://localhost`, which no peer pod can reach. `deploy.sh` rejects 5.x outright
+  and ChurnSim checks again at startup.
+- **Measurement goes through the safetylab pod** (`./scripts/monitor.sh deploy`),
+  because there is no `psql` to `kubectl exec` into. The monitor already speaks
+  RavenDB's REST API and takes no Wolverine dependency, so it doubles as the query
+  tool rather than needing a second image.
+
+`scripts/synth-guard-*.sh` are PostgreSQL-only and say so: they inject faults with
+row-level security, which RavenDB has no equivalent of. They refuse to run on the
+RavenDB arm rather than silently measuring something else.
 
 ## Environment setup (one time)
 
@@ -62,25 +115,28 @@ the .NET 10 SDK for it, along with kubectl, podman and jq.
 ## Running the baseline (reproduce GH-3987)
 
 ```bash
-./scripts/deploy.sh          # build image, load into minikube, deploy pg + 3 replicas
-./scripts/reset-metrics.sh   # zero the node_records history once the cluster is settled
+./scripts/deploy.sh          # build image, load into minikube, deploy the store + 3 replicas
+./scripts/reset-metrics.sh   # zero the node-record history once the cluster is settled
 ./scripts/rollout.sh         # one rolling deploy: 3 pods replaced one at a time
 ./scripts/measure.sh         # churn report
 ```
 
+Add `--backend ravendb` to `deploy.sh` (plus `./scripts/monitor.sh deploy`, which the
+RavenDB arm needs before it can be measured) and the other three are unchanged.
+
 `measure.sh` reports:
 
-- `wolverine_node_records` counts by event type — `AssignmentChanged` is the
+- node-record counts by event type — `AssignmentChanged` is the
   churn signal the issue reporter counted (24k rows for one 3-pod rollout in
   their production system);
 - `AssignmentChanged` rows per minute, to see the churn concentrated in the
   rollout window;
 - current node registrations and per-node agent assignment counts — after the
   cluster settles, every `sim://` agent should have exactly one assignment on
-  a live node. Discrepancies between `wolverine_node_assignments` and what
+  a live node. Discrepancies between the assignment set and what
   pods actually run are the "assigned but not running" symptom;
 - `AGENT-START` / `AGENT-STOP` counts from live pod logs (note: logs of
-  replaced pods are gone, so the durable node_records numbers are the source
+  replaced pods are gone, so the durable node-record numbers are the source
   of truth).
 
 To measure a steady-state baseline (no deploy), reset metrics, wait a few
@@ -106,24 +162,32 @@ terminated, its in-process lock list went on reporting "held", and two nodes bot
 
 | | Property | Fails when |
 |---|---|---|
-| S1 | At most one backend holds the leader advisory lock | sentinel — if it trips, the lock id is wrong and every leader check below is vacuous |
-| S2 | At most one `wolverine://leader` assignment row | sentinel — already PK-enforced |
+| S1 | At most one holder of the leader lock | Postgres: sentinel — if it trips, the lock id is wrong and every leader check below is vacuous. **RavenDB: a real check** — leadership held under both `wolverine/leader` and `wolverine/leader/<service>` |
+| S2 | At most one `wolverine://leader` assignment row | sentinel — already enforced, by a PK on Postgres and by document identity on RavenDB |
 | S3 | The lock and the leader assignment row agree | sustained split between "who holds the lock" and "who owns the row" |
-| S4 | The lock is not held by a departed node | the stacking / failover-stall fingerprint |
+| S4 | The lock is not held by a departed node | the stacking / failover-stall fingerprint (on RavenDB, expected for up to the lock's 5-minute expiry — read with S8) |
+| S8 | The lock is not left expired but unclaimed | **RavenDB only** — an expired compare-exchange lock nobody has taken over: no leader until a peer looks. SKIPs on Postgres, where a lock has no expiry |
 | S5 | **No agent runs on two nodes at once** | the user-visible property: a doubled projection daemon or exclusive listener |
 | S6 | Every assigned agent is running on its assigned node | GH-3987's "assigned but not running" wedge |
 | S7 | Every running agent is assigned to the node running it | an orphan runner — the precursor to S5 |
-| L1 | The cluster converges after the last phase marker | one leader, every agent placed once, and it stays that way |
-| C0 | Observation coverage | sampling gaps, failed samples, monitor↔database clock offset |
+| L1 | The cluster converges after the last phase marker | one leader, every agent placed once, and it stays that way (on RavenDB a *present but expired* lock is not a leader) |
+| C0 | Observation coverage | sampling gaps, failed samples, monitor↔store clock offset, and — on RavenDB — a query that came back stale or short of its page limit |
 
-S3–S7 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
+S3–S8 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
 of disagreement is the protocol working. What gets reported is divergence that does not end.
+
+The checkers themselves are backend-agnostic: every leader-side check reads
+`RunHistory.LeaderHolders`, which normalises "a granted advisory lock, attributed through the
+identity map" and "a compare-exchange document that names its owner" into the same shape. Which
+evidence a sample carries is recorded in its meta record, and a run directory captured before the
+RavenDB arm existed has no `backend` field — those load and check as PostgreSQL, unchanged.
 
 ### Running it
 
 ```bash
 nix develop                              # dotnet 10 + kubectl + podman + jq
-./scripts/monitor.sh deploy              # build + deploy the in-cluster monitor (once)
+./scripts/monitor.sh deploy              # build + deploy the in-cluster monitor (once;
+                                         # picks the manifest matching the deployed arm)
 
 ./scripts/monitor.sh start rollout-1     # begin capturing BEFORE the disturbance
 ./scripts/rollout.sh
@@ -156,16 +220,22 @@ checks must go red — and that the others stay green.
 
 ```
 $ nix develop --command ./tests/selftest.sh
-  ok   clean          -> []
-  ok   dup-agent      -> [S5 S7]
-  ok   orphan-lock    -> [L1 S3 S4]
-  ok   stranded       -> [S6]
-  ok   no-converge    -> [L1]
-  ok   split-leader   -> [S3]
-  ok   gap            -> [C0]
+  ok   clean              -> []
+  ok   dup-agent          -> [S5 S7]
+  ok   orphan-lock        -> [L1 S3 S4]
+  ok   stranded           -> [S6]
+  ok   no-converge        -> [L1]
+  ok   split-leader       -> [S3]
+  ok   gap                -> [C0]
+  ok   raven-clean        -> []
+  ok   raven-expired-lock -> [L1 S8]
+  ok   raven-split-key    -> [L1 S1]
+  ok   raven-truncated    -> [C0]
 ```
 
-Add a checker, add a fixture and a ledger row.
+Add a checker, add a fixture and a ledger row. `raven-clean` is not filler: without it the
+leader-side checkers could pass a RavenDB run vacuously — finding no `pg_locks` rows, because
+there are none — which is precisely how the first live PostgreSQL run passed every leader check.
 
 ## Structured logs and SQL
 
@@ -209,6 +279,9 @@ byte-for-byte comparable with earlier results.
 
 | Knob | Where | Default | Meaning |
 |---|---|---|---|
+| `SIM_BACKEND` | `k8s/churnsim*.yaml` | `postgres` | which store this arm is; must match the image's build-time `-p:SimBackend=` or ChurnSim refuses to start |
+| `RAVENDB_URLS` / `RAVENDB_DATABASE` | `k8s/churnsim-ravendb.yaml` | `http://ravendb:8080` / `churnsim` | RavenDB arm only; ChurnSim creates the database if it is missing |
+| `RAVEN_Memory_MaxWorkingSet` | `k8s/ravendb.yaml` | 1024 (MB) | **do not remove** — RavenDB otherwise sizes itself from the host's 30 GB, see [harness-traps.md](docs/harness-traps.md) |
 | `SIM_AGENT_COUNT` | `k8s/churnsim.yaml` | 20 | number of `sim://` agents to distribute |
 | `SIM_AGENT_MB` | `k8s/churnsim.yaml` | 0 | resident MB each *running* agent allocates (for GH-3959 overload runs) |
 | `replicas` | `k8s/churnsim.yaml` | 3 | cluster size |
@@ -254,6 +327,11 @@ done
 
 ./scripts/deploy.sh 6.33.0-stock.1       # or 6.33.0-proposal.3
 ```
+
+For the RavenDB arm, swap `Wolverine.Postgresql` (and `Wolverine.RDBMS`, which it does not
+need) for `src/Persistence/Wolverine.RavenDb/Wolverine.RavenDb.csproj` in that list. The two
+arms' package sets are disjoint apart from core, which is the point of the build-time switch:
+neither has to be packed to run the other.
 
 Churn-shape runs: `reset-metrics.sh` → `rollout.sh <stamp>` → settle →
 `measure.sh`; for the proposal add

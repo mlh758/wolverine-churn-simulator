@@ -33,10 +33,12 @@ TSV="$OUT/results.tsv"
 mkdir -p "$OUT"
 [ -f "$TSV" ] || printf 'iteration\toutcome\thealed\tpersisted\tlongest_heal_s\n' > "$TSV"
 
+# The only question this script asks the store is "how many sim agents are placed"; everything
+# else it needs is already in the pod logs. backend.sh answers it on either arm.
+source scripts/backend.sh
+
 live_pods() { $K get pods -l app=churnsim -o json 2>/dev/null | python3 scripts/live_pods.py; }
-pgpod()     { $K get pod -l app=pg -o jsonpath='{.items[0].metadata.name}'; }
-psql_t()    { $K exec "$(pgpod)" -- psql -U postgres -d churnsim -qAt -c "$1" 2>/dev/null; }
-placed()    { psql_t "select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';" | tr -d '[:space:]'; }
+placed()    { db_placed; }
 
 capture() {
     local dir="$1"

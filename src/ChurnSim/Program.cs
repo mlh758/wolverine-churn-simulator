@@ -3,12 +3,26 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Wolverine;
-using Wolverine.Postgresql;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Wolverine.Runtime.Agents;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+// Which message store this image was BUILT for is a compile-time fact (see ChurnSim.csproj's
+// SimBackend switch), but SIM_BACKEND on the deployment is what every measurement script reads
+// to pick its query path. If the two disagree, the arm is mislabelled and the run is scrap --
+// and a mislabelled arm has already cost this rig three launches (see duplicate-rate.sh). Die
+// here rather than produce numbers filed under the wrong backend.
+var declaredBackend = Environment.GetEnvironmentVariable("SIM_BACKEND");
+if (!string.IsNullOrWhiteSpace(declaredBackend) &&
+    !string.Equals(declaredBackend, SimBackend.Name, StringComparison.OrdinalIgnoreCase))
+{
+    throw new InvalidOperationException(
+        $"SIM_BACKEND is '{declaredBackend}' but this image was built for '{SimBackend.Name}'. " +
+        "Rebuild with ./scripts/deploy.sh --backend " + declaredBackend +
+        ", or fix the deployment's SIM_BACKEND. Refusing to run a mislabelled arm.");
+}
 
 // Startup lines are written before a logger exists, but they must not break the log stream:
 // DuckDB reads the pod log as newline-delimited JSON, and a single bare-text line makes the whole
@@ -77,9 +91,6 @@ if (!string.IsNullOrWhiteSpace(otlp))
         new Dictionary<string, object?> { ["Setting"] = "SIM_OTLP_ENDPOINT", ["Value"] = otlp });
 }
 
-var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
-                       ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
-
 builder.UseWolverine(opts =>
 {
     opts.ServiceName = "churnsim";
@@ -103,7 +114,10 @@ builder.UseWolverine(opts =>
     // No message handlers needed -- the point is the agent assignment plane
     opts.Discovery.DisableConventionalDiscovery();
 
-    opts.PersistMessagesWithPostgresql(connectionString, "wolverine");
+    // The one line that differs between arms. Everything below -- the control-plane timers, the
+    // proposal knobs, the agent family -- is held constant on purpose, so a difference between a
+    // PostgreSQL run and a RavenDB run is the store's semantics and not the simulation's.
+    SimBackend.Configure(opts, emit);
 
     // Tighten the control-plane timers a bit so a short simulated rollout
     // exercises several health-check / assignment cycles. These stay well

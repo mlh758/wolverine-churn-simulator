@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safetylab
+spec:
+  # Exactly one. A second monitor would double the history with interleaved seq numbers and
+  # make the coverage check meaningless.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: safetylab
+  template:
+    metadata:
+      labels:
+        app: safetylab
+    spec:
+      # The monitor must outlive a rollout of the app it is watching, and must not be drained
+      # at the same moment the interesting thing happens.
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: safetylab
+          image: localhost/safetylab:local
+          imagePullPolicy: Never
+          # Same 1s tick as the PostgreSQL arm, for the same reason: every sample carries the
+          # whole assignment set, the control plane itself only ticks at 2-5s, and the checkers'
+          # grace windows are 15s, so a faster tick buys size and not resolution.
+          #
+          # --service must match ChurnSim's opts.ServiceName: RavenDbMessageStore builds the
+          # leadership key as "wolverine/leader/<service, lowercased>". It is recorded in the meta
+          # record rather than used as a filter -- LeaderHolders matches any wolverine/leader key,
+          # precisely so that a lock held under an unexpected spelling shows up as a second holder
+          # instead of vanishing from the history.
+          args:
+            - "monitor"
+            - "--backend"
+            - "ravendb"
+            - "--tick-ms"
+            - "1000"
+            - "--service"
+            - "churnsim"
+          env:
+            - name: RAVENDB_URL
+              value: "http://ravendb:8080"
+            - name: RAVENDB_DATABASE
+              value: "churnsim"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

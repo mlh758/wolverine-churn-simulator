@@ -3,6 +3,16 @@ using System.Text.Json;
 namespace SafetyLab;
 
 /// <summary>
+/// One holder of the leadership lock, normalised across backends.
+/// <paramref name="Where"/> is the server-side evidence in the backend's own vocabulary (a
+/// Postgres pid and client address, or a RavenDB compare-exchange key and Raft index) and goes
+/// straight into violation text, so a report still says where to go and look.
+/// <paramref name="ExpiresAt"/> is RavenDB-only and null on PostgreSQL, where a lock has no
+/// expiry because the death of its session <em>is</em> its release.
+/// </summary>
+public sealed record LeaderHolder(string Where, Guid? NodeId, DateTimeOffset? ExpiresAt);
+
+/// <summary>
 /// A captured run directory, loaded back for offline checking:
 ///
 /// <list type="bullet">
@@ -62,6 +72,24 @@ public sealed class RunHistory
     }
 
     public long LeaderLockId => Meta?.LeaderLockId ?? LockIdForSchema("wolverine");
+
+    /// <summary>
+    /// Which message store this run watched. A history with no <c>backend</c> in its meta record
+    /// predates the RavenDB arm, and every one of those was PostgreSQL — so the default is not a
+    /// guess.
+    /// </summary>
+    public string Backend => Meta?.BackendName ?? Backends.Postgres;
+
+    public bool IsRavenDb => Backend == Backends.RavenDb;
+
+    /// <summary>
+    /// RavenDB's leadership compare-exchange key. Matches both the suffixed form the store settles
+    /// on (<c>wolverine/leader/&lt;service&gt;</c>) and the un-suffixed one its constructor starts
+    /// with, because a lock held under both at once is a genuine split and must be visible as two
+    /// holders rather than filtered down to one.
+    /// </summary>
+    public static bool IsLeaderLockKey(string key)
+        => key == "wolverine/leader" || key.StartsWith("wolverine/leader/", StringComparison.Ordinal);
 
     public IEnumerable<Sample> Good => Samples.Where(x => x.Error is null);
 
@@ -185,6 +213,40 @@ public sealed class RunHistory
         var wanted = (uint)LeaderLockId;
         return sample.Locks.Where(x => (uint)x.ObjId == wanted && x.Granted);
     }
+
+    /// <summary>
+    /// Whoever holds leadership in this sample, in backend-neutral terms. Every leader-side
+    /// checker goes through here, which is the whole reason the RavenDB arm did not need a second
+    /// copy of them: the properties ("at most one holder", "the holder and the row agree", "the
+    /// holder is still a registered node") are about the protocol, not about the store.
+    ///
+    /// The two backends differ in what they can answer, and the difference is real rather than
+    /// cosmetic. PostgreSQL knows a <c>client_addr</c>, so <see cref="LeaderHolder.NodeId"/> is
+    /// null whenever the identity map cannot place that address — a case S4 exists to report. On
+    /// RavenDB the lock document names its owner, so the node id is always known and never needs
+    /// pod logs; what RavenDB adds instead is <see cref="LeaderHolder.ExpiresAt"/>, which Postgres
+    /// has no equivalent for at all.
+    /// </summary>
+    public IReadOnlyList<LeaderHolder> LeaderHolders(Sample sample)
+    {
+        if (IsRavenDb)
+        {
+            return (sample.Cmpxchg ?? [])
+                .Where(x => IsLeaderLockKey(x.Key))
+                .Select(x => new LeaderHolder($"cmpxchg '{x.Key}' at index {x.Index}", x.NodeId, x.ExpiresAt))
+                .ToList();
+        }
+
+        return LeaderLockHolders(sample)
+            .Select(x => new LeaderHolder($"pid {x.Pid} ({x.ClientAddr})", NodeForAddress(x.ClientAddr, sample.Ts),
+                null))
+            .ToList();
+    }
+
+    /// <summary>How the leader lock is named in a report line, for the header of a run.</summary>
+    public string LeaderLockDescription => IsRavenDb
+        ? $"compare-exchange '{Meta?.LockKey ?? "wolverine/leader/*"}'"
+        : $"advisory lock {LeaderLockId}";
 
     public static AssignmentRow? LeaderRow(Sample sample)
         => sample.Assignments.FirstOrDefault(x => IsLeaderUri(x.Id));

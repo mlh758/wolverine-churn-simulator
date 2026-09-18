@@ -55,6 +55,7 @@ public static class Checkers
             LeaderRowUniqueness(history),
             LeaderCoherence(history, options),
             OrphanedLeaderLock(history, options),
+            ExpiredLeaderLock(history, options),
             RuntimeAgentExclusivity(history, options, residencies),
             AssignedButNotRunning(history, options, residencies),
             RunningButNotAssigned(history, options, residencies),
@@ -66,36 +67,52 @@ public static class Checkers
     // ---------------------------------------------------------------- safety
 
     /// <summary>
-    /// Two backends holding the same advisory lock is impossible in Postgres, so this is a
-    /// sentinel: if it ever trips, the monitor is watching the wrong lock id and every other
-    /// leader check in this file is worthless. Cheap insurance against a silently green run.
+    /// On PostgreSQL this is a sentinel: two backends holding one advisory lock is impossible, so
+    /// if it ever trips the monitor is watching the wrong lock id and every other leader check in
+    /// this file is worthless. Cheap insurance against a silently green run.
+    ///
+    /// On RavenDB it is not a sentinel but a real check, because the lock is not one key. The
+    /// message store constructs itself with <c>wolverine/leader</c> and renames the key to
+    /// <c>wolverine/leader/&lt;service&gt;</c> when <c>StartScheduledJobs</c> runs, and each key is
+    /// an independent compare-exchange value with its own index. Two nodes leading under the two
+    /// spellings is a state the compare-exchange primitive does nothing to prevent, and it would
+    /// look perfectly healthy from inside either node.
     /// </summary>
     private static CheckResult LeaderLockUniqueness(RunHistory history)
     {
         var violations = Condense(history.Good, TimeSpan.Zero, sample =>
         {
-            var holders = history.LeaderLockHolders(sample).ToArray();
-            return holders.Length > 1
-                ? $"{holders.Length} backends hold leader lock {history.LeaderLockId}: " +
-                  string.Join(", ", holders.Select(x => $"pid {x.Pid} ({x.ClientAddr})"))
+            var holders = history.LeaderHolders(sample);
+            return holders.Count > 1
+                ? $"{holders.Count} holders of the leader lock: " +
+                  string.Join(", ", holders.Select(x => x.Where + (x.NodeId is null ? "" : $" = node {x.NodeId}")))
                 : null;
         });
 
-        var everHeld = history.Good.Any(s => history.LeaderLockHolders(s).Any());
+        var everHeld = history.Good.Any(s => history.LeaderHolders(s).Count > 0);
         var notes = new List<string>();
         if (!everHeld)
         {
-            notes.Add($"the leader lock ({history.LeaderLockId}) was NEVER observed held in this run — " +
-                      "either the cluster never elected a leader, or the lock id is wrong and the " +
-                      "leader-side checks below are vacuous");
+            notes.Add($"the leader lock ({history.LeaderLockDescription}) was NEVER observed held in this " +
+                      "run — either the cluster never elected a leader, or the monitor is watching the wrong " +
+                      "key and the leader-side checks below are vacuous");
         }
 
-        return new CheckResult("S1", "At most one backend holds the leader advisory lock", violations, notes);
+        notes.Add(history.IsRavenDb
+            ? "on RavenDB this is a real check, not a sentinel: the leadership key is renamed from " +
+              "'wolverine/leader' to 'wolverine/leader/<service>' once StartScheduledJobs runs, and nothing " +
+              "stops the two spellings being held by different nodes"
+            : "two backends holding one advisory lock is impossible in Postgres, so this is a sentinel: if " +
+              "it trips, the lock id is wrong and every leader check below is vacuous");
+
+        return new CheckResult("S1", "At most one holder of the leader lock", violations, notes);
     }
 
     /// <summary>
-    /// Also PK-enforced (<c>wolverine_node_assignments.id</c> is the primary key), so likewise a
-    /// sentinel rather than a discovery. Kept because it costs nothing and it pins the assumption.
+    /// Enforced by the store on both backends — a primary key on
+    /// <c>wolverine_node_assignments.id</c> on PostgreSQL, document identity on the
+    /// <c>AgentAssignments</c> collection on RavenDB — so likewise a sentinel rather than a
+    /// discovery. Kept because it costs nothing and it pins the assumption.
     /// </summary>
     private static CheckResult LeaderRowUniqueness(RunHistory history)
     {
@@ -106,7 +123,11 @@ public static class Checkers
         });
 
         return new CheckResult("S2", $"At most one '{RunHistory.LeaderUri}' assignment row", violations,
-            ["primary key on wolverine_node_assignments.id already enforces this; kept as a sentinel"]);
+        [
+            history.IsRavenDb
+                ? "one AgentAssignments document per agent uri already enforces this; kept as a sentinel"
+                : "primary key on wolverine_node_assignments.id already enforces this; kept as a sentinel"
+        ]);
     }
 
     /// <summary>
@@ -118,11 +139,22 @@ public static class Checkers
     private static CheckResult LeaderCoherence(RunHistory history, CheckOptions options)
     {
         var notes = new List<string>();
-        var haveIdentities = history.Identities.Count > 0;
-        if (!haveIdentities)
+
+        // On RavenDB the lock document carries its owner's node id, so attribution needs nothing
+        // from the pod logs. On PostgreSQL it needs the identity map to turn a client_addr into a
+        // node, and without it the 'same node' half cannot run at all.
+        var canAttribute = history.IsRavenDb || history.Identities.Count > 0;
+        if (!canAttribute)
         {
             notes.Add("no identity records in pods.jsonl — lock-holder-to-node attribution was skipped, " +
                       "so only the presence checks ran, not the 'same node' check");
+        }
+
+        if (history.IsRavenDb)
+        {
+            notes.Add("RavenDB's HasLeadershipLock() reads a local field and its expiry and never asks the " +
+                      "server who owns the key, so a disagreement found here is belief-versus-server — the " +
+                      "GH-2602 shape — and not a reporting artifact");
         }
 
         var violations = new List<Violation>();
@@ -131,35 +163,34 @@ public static class Checkers
         {
             var row = RunHistory.LeaderRow(sample);
             if (row is null) return null;
-            return history.LeaderLockHolders(sample).Any()
+            return history.LeaderHolders(sample).Count > 0
                 ? null
-                : $"node {row.NodeId} owns the leader assignment row but no backend holds lock {history.LeaderLockId}";
+                : $"node {row.NodeId} owns the leader assignment row but nothing holds " +
+                  $"{history.LeaderLockDescription}";
         }));
 
         violations.AddRange(Condense(history.Good, options.Grace, sample =>
         {
-            var holder = history.LeaderLockHolders(sample).FirstOrDefault();
+            var holder = history.LeaderHolders(sample).FirstOrDefault();
             if (holder is null) return null;
             return RunHistory.LeaderRow(sample) is null
-                ? $"pid {holder.Pid} ({holder.ClientAddr}) holds the leader lock but there is no leader assignment row"
+                ? $"{holder.Where} holds the leader lock but there is no leader assignment row"
                 : null;
         }));
 
-        if (haveIdentities)
+        if (canAttribute)
         {
             violations.AddRange(Condense(history.Good, options.Grace, sample =>
             {
                 var row = RunHistory.LeaderRow(sample);
-                var holder = history.LeaderLockHolders(sample).FirstOrDefault();
+                var holder = history.LeaderHolders(sample).FirstOrDefault();
                 if (row is null || holder is null) return null;
+                if (holder.NodeId is null) return null; // unattributable holder; covered by S4
 
-                var holderNode = history.NodeForAddress(holder.ClientAddr, sample.Ts);
-                if (holderNode is null) return null; // covered by S4
-
-                return holderNode == row.NodeId
+                return holder.NodeId == row.NodeId
                     ? null
-                    : $"leader row says node {row.NodeId} but lock {history.LeaderLockId} is held by " +
-                      $"node {holderNode} (pid {holder.Pid}, {holder.ClientAddr})";
+                    : $"leader row says node {row.NodeId} but {history.LeaderLockDescription} is held by " +
+                      $"node {holder.NodeId} ({holder.Where})";
             }));
         }
 
@@ -176,7 +207,9 @@ public static class Checkers
     /// </summary>
     private static CheckResult OrphanedLeaderLock(RunHistory history, CheckOptions options)
     {
-        if (history.Identities.Count == 0)
+        // RavenDB's lock names its own owner, so this runs with no pod logs at all. Postgres
+        // cannot: pg_stat_activity knows a client_addr and nothing more.
+        if (!history.IsRavenDb && history.Identities.Count == 0)
         {
             return new CheckResult("S4", "The leader lock is not held by a departed node", [],
                 ["skipped: needs identity records in pods.jsonl to map a backend to a node"])
@@ -187,23 +220,83 @@ public static class Checkers
 
         var violations = Condense(history.Good, options.Grace, sample =>
         {
-            var holder = history.LeaderLockHolders(sample).FirstOrDefault();
+            var holder = history.LeaderHolders(sample).FirstOrDefault();
             if (holder is null) return null;
 
-            var holderNode = history.NodeForAddress(holder.ClientAddr, sample.Ts);
-            if (holderNode is null)
+            if (holder.NodeId is null)
             {
-                return $"leader lock held by pid {holder.Pid} at {holder.ClientAddr}, which never " +
-                       "announced itself as a node";
+                return $"leader lock held by {holder.Where}, which never announced itself as a node";
             }
 
-            return sample.Nodes.Any(n => n.Id == holderNode)
+            return sample.Nodes.Any(n => n.Id == holder.NodeId)
                 ? null
-                : $"leader lock held by node {holderNode} (pid {holder.Pid}, {holder.ClientAddr}), which is " +
-                  "no longer registered in wolverine_nodes — failover cannot proceed while this holds";
+                : $"leader lock held by node {holder.NodeId} ({holder.Where}), which is no longer a " +
+                  "registered node — failover cannot proceed while this holds";
         });
 
-        return new CheckResult("S4", "The leader lock is not held by a departed node", violations, []);
+        var notes = new List<string>();
+        if (history.IsRavenDb)
+        {
+            notes.Add("on RavenDB this is the expected state for up to five minutes after a leader dies " +
+                      "without releasing: the compare-exchange value has no session to die with, so it sits " +
+                      "there until it expires and a peer CAS-replaces it. Read this check together with S8, " +
+                      "and treat a window shorter than the expiry as the protocol rather than a bug");
+        }
+
+        return new CheckResult("S4", "The leader lock is not held by a departed node", violations, notes);
+    }
+
+    /// <summary>
+    /// RavenDB-only, and the reason the RavenDB arm exists as a separate arm at all.
+    ///
+    /// A PostgreSQL leadership lock is released by the death of the session holding it, which is
+    /// immediate and needs no actor. A RavenDB leadership lock is a compare-exchange document with
+    /// an <c>ExpirationTime</c> five minutes out, and nothing in the server clears it: the only
+    /// path back to an elected leader is <c>tryTakeOverIfExpiredAsync</c> — a <em>peer</em>
+    /// noticing the expiry and CAS-replacing the value. So the failure mode is not "two leaders"
+    /// but "no leader, for as long as nobody looks", and it is invisible from inside every node
+    /// (the dead one is dead; the live ones see a lock they do not hold).
+    ///
+    /// What this reports is therefore an expired lock that is <em>still there</em> beyond the
+    /// grace window — the stall itself, not the expiry, which is normal and momentary.
+    /// </summary>
+    private static CheckResult ExpiredLeaderLock(RunHistory history, CheckOptions options)
+    {
+        if (!history.IsRavenDb)
+        {
+            return new CheckResult("S8", "The leader lock is not left expired but unclaimed", [],
+            [
+                "skipped: PostgreSQL advisory locks have no expiration — the death of the holding session " +
+                "is the release, so there is no window for this to describe"
+            ])
+            {
+                Skipped = true
+            };
+        }
+
+        var violations = Condense(history.Good, options.Grace, sample =>
+        {
+            var expired = history.LeaderHolders(sample)
+                .Where(x => x.ExpiresAt is not null && x.ExpiresAt < sample.Ts)
+                .ToArray();
+
+            if (expired.Length == 0) return null;
+
+            var holder = expired[0];
+            var age = sample.Ts - holder.ExpiresAt!.Value;
+            return $"{holder.Where} is held by node {holder.NodeId} but expired {age.TotalSeconds:F0}s ago " +
+                   "and has not been taken over — no node can become leader until a peer CAS-replaces it";
+        });
+
+        var everSeen = history.Good.Any(s => history.LeaderHolders(s).Any(x => x.ExpiresAt is not null));
+        var notes = new List<string>();
+        if (!everSeen)
+        {
+            notes.Add("no leader lock with an expiration was observed in this run, so nothing here was " +
+                      "actually exercised — check S1's note before reading this as a pass");
+        }
+
+        return new CheckResult("S8", "The leader lock is not left expired but unclaimed", violations, notes);
     }
 
     /// <summary>
@@ -382,8 +475,15 @@ public static class Checkers
             var row = RunHistory.LeaderRow(sample);
             if (row is null) return "no leader assignment row";
 
-            var holders = history.LeaderLockHolders(sample).ToArray();
-            if (holders.Length != 1) return $"{holders.Length} leader lock holders";
+            var holders = history.LeaderHolders(sample);
+            if (holders.Count != 1) return $"{holders.Count} leader lock holders";
+
+            // On RavenDB a lock that is present but expired is not leadership: the incumbent may
+            // be gone and no peer has claimed it yet. Converged has to mean a live claim.
+            if (holders[0].ExpiresAt is { } expiry && expiry < sample.Ts)
+            {
+                return $"the leader lock is present but expired ({(sample.Ts - expiry).TotalSeconds:F0}s ago)";
+            }
 
             var placed = RunHistory.SimAssignments(sample).Select(x => x.Id).ToHashSet();
             if (!expected.SetEquals(placed))
@@ -474,6 +574,8 @@ public static class Checkers
         var first = history.Samples[0].Ts;
         var last = history.Samples[^1].Ts;
 
+        notes.Add($"backend '{history.Backend}', leadership watched as {history.LeaderLockDescription}");
+
         notes.Add($"{history.Samples.Count} samples over {(last - first).TotalMinutes:F1} min at a " +
                   $"{tick.TotalMilliseconds:F0}ms tick" +
                   (history.Meta is null ? " (inferred — no meta record in this capture)" : ""));
@@ -483,6 +585,22 @@ public static class Checkers
         {
             notes.Add($"{errors} sample(s) failed outright; their first error was: " +
                       history.Samples.First(x => x.Error is not null).Error);
+        }
+
+        // A tick that succeeded but came back short or stale. On RavenDB the assignment set is read
+        // through a paged query rather than a SELECT, so a run with more agents than the monitor's
+        // page limit would quietly check a prefix of the cluster and report it as healthy. That is
+        // precisely the class of harness lie C0 exists to make impossible, so a truncated sample is
+        // a violation and not a note.
+        var warned = history.Samples.Where(x => x.Warnings is { Count: > 0 }).ToArray();
+        if (warned.Length > 0)
+        {
+            var kinds = warned.SelectMany(x => x.Warnings!).GroupBy(x => x)
+                .OrderByDescending(g => g.Count())
+                .Select(g => $"{g.Key} (×{g.Count()})");
+
+            violations.Add(new Violation(warned[0].Ts, warned[^1].Ts,
+                $"{warned.Length} sample(s) came back incomplete or stale: {string.Join("; ", kinds)}"));
         }
 
         for (var i = 1; i < history.Samples.Count; i++)
@@ -507,7 +625,11 @@ public static class Checkers
         {
             notes.Add($"monitor-to-database clock offset: min {offsets.Min():F0}ms, " +
                       $"max {offsets.Max():F0}ms, mean {offsets.Average():F0}ms " +
-                      "(includes query latency, so treat it as an upper bound on true skew)");
+                      "(includes query latency, so treat it as an upper bound on true skew)" +
+                      (history.IsRavenDb
+                          ? " — RavenDB has no now(), so this comes from the HTTP Date response header and is " +
+                            "only accurate to a second; do not read sub-second figures from it"
+                          : ""));
         }
 
         notes.Add($"{history.Identities.Count} node identity record(s), " +

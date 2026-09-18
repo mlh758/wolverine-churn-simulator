@@ -8,3 +8,4 @@ runs/
 .tools/
 tests/fixtures/
 evidence/
+__pycache__/

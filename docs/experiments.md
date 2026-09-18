@@ -44,6 +44,41 @@ Two structural facts worth carrying:
 
 Neither is currently exercised by any test, ours or Wolverine's.
 
+### The second system under test: RavenDB
+
+The same leader-election *protocol* runs on a structurally different lock when the store is
+RavenDB (`RavenDbMessageStore.Locking`), and the differences are not incidental:
+
+- The lock is a **compare-exchange document with a five-minute expiration**, not a session. There
+  is no session whose death releases it. `tryTakeOverIfExpiredAsync` — a *peer* noticing the expiry
+  and CAS-replacing the value — is the only path back to an elected leader.
+- `HasLeadershipLock()` reads a local field and its expiry. It never asks the server who owns the
+  key. On PostgreSQL the equivalent belief is at least refreshed by a `select 1` liveness ping;
+  here there is no server round trip at all.
+- The key is **renamed at runtime**: the constructor sets `wolverine/leader`, and
+  `StartScheduledJobs` changes it to `wolverine/leader/<service>`. Two independent
+  compare-exchange values, each with its own index, and nothing makes holding one exclude the
+  other.
+
+So the characteristic RavenDB failure is not split-brain but **stall**: after an ungraceful
+leader death there is *no* leader for up to five minutes, and it is invisible from inside every
+node — the dead one is dead, and the live ones see a lock they simply do not own. This is what
+S8 measures, and it is the reason the arm exists. It also makes the fencing question from fact (1)
+above sharper rather than softer: a leader whose lock has been taken over by a peer still believes
+it holds one, and still dispatches unfenced agent commands.
+
+Two structural facts here too:
+
+4. **The assignment set is read through a query, not a SELECT.** It arrives with an `IsStale` flag
+   and a page limit. Collection queries (`from AgentAssignments`, no filter) are served from the
+   collection and cannot be stale — but a filtered one builds an auto-index that can be, and a
+   short read would look exactly like a smaller, healthy cluster. The monitor stays on the
+   unfiltered form and records both signals regardless; C0 fails the run on either.
+5. **Staleness detection mixes two clocks here as well, and worse.** RavenDB has no `now()`, so the
+   monitor reads the server's clock from the HTTP `Date` header at one-second resolution. Whatever
+   the true app-versus-store skew is, this arm cannot measure it below a second — which is a real
+   limit on what a RavenDB stale-node finding can claim.
+
 ## The two threads
 
 ### Thread A — duplicate agents under deploy churn
@@ -108,6 +143,27 @@ recorded via `IWolverineObserver`. Faults reachable without any infrastructure:
   through it first
 
 This is the layer most likely to find new leadership bugs, and it runs in CI.
+
+**Layer 1b — the RavenDB arm. Built, not yet run for results.**
+Everything in Layer 0 now runs against RavenDB as well: `deploy.sh --backend ravendb`, a
+compare-exchange-reading monitor, S8 on top of S1–S7/L1/C0, and the same measurement scripts. What
+has been established so far is only that the rig works — a 3-node cluster forms, places 500 agents,
+and checks clean end to end. **No RavenDB result is claimed yet**, and none should be until the
+same runs that produced RESULTS.md have been repeated on it.
+
+The obvious first questions, in order of expected value:
+
+- **E1/E2 on RavenDB.** Is the ~1-in-4 duplicate rate a property of the assignment plane or of the
+  PostgreSQL store? The assignment plane is identical code and the duplicate mechanism found on
+  2026-09-09 is a leadership-handover ordering problem, so the prediction is that it reproduces.
+  A RavenDB rate that differs materially would mean the mechanism is not what we think it is.
+- **The stall, directly.** Kill a leader pod ungracefully (`--grace-period=0`) and measure how long
+  the cluster has no leader. The prediction from the code is "up to five minutes, ended by whichever
+  peer next tries to attain the lock". If the observed number is the full expiry, that is a finding
+  worth reporting on its own — it is a five-minute control-plane outage with no log line.
+- **The key rename.** Does any real sequence leave leadership under both spellings? S1 is now a
+  live check rather than a sentinel on this arm; the fixture proves it can fire, but not that the
+  state is reachable.
 
 **Layer 2 — pod-level faults in minikube. Not built.**
 Only for what Layer 1 cannot fake: SIGSTOP a whole pod, `tc netem` partition pod↔Postgres
@@ -220,7 +276,9 @@ have separated the arms anyway.
 ## Standing rules for this rig
 
 1. **No claim without the configuration it was measured under.** A number without its knobs is not
-   a result.
+   a result — and that now includes the backend. Two arms exist; a figure filed under the wrong
+   one is worse than no figure, which is why `SIM_BACKEND` is asserted by the app at startup and
+   read off the deployment (never passed as an argument) by every measurement script.
 2. **A checker that has never been seen to fire is decoration.** `tests/selftest.sh` is the mutant
    ledger; add a fixture and a row whenever you add a check.
 3. **A skipped check is not a passing one.** SKIP and PASS are different words in the report for a

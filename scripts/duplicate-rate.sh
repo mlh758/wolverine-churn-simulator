@@ -31,10 +31,13 @@ TSV="$OUT/results.tsv"
 mkdir -p "$OUT"
 [ -f "$TSV" ] || printf 'iteration\tresult\trunning\tassigned\tduplicated\torphaned\tmissing\tsettle_s\n' > "$TSV"
 
+# Two questions of the store -- what is placed, and who owns what -- answered on either arm by
+# scripts/backend.sh. The running side never touches the store at all: it is replayed from the pod
+# logs, which is the whole reason this measurement survived when the streaming pipeline did not.
+source scripts/backend.sh
+
 live_pods() { $K get pods -l app=churnsim -o json 2>/dev/null | python3 scripts/live_pods.py; }
-pgpod()     { $K get pod -l app=pg -o jsonpath='{.items[0].metadata.name}'; }
-psql_t()    { $K exec "$(pgpod)" -- psql -U postgres -d churnsim -qAt -c "$1" 2>/dev/null; }
-placed()    { psql_t "select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';" | tr -d '[:space:]'; }
+placed()    { db_placed; }
 
 # Snapshot both sides into a directory and diff them.
 #
@@ -51,10 +54,7 @@ snapshot() {
         $K logs "$p" > "$dir/raw.$p.jsonl" 2>/dev/null
         python3 scripts/running_agents.py --pod "$p" < "$dir/raw.$p.jsonl" >> "$dir/running.tsv"
     done
-    psql_t "select a.id || chr(9) || n.description
-              from wolverine.wolverine_node_assignments a
-              join wolverine.wolverine_nodes n on n.id = a.node_id
-             where a.id like 'sim://%';" > "$dir/assigned.tsv"
+    db_assigned > "$dir/assigned.tsv"
     python3 scripts/orphans.py "$dir/running.tsv" "$dir/assigned.tsv" --verbose > "$dir/report.txt" 2>&1
     head -1 "$dir/report.txt"
 }
@@ -93,6 +93,7 @@ field() { sed -n "s/.*$1=\([0-9]*\).*/\1/p" <<<"$2"; }
 gate=$($K get deployment churnsim \
         -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="SIM_STABILITY_WINDOW_SECONDS")]}{.value}{end}')
 echo "duplicate-rate: $ITERS rollouts, single arm"
+echo "backend: $(sim_backend)"
 echo "settle gate (GH-4367): $( [ -n "$gate" ] && echo "ON ($gate s)" || echo OFF )"
 
 for i in $(seq 1 "$ITERS"); do

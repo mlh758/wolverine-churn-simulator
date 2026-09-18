@@ -23,6 +23,9 @@ RUNS="runs"
 ACTIVE="$RUNS/.active"
 TOOLS=".tools/safetylab"
 
+# sim_backend(), so `deploy` picks the manifest matching the arm under test.
+source scripts/backend.sh
+
 now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
 ensure_tool() {
@@ -58,8 +61,19 @@ cmd_deploy() {
     minikube image load /tmp/safetylab-local.tar
     rm -f /tmp/safetylab-local.tar
 
-    echo "== deploying the monitor =="
-    $KUBECTL apply -f k8s/safetylab.yaml
+    # One image, two manifests. The monitor binary speaks both stores; which one it watches is
+    # an argument, and it must match the arm that is deployed -- a monitor pointed at an empty
+    # Postgres while the cluster runs on RavenDB would produce a history full of nothing and
+    # every safety check would pass over it.
+    local backend manifest
+    backend=$(sim_backend)
+    case "$backend" in
+        ravendb) manifest="k8s/safetylab-ravendb.yaml" ;;
+        *) manifest="k8s/safetylab.yaml" ;;
+    esac
+
+    echo "== deploying the monitor ($backend) =="
+    $KUBECTL apply -f "$manifest"
     $KUBECTL rollout status deployment/safetylab --timeout=180s
 }
 

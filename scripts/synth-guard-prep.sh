@@ -11,6 +11,16 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
 K="minikube kubectl -- --context=minikube"
 
+# PostgreSQL only, and not portably so. The fault injected here is row-level security hiding one
+# node's row from the app role -- a Postgres feature with no RavenDB counterpart at all. Refuse
+# rather than run something that looks like the experiment and is not.
+source scripts/backend.sh
+if [ "$(sim_backend)" = "ravendb" ]; then
+    echo "$(basename "$0"): the synthetic-self-guard runs inject faults with Postgres row-level" >&2
+    echo "    security, which RavenDB has no equivalent of. This experiment is PostgreSQL-only." >&2
+    exit 2
+fi
+
 PGPOD=$($K get pod -l app=pg -o jsonpath='{.items[0].metadata.name}')
 
 $K exec "$PGPOD" -- psql -U postgres -d churnsim -qAt -c "

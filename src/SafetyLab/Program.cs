@@ -17,13 +17,22 @@ internal static partial class Cli
             case "monitor": return await MonitorAsync(rest);
             case "harvest": return Harvest(rest);
             case "check": return Check(rest);
+            case "query": return await RavenQueries.QueryAsync(rest);
+            case "admin": return await RavenQueries.AdminAsync(rest);
             default:
                 Console.Error.WriteLine("""
                     safetylab — server-side invariant monitor for Wolverine leader election
 
-                      safetylab monitor [--tick-ms N] [--schema S] [--lock-id N]
-                          Poll pg_locks / wolverine_nodes / wolverine_node_assignments and write
-                          one JSON sample per tick to stdout. Connection from POSTGRES_CONNECTION.
+                      safetylab monitor [--backend postgres|ravendb] [--tick-ms N]
+                                        [--schema S] [--lock-id N]                 (postgres)
+                                        [--url U] [--database D] [--service S]
+                                        [--page-size N]                            (ravendb)
+                          Poll the store's leadership lock, node registry and agent assignments
+                          and write one JSON sample per tick to stdout.
+                          postgres: pg_locks / wolverine_nodes / wolverine_node_assignments,
+                                    connection from POSTGRES_CONNECTION.
+                          ravendb:  wolverine/* compare-exchange values / WolverineNodes /
+                                    AgentAssignments, url from RAVENDB_URL.
 
                       safetylab harvest --pod NAME
                           Read a pod's log text on stdin, write identity and AGENT-START/STOP
@@ -32,6 +41,16 @@ internal static partial class Cli
                       safetylab check DIR [--grace S] [--cross-pod-grace S] [--converge S] [--json]
                           Run every checker over a captured run directory and report.
                           Exit 1 if any check failed.
+
+                      safetylab query KIND [--url U] [--database D] [--event E]
+                          RavenDB only: read one measurement as TSV on stdout, the way the
+                          PostgreSQL scripts use psql. KIND is one of
+                          assigned | placed | nodes | per-node | records | per-minute.
+
+                      safetylab admin ACTION [--url U] [--database D]
+                          RavenDB only, and it MUTATES. ACTION is one of
+                          reset-metrics (delete every NodeRecords document) or
+                          drop-database (delete the database outright).
                     """);
                 return 2;
         }
@@ -41,15 +60,8 @@ internal static partial class Cli
 
     private static async Task<int> MonitorAsync(string[] args)
     {
-        var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
-                               ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
-
         var tick = TimeSpan.FromMilliseconds(IntArg(args, "--tick-ms") ?? 200);
-        var schema = StringArg(args, "--schema") ?? "wolverine";
-        // Derived from the schema, because that is what Wolverine actually locks on
-        // (PostgresqlNodePersistence._lockId = schemaName.GetDeterministicHashCode()). The
-        // LeaderLockId = 9999999 constant in that same class is not used by the leadership path.
-        var lockId = IntArg(args, "--lock-id") ?? RunHistory.LockIdForSchema(schema);
+        var backend = StringArg(args, "--backend") ?? Backends.Postgres;
 
         using var cancellation = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
@@ -59,7 +71,41 @@ internal static partial class Cli
         };
         AppDomain.CurrentDomain.ProcessExit += (_, _) => cancellation.Cancel();
 
-        var monitor = new ClusterMonitor(connectionString, schema, lockId, tick, Console.Out);
+        MonitorLoop monitor;
+        RavenClient? raven = null;
+
+        switch (backend)
+        {
+            case Backends.Postgres:
+            {
+                var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
+                                       ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
+                var schema = StringArg(args, "--schema") ?? "wolverine";
+                // Derived from the schema, because that is what Wolverine actually locks on
+                // (PostgresqlNodePersistence._lockId = schemaName.GetDeterministicHashCode()). The
+                // LeaderLockId = 9999999 constant in that same class is not used by the leadership path.
+                var lockId = IntArg(args, "--lock-id") ?? RunHistory.LockIdForSchema(schema);
+                monitor = new ClusterMonitor(connectionString, schema, lockId, tick, Console.Out);
+                break;
+            }
+
+            case Backends.RavenDb:
+            {
+                raven = RavenQueries.Connect(args);
+                // 2000 covers the 500-agent shape with room to spare. A run that exceeds it does
+                // not silently check a prefix: RavenClusterMonitor writes a warning onto every
+                // affected sample and C0 turns those into a failing coverage check.
+                var pageSize = (int)(IntArg(args, "--page-size") ?? 2000);
+                var service = StringArg(args, "--service") ?? "churnsim";
+                monitor = new RavenClusterMonitor(raven, service, pageSize, tick, Console.Out);
+                break;
+            }
+
+            default:
+                Console.Error.WriteLine($"monitor: unknown --backend '{backend}' " +
+                                        $"(expected '{Backends.Postgres}' or '{Backends.RavenDb}')");
+                return 2;
+        }
 
         try
         {
@@ -68,6 +114,10 @@ internal static partial class Cli
         catch (OperationCanceledException)
         {
             // Normal shutdown.
+        }
+        finally
+        {
+            raven?.Dispose();
         }
 
         return 0;
@@ -224,7 +274,8 @@ internal static partial class Cli
         if (history.Meta is { } meta)
         {
             Console.WriteLine($"  started {meta.StartedUtc:u}, {meta.TickMs}ms tick, " +
-                              $"leader lock {meta.LeaderLockId}, schema '{meta.Schema}'");
+                              $"backend '{history.Backend}', {history.LeaderLockDescription}, " +
+                              $"{(history.IsRavenDb ? "database" : "schema")} '{meta.Schema}'");
         }
 
         Console.WriteLine();

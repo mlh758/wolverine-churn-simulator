@@ -41,6 +41,14 @@ save you from an app that reads host capacity and pre-allocates. Analysis belong
 structured JSON logs plus DuckDB (`scripts/logq.sh`) gives full SQL with nothing running in the
 cluster at all. "The node reports 31 GB free" is not headroom; it is the absence of enforcement.
 
+**RavenDB is in that same class, and the RavenDB arm runs it in-cluster anyway.** Its banner prints
+`Phys Mem 30.386 GBytes` inside the container, and it sizes itself accordingly: measured on this
+machine, an idle server with an *empty* database sat at **1.5 GB** resident. The store under test
+cannot be moved to the host the way the analysis was, so the mitigation is to tell it the number
+rather than let it read one — `RAVEN_Memory_MaxWorkingSet=1024` in `k8s/ravendb.yaml` brings the
+same idle server to **131 MB**. The pod `limits` are the kill line, not the constraint; that env
+var is the constraint. Do not remove it, and do not raise the limits in its place.
+
 ## Kubernetes selectors
 
 **Terminating pods report `status.phase=Running`** for their whole
@@ -126,6 +134,41 @@ dangling node reference.
 **`wolverine_node_assignments.id` is the primary key**, so per-agent assignment uniqueness is
 DB-enforced. S2/S3's table-side uniqueness checks are sentinels, not discoveries — the real
 exclusivity question is answered from the pod log stream.
+
+## RavenDB and the app
+
+**The three replicas race to create the database, and the loser's failure is not one exception.**
+RavenDB has no `CREATE DATABASE IF NOT EXISTS` and the client creates nothing implicitly, so
+ChurnSim's first pod up has to — and all three start together and all three find no record.
+Handling only `ConcurrencyException` ("it already exists") is not enough: a loser whose `PUT
+/admin/databases` lands while the winner's brand-new database is inside
+`UnloadAndLockDatabaseImpl` gets a 503 `DatabaseDisabledException` instead, *"unloaded and locked
+because Checking if we need to recreate indexes"*. That propagates out of `UseWolverine` and kills
+the host — one pod of three died this way on every cold start, which in Kubernetes is
+CrashLoopBackOff on a store that is perfectly healthy. `RavenDbBackend.ensureDatabaseReady` is
+therefore written around a postcondition (the record exists *and* the database answers
+`GetStatisticsOperation`) and retries every failure identically, because every one of them has the
+same correct response. Three consecutive cold starts after the fix: 3/3 pods up, 0 crashes, with
+the retry visibly firing on one or two pods each time.
+
+**`WolverineNode.Description` is `Environment.MachineName` on both backends** — the pod name in
+Kubernetes, and the host name outside it. That is what makes C0's per-pod coverage check work
+identically for RavenDB, and it is also why running the sim on a bare host makes C0 report every
+node as uncaptured: all three processes share one machine name. Not a bug in the check.
+
+**A RavenDB collection query is not an indexed query, and the difference is the whole trust
+model.** `from AgentAssignments` with no `where` or `order by` is served straight from the
+collection (`IndexName` comes back as `collection/AgentAssignments`) and cannot be stale; add a
+filter and RavenDB builds an auto-index that can be. The monitor and `safetylab query` both stay on
+the unfiltered form and filter client-side for exactly this reason, and both record `IsStale` and
+the page limit anyway — a query that silently returns a *prefix* of the cluster would read as a
+healthy, fully-placed cluster. C0 turns either into a failing coverage check rather than a note.
+
+**A fresh RavenDB server is `passive` until something bootstraps it**, and every database operation
+against it returns 503 `NodeIsPassiveException`. Creating a database is what bootstraps it, so the
+monitor started against a cold cluster records a hole or two before the first ChurnSim pod is up.
+That is the sampler working — it records the gap instead of dying — but do not read those first
+samples as an outage.
 
 ## Measurement hygiene
 

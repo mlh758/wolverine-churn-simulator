@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ravendb
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. Two RavenDB servers sharing one emptyDir would corrupt it, and
+  # the store under test must not change identity underneath a run.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ravendb
+  template:
+    metadata:
+      labels:
+        app: ravendb
+    spec:
+      containers:
+        - name: ravendb
+          # Pinned, not :latest. The leadership semantics this arm exists to measure are the
+          # client's (compare-exchange with an expiry), but a server version change is still a
+          # change to the system under test, and "no claim without the configuration it was
+          # measured under" applies to the database as much as to the knobs.
+          image: docker.io/ravendb/ravendb:7.0.9-ubuntu.22.04-x64
+          env:
+            # Single unsecured node. This is the same posture as the postgres pod next door:
+            # a throwaway minikube cluster with no ingress. Do not copy it anywhere real.
+            - name: RAVEN_Setup_Mode
+              value: "None"
+            - name: RAVEN_License_Eula_Accepted
+              value: "true"
+            - name: RAVEN_Security_UnsecuredAccessAllowed
+              value: "PublicNetwork"
+            - name: RAVEN_ServerUrl
+              value: "http://0.0.0.0:8080"
+            - name: RAVEN_ServerUrl_Tcp
+              value: "tcp://0.0.0.0:38888"
+            # READ docs/harness-traps.md BEFORE REMOVING THIS.
+            #
+            # RavenDB sizes its caches and its memory-mapped budget from the machine's advertised
+            # physical memory. Under rootless podman the minikube node advertises the HOST's RAM
+            # (30 GB on the development machine) regardless of `minikube start --memory`, so the
+            # `limits` below do not constrain what RavenDB *decides* to do -- they only decide
+            # where it gets OOM-killed. Measured on this machine: an idle server with an empty
+            # database sat at 1.5 GB resident without this setting and at 131 MB with it.
+            #
+            # This is the identical failure mode that made an in-cluster ClickHouse take the whole
+            # machine down, and it is why that experiment was abandoned. The value is in MB.
+            - name: RAVEN_Memory_MaxWorkingSet
+              value: "1024"
+            - name: RAVEN_DataDir
+              value: "/var/lib/ravendb/data"
+          ports:
+            - containerPort: 8080
+            - containerPort: 38888
+          readinessProbe:
+            # An HTTP probe rather than an exec one: kubelet makes the request itself, so this
+            # depends on nothing being installed inside the image.
+            httpGet:
+              path: /build/version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 40
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ravendb
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              # Headroom over RAVEN_Memory_MaxWorkingSet for the CLR itself and for the
+              # memory-mapped files RavenDB counts separately from its working set.
+              memory: 2Gi
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ravendb
+spec:
+  selector:
+    app: ravendb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: tcp
+      port: 38888
+      targetPort: 38888

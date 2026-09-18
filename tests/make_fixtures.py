@@ -30,6 +30,15 @@ DURATION = 240  # samples, i.e. four minutes
 LEADER_LOCK = 832201495
 LEADER_URI = "wolverine://leader/"
 
+# RavenDB's leadership lock is a compare-exchange value, not an advisory lock. The key is
+# "wolverine/leader/<service name, lowercased>" once RavenDbMessageStore.StartScheduledJobs has
+# run -- before that the store's constructor uses the un-suffixed form, which is why the split-key
+# fixture below is a plausible state and not an invented one. The five-minute expiry is
+# RavenDbMessageStore.Locking's DateTimeOffset.UtcNow.AddMinutes(5).
+RAVEN_LEADER_KEY = "wolverine/leader/churnsim"
+RAVEN_LEADER_KEY_UNSUFFIXED = "wolverine/leader"
+RAVEN_LOCK_TTL = timedelta(minutes=5)
+
 NODES = [
     # (pod name, pod ip, node uuid, node number, backend pid)
     ("churnsim-a", "10.0.0.11", "11111111-1111-1111-1111-111111111111", 1, 101),
@@ -55,10 +64,40 @@ class World:
         self.placement = {a: NODES[i % 3][2] for i, a in enumerate(AGENTS)}
         self.running = {a: NODES[i % 3][0] for i, a in enumerate(AGENTS)}  # agent -> pod
 
+        # RavenDB only. `lock_expires_in` is how far ahead of the current tick the lock's
+        # ExpirationTime sits; a negative value is a lock that has expired and nobody has taken
+        # over. `extra_locks` are further (key, node uuid) pairs holding leadership at the same
+        # time -- which the compare-exchange primitive does nothing to prevent, because each key
+        # is its own value with its own index.
+        self.lock_expires_in = RAVEN_LOCK_TTL
+        self.extra_locks = []
 
-def sample(seq, t, w):
+        # A tick that SUCCEEDED but is not fully trustworthy -- a query served from a stale index,
+        # or one that came back short of its page limit. Not an error (there is real data on the
+        # sample) and not nothing (the data may be a prefix of the cluster).
+        self.warnings = []
+
+
+def sample(seq, t, w, backend="postgres"):
     locks = []
-    if w.lock_holder is not None:
+    cmpxchg = []
+
+    if backend == "ravendb":
+        if w.lock_holder is not None:
+            cmpxchg.append({
+                "key": RAVEN_LEADER_KEY,
+                "nodeId": w.lock_holder[2],
+                "expiresAt": iso(t + w.lock_expires_in),
+                "index": 1000 + seq,
+            })
+        for key, node_id in w.extra_locks:
+            cmpxchg.append({
+                "key": key,
+                "nodeId": node_id,
+                "expiresAt": iso(t + RAVEN_LOCK_TTL),
+                "index": 2000 + seq,
+            })
+    elif w.lock_holder is not None:
         locks.append({
             "pid": w.lock_holder[4],
             "classId": 0,
@@ -82,7 +121,7 @@ def sample(seq, t, w):
     for agent, node in sorted(w.placement.items()):
         assignments.append({"id": agent, "nodeId": node, "started": iso(T0)})
 
-    return {
+    record = {
         "kind": "sample",
         "seq": seq,
         "ts": iso(t),
@@ -93,14 +132,38 @@ def sample(seq, t, w):
         "assignments": assignments,
     }
 
+    # Absent rather than empty on PostgreSQL, because that is what the monitor writes: the field
+    # is null there and the serializer drops nulls. A fixture that agrees with the checker instead
+    # of with the thing being checked is the failure mode these comments exist to prevent.
+    if backend == "ravendb":
+        record["cmpxchg"] = cmpxchg
 
-def build(name, mutate=None, skip=None):
-    """mutate(tick, world) adjusts state in place; skip(tick) drops a sample entirely."""
-    directory = os.path.join(FIXTURES, name)
-    shutil.rmtree(directory, ignore_errors=True)
-    os.makedirs(directory)
+    if w.warnings:
+        record["warnings"] = list(w.warnings)
 
-    meta = {
+    return record
+
+
+def meta_record(backend):
+    if backend == "ravendb":
+        # leaderLockId is a PostgreSQL schema-name hash with no RavenDB counterpart, so the
+        # monitor writes 0 rather than a plausible-looking number, and `schema` carries the
+        # database name. Keep this identical to RavenClusterMonitor.DescribeAsync.
+        return {
+            "kind": "meta",
+            "schemaVersion": 2,
+            "startedUtc": iso(T0),
+            "tickMs": 1000,
+            "leaderLockId": 0,
+            "schema": "churnsim",
+            "serverVersion": "RavenDB 7.0.9 (fixture)",
+            "backend": "ravendb",
+            "lockKey": RAVEN_LEADER_KEY,
+        }
+
+    # No "backend" key on purpose: this is what a pre-RavenDB capture looks like, so the
+    # fixtures also pin that those still load and still check as PostgreSQL.
+    return {
         "kind": "meta",
         "schemaVersion": 1,
         "startedUtc": iso(T0),
@@ -110,7 +173,14 @@ def build(name, mutate=None, skip=None):
         "serverVersion": "PostgreSQL 16.4 (fixture)",
     }
 
-    history = [meta]
+
+def build(name, mutate=None, skip=None, backend="postgres"):
+    """mutate(tick, world) adjusts state in place; skip(tick) drops a sample entirely."""
+    directory = os.path.join(FIXTURES, name)
+    shutil.rmtree(directory, ignore_errors=True)
+    os.makedirs(directory)
+
+    history = [meta_record(backend)]
     for tick in range(DURATION):
         if skip and skip(tick):
             continue
@@ -118,7 +188,7 @@ def build(name, mutate=None, skip=None):
         w = World()
         if mutate:
             mutate(tick, w)
-        history.append(sample(tick + 1, t, w))
+        history.append(sample(tick + 1, t, w, backend))
 
     # Pod-side stream. Residencies are derived from the same World the samples use, so a
     # fixture only has to state its fault once.
@@ -200,6 +270,54 @@ def split_leader(tick, w):
         w.lock_holder = NODES[1]
 
 
+def raven_expired_lock(tick, w):
+    """The RavenDB failover stall, and the fault that has no PostgreSQL counterpart.
+
+    A compare-exchange lock is not released by the death of a session -- there is no session. It
+    sits in the Raft cluster until its ExpirationTime passes AND some peer runs
+    tryTakeOverIfExpiredAsync and CAS-replaces it. So the fault here is not two leaders; it is
+    *no* leader, for as long as nobody troubles to look. From inside the cluster it is invisible:
+    the incumbent (if it is alive at all) still believes it holds the lock, because
+    HasLeadershipLock() reads a local field, and every peer sees a lock it does not own.
+
+    Node A is deliberately left alive and registered and still owning the leader row, so that
+    exactly one thing is wrong: the lock stopped being renewed and has aged past its expiry.
+    """
+    if tick >= 120:
+        w.lock_expires_in = -timedelta(seconds=30)
+
+
+def raven_truncated(tick, w):
+    """The read came back short, and every check above it silently narrowed.
+
+    RavenDB returns the assignment set through a paged query, not a SELECT. A cluster with more
+    agents than the monitor's page limit gets a PREFIX of the assignment set on every sample --
+    and a prefix is internally consistent. Every agent in it has exactly one live owner, the
+    leader row is there, S5/S6/S7 and L1 all pass, and the run reads as a smaller healthy cluster
+    rather than as a partly-unobserved one.
+
+    Nothing about the sample says so except the warning the monitor attaches, which is why C0
+    treats it as a violation and not a note: this is the exact shape of "0 violations over an
+    unknown amount of observation" that the whole coverage check exists to refuse.
+    """
+    if tick >= 150:
+        w.warnings = ["AgentAssignments read returned 2000 of 3000 — page limit hit"]
+
+
+def raven_split_key(tick, w):
+    """Leadership held under both spellings of the key, by two different nodes.
+
+    RavenDbMessageStore's constructor sets the key to "wolverine/leader" and StartScheduledJobs
+    then renames it to "wolverine/leader/<service>". They are two independent compare-exchange
+    values: nothing about the primitive makes claiming one exclude the other, so a node that
+    settled on the un-suffixed key leads alongside a node that settled on the suffixed one. The
+    suffixed holder is listed first and matches the leader assignment row, so this fixture states
+    the split and nothing else.
+    """
+    if tick >= 120:
+        w.extra_locks = [(RAVEN_LEADER_KEY_UNSUFFIXED, NODES[1][2])]
+
+
 def main():
     os.makedirs(FIXTURES, exist_ok=True)
     print("fixtures:")
@@ -210,6 +328,14 @@ def main():
     build("split-leader", split_leader)
     build("gap", clean, skip=lambda tick: 150 <= tick < 180)
     build_dup()
+
+    # The RavenDB arm. `raven-clean` is not filler: it is the evidence that the leader-side
+    # checkers read compare-exchange evidence correctly and do not fire on a healthy RavenDB
+    # cluster just because the locks array is empty.
+    build("raven-clean", clean, backend="ravendb")
+    build("raven-expired-lock", raven_expired_lock, backend="ravendb")
+    build("raven-split-key", raven_split_key, backend="ravendb")
+    build("raven-truncated", raven_truncated, backend="ravendb")
 
 
 def build_dup():
