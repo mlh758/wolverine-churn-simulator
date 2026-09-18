@@ -62,6 +62,30 @@ public class CommandLineTests
     [InlineData("pods", "--label", "app=churnsim")]
     [InlineData("pick-pod", "--label", "app=safetylab")]
     [InlineData("host-pid", "--pod", "churnsim-abc", "--container", "churnsim", "--expect", "ChurnSim")]
+    // scripts/duplicate-rate.sh, scripts/synth-guard-run.sh
+    [InlineData("snapshot", "runs/duplicate-rate/iter1/post")]
+    [InlineData("snapshot", "runs/duplicate-rate/iter1/post", "--tsv")]
+    [InlineData("snapshot", "runs/foo", "--label", "app=churnsim", "--tsv")]
+    // scripts/heal-test.sh
+    [InlineData("overlaps", "runs/heal-test/iter1")]
+    [InlineData("overlaps", "runs/heal-test/iter1", "--tsv")]
+    [InlineData("overlaps", "runs/heal-test/iter1", "--grace", "2")]
+    // scripts/synth-guard-run.sh
+    [InlineData("chaos", "arm")]
+    [InlineData("chaos", "disarm")]
+    [InlineData("chaos", "status")]
+    [InlineData("verify-config", "--label", "app=churnsim", "--expect", "StaleNodeTimeout=4")]
+    [InlineData("count", "runs/synth-guard/x/during", "--message", "was missing from its own node snapshot")]
+    // the three scripts' settle loop
+    [InlineData("settle")]
+    [InlineData("settle", "--expect", "500")]
+    [InlineData("settle", "--series", "runs/x/placement.tsv")]
+    [InlineData("settle", "--timeout-seconds", "1200", "--poll-seconds", "10", "--stable-polls", "3")]
+    // justfile: traces
+    [InlineData("traces")]
+    [InlineData("traces", "--minutes", "90")]
+    [InlineData("traces", "--minutes", "30", "--raw")]
+    [InlineData("traces", "--operation", "wolverine_node_assignments")]
     public void every_invocation_the_repo_issues_still_parses(params string[] argv) => AssertParses(argv);
 
     // ------------------------------------------------------ and every mistake is now caught
@@ -149,7 +173,7 @@ public class CommandLineTests
         var verbs = root.Subcommands.Select(c => c.Name).ToArray();
 
         Assert.Equal(
-            new[] { "admin", "check", "harvest", "host-pid", "monitor", "pick-pod", "pods", "query" },
+            new[] { "admin", "chaos", "check", "count", "harvest", "host-pid", "monitor", "overlaps", "pick-pod", "pods", "query", "settle", "snapshot", "traces", "verify-config" },
             verbs.OrderBy(x => x, StringComparer.Ordinal).ToArray());
     }
 }

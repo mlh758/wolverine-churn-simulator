@@ -1,22 +1,38 @@
 #!/usr/bin/env bash
-# Build the app image against a chosen Wolverine version and message store, load it into
-# minikube, and deploy the store plus 3 app replicas running exactly that image.
+# Build the app image against a Wolverine version and message store, load it into minikube, and
+# deploy the store plus 3 app replicas running exactly that image.
 #
-#   ./scripts/deploy.sh                                   # released WolverineFx 5.39.0, postgres
-#   ./scripts/deploy.sh 6.33.0-stock.1                    # pristine main, packed into localfeed/
-#   ./scripts/deploy.sh 6.33.0-proposal.1                 # GH-3987/GH-3959 implementation
-#   ./scripts/deploy.sh 6.39.0 --backend ravendb          # the RavenDB arm
+# DEPENDS ON  podman, minikube, and nuget.org for a released version (localfeed/ for a local one).
+# REQUIRES    a running minikube. A 5.x version with --backend ravendb is refused: the native
+#             ravendb:// control queue landed 2026-07-02 and Balanced durability cannot elect a
+#             control endpoint without it.
+# PRODUCES    a deployed store and churnsim at localhost/churnsim:<version>-<backend>. MUTATES the
+#             cluster. The RavenDB arm additionally needs ./scripts/monitor.sh deploy to be
+#             measurable at all.
 #
-# The backend is a BUILD-TIME choice (ChurnSim.csproj picks the message store package and the
-# wiring file from it), so switching arms rebuilds the image. The deployment declares the same
+# The backend is a BUILD-TIME choice -- ChurnSim.csproj picks the message store package and the
+# wiring file from it -- so switching arms rebuilds the image. The deployment declares the same
 # value in SIM_BACKEND and ChurnSim refuses to start on a mismatch.
+#
+# ARGUMENTS
+#
+#   ./scripts/deploy.sh [version] [--backend postgres|ravendb]
+#
+#     version   defaults to the contents of ./wolverine-version, which is also what
+#               Directory.Build.props and the Dockerfile read. Change the version under test by
+#               editing that file; pass one here to override for a single run.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export PATH="$HOME/.local/bin:$PATH"
 KUBECTL="minikube kubectl -- --context=minikube"
 
-VERSION="5.39.0"
+# One source of truth: ./wolverine-version. Directory.Build.props and the Dockerfile read the
+# same file, so there is no second copy of the number to drift.
+VERSION_FILE="wolverine-version"
+[ -r "$VERSION_FILE" ] || { echo "deploy.sh: $VERSION_FILE is missing" >&2; exit 2; }
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+[ -n "$VERSION" ] || { echo "deploy.sh: $VERSION_FILE is empty" >&2; exit 2; }
 BACKEND="postgres"
 
 while [ $# -gt 0 ]; do

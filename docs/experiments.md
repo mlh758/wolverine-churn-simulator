@@ -95,7 +95,7 @@ The shape, every time: an agent is started on one pod and started again on anoth
 the first never arrives, and **the assignment table stays immaculate** — 500 rows, evenly
 distributed, one owner each — while the cluster reports itself converged. Any check that walks the
 table sees perfect health. Only the pod log stream shows it, which is why S5/S7 read it and why
-`orphans.py` exists.
+`safetylab snapshot` compares the logs against the table rather than trusting the table.
 
 **Mechanism — found 2026-09-09, see RESULTS.md.** Duplicates are created at the *leadership
 handover*, not by drain timing. The outgoing leader places agents onto the node that is about to
@@ -219,16 +219,22 @@ a permanent regression test.
 - **Method:** N iterations, single arm, shipping defaults. Each iteration bounces to fresh pods,
   waits for full placement to hold still, snapshots, and skips if the cluster did not start clean.
   Then one rollout, settle, snapshot again. The measurement is a direct comparison: agents
-  actually running (replayed from each live pod's `AGENT-START`/`AGENT-STOP` via
-  `running_agents.py`) versus agents assigned (the table, joined to pod name through
-  `wolverine_nodes.description`). `orphans.py` diffs them. Appends to
-  `runs/duplicate-rate/results.tsv` after every iteration.
+  actually running (replayed from each live pod's `AGENT-START`/`AGENT-STOP`) versus agents
+  assigned (the table, joined to pod name through `wolverine_nodes.description`). Both sides, the
+  diff and the verdict are one process — `safetylab snapshot` — which resolves the live pods,
+  writes each raw log, reads the store on whichever arm is deployed, and prints the results.tsv
+  columns. It exits **0 clean, 1 diverged, 2 could not measure**, and the script branches on that
+  rather than parsing anything. Appends to `runs/duplicate-rate/results.tsv` after every
+  iteration.
 - **Three divergences, kept separate:** `duplicated` (running on 2+ pods — the user-visible bug,
   and the number this experiment counts), `orphaned` (running where not assigned — the
   precursor), `missing` (assigned but running nowhere — GH-3987's wedge).
 - **Finding:** any non-zero `duplicated` that survives the 120 s post-settle reconcile window.
 - **Artifact:** a dirty start. Recorded as `SKIP-dirty-start`, never as a pass — and the
   pre-snapshot is *kept*, because a dirty start is itself the previous rollout's duplicate.
+- **Artifact:** an iteration the harness could not see. Recorded as `SKIP-unmeasurable` — an
+  unreachable store, no live pod, or a pod log carrying no agent event at all. Previously these
+  were indistinguishable from `clean`, which is the whole reason the row type exists.
 - **Evidence:** every snapshot writes each pod's raw JSON log alongside the running/assigned diff,
   and iterations that diverge keep it (clean ones are reclaimed). A duplicate is only detected
   after the fact, and its pods are replaced by the next iteration, so without this the answer to
@@ -258,10 +264,37 @@ have separated the arms anyway.
   wrong instrument for a fix whose claim is convergence. `LocalAgentReconciliationThreshold`
   defaults to 3 and ChurnSim health-checks every 2 s, so a heal lands in ~6 s and an end-state
   snapshot would read clean — indistinguishable from "no duplicate happened".
-- **Method:** sample the running-vs-assigned comparison every 15 s through the whole settle window.
-  Classifies each rollout `never` / `HEALED` (with heal time) / `PERSISTED`. Keeps sampling after
-  duplicates clear, so heal-then-recur is distinguishable from a durable heal.
+- **Method:** do not sample the cluster at all. A 6 s window polled every 15 s is missed most of
+  the time, and three `never` results in a row nearly became "the fix prevents duplication". Every
+  AGENT-START and AGENT-STOP is already in the pod logs with a timestamp, so one capture after the
+  rollout recovers the complete timeline at full resolution. `safetylab overlaps` replays it into
+  residency intervals and classifies each rollout `never` / `HEALED` (with heal time) /
+  `PERSISTED`, or exits 2 if it could not analyse — which is recorded as `SKIP-unanalysable`, never
+  as `never`.
 - **Baseline:** stock 6.35.0 is known to PERSIST — a duplicate was still live 40 minutes later.
+
+### E6 — the synthetic-self guard (`scripts/synth-guard-run.sh`) — **blocked**
+
+- **Question:** when a node's own snapshot omits itself while its agents are still claimed there,
+  does the reconcile sweep's synthetic-self guard stop it from stopping its own agents?
+- **Method:** PostgreSQL row-level security hides ONE non-leader node's row from every read the app
+  role makes, while permitting all its writes — the production condition (reads lagging writes),
+  made deterministic. Three deletion-based attempts failed to open the window at all. The victim's
+  assignment rows are never hidden: doing that made the leader reassign its agents on ordinary
+  ticks, which is churn but not the guard's domain.
+- **Arm safety:** `safetylab chaos arm/disarm/status`. The disarm runs from a `trap … EXIT INT
+  TERM` and is idempotent, and the run refuses to start while a previous arm is still in place. An
+  arm that leaks leaves one node permanently invisible to the app, and every later experiment on
+  that cluster then silently measures a crippled node.
+- **BLOCKED — the instrumentation is gone.** Both arms need locally packed Wolverine builds
+  (`6.35.0-sweepguard.1` / `6.35.0-sweepnoguard.1`) carrying the injection log line the whole
+  measurement counts. Released **6.39.0 does not contain that string at all** — checked with
+  `strings` against the deployed `WolverineFx.dll` — and those packages were deleted from
+  `localfeed/` when the pre-6.36 results were archived. A run on a released build arms correctly,
+  injects a real fault, and then reports `*** INVALID ARM ***` because zero injections were logged,
+  which is the harness working: the guard cannot be said to have been exercised.
+- **To unblock:** repack the two branch builds into `localfeed/` (README has the recipe) and
+  `just deploy 6.35.0-sweepnoguard.1`, or add the marker to a current branch.
 
 ### E3 — convergence tail
 

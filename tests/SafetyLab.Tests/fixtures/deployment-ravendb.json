@@ -1,0 +1,33 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": { "name": "churnsim", "namespace": "default" },
+  "spec": {
+    "replicas": 3,
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "churnsim",
+            "image": "localhost/churnsim:local",
+            "env": [
+              { "name": "SIM_BACKEND", "value": "ravendb" },
+              { "name": "RAVENDB_URLS", "value": "http://ravendb:8080" },
+              { "name": "RAVENDB_DATABASE", "value": "churnsim" },
+              {
+                "name": "POD_NAME",
+                "valueFrom": { "fieldRef": { "apiVersion": "v1", "fieldPath": "metadata.name" } }
+              },
+              {
+                "name": "POD_IP",
+                "valueFrom": { "fieldRef": { "apiVersion": "v1", "fieldPath": "status.podIP" } }
+              },
+              { "name": "SIM_AGENT_COUNT", "value": "500" },
+              { "name": "ROLLOUT_STAMP", "value": "initial" }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

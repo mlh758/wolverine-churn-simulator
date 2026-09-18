@@ -1,64 +1,43 @@
 #!/usr/bin/env bash
 # How long is the cluster leaderless after its leader dies ungracefully?
 #
-# This is the experiment the RavenDB arm exists for, because the two backends cannot give the
-# same answer:
+# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, minikube ssh + crictl on the
+#             node. The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
+# REQUIRES    a settled cluster with a leader that resolves to a live pod; both are refusals. A
+#             window timed from a cluster already mid-election is not a failover measurement.
+# PRODUCES    $OUT/timeline.tsv, one row per 5s poll, and a verdict on stdout. MUTATES the cluster:
+#             it kills a pod. Prints *** INVALID RUN *** if a NodeStopped record appeared, which
+#             means the victim shut down gracefully and the expiry path was never exercised.
 #
-#   PostgreSQL — leadership is a session-scoped advisory lock. The backend dies with the pod and
-#   the server releases the lock immediately. A survivor can win the next election on its next
-#   heartbeat, so the leaderless window is bounded by the control-plane cadence (seconds).
+# The two backends cannot give the same answer -- PostgreSQL leadership is a session-scoped
+# advisory lock the server releases when the pod dies, RavenDB's is a compare-exchange document
+# whose ExpirationTime nothing clears. See the 2026-09-18 entry in RESULTS.md.
 #
-#   RavenDB — leadership is a compare-exchange document carrying ExpirationTime, and nothing in
-#   the server clears it. RavenDbMessageStore.Locking.TryAttainLeadershipLockAsync gives a peer
-#   two routes and both are closed while the dead leader's value is unexpired:
-#     * PutCompareExchangeValueOperation(key, newLock, index: 0) means "create only if absent",
-#       and the dead leader's value is still there, so it fails;
-#     * tryTakeOverIfExpiredAsync returns false while ExpirationTime > UtcNow.
-#   Every heartbeat rewrites ExpirationTime to UtcNow.AddMinutes(5), so at the moment of death
-#   the lock has most of five minutes left. PREDICTION: a leaderless window of ~5 minutes, with
-#   nothing logged and no server-side actor able to shorten it.
+# THE NEMESIS HAS TO BE UNGRACEFUL, AND `kubectl delete --force --grace-period=0` IS NOT: --force
+# removes the API object immediately, but the kubelet still delivers SIGTERM and .NET still runs
+# its shutdown, which releases the lock rather than abandoning it. `kubectl exec -- kill -9 1` is
+# also a no-op -- the kernel will not deliver an unhandled signal to PID 1 from inside its own PID
+# namespace. So the kill comes from the host side, via crictl on the minikube node.
 #
-# THE NEMESIS HAS TO BE UNGRACEFUL, AND `kubectl delete --force --grace-period=0` IS NOT.
+# ARGUMENTS
 #
-# A graceful shutdown calls ReleaseLeadershipLockAsync, which DELETES the compare-exchange value.
-# That hands leadership over cleanly and skips the entire expiry mechanism -- it is the path a
-# rolling deploy takes, and it is not the one under test. What is under test is a leader that dies
-# without running shutdown at all: OOM kill, node loss, SIGKILL past the grace period.
-#
-# The first version of this script used `kubectl delete pod --force --grace-period=0` and measured
-# a 6-second failover. That number was real and meant nothing: --force removes the API object
-# immediately but the kubelet still delivers SIGTERM, .NET still ran its shutdown, and the lock was
-# released rather than abandoned. The giveaway was in the data -- the lock read `none` one second
-# after the kill, and a NodeStopped record appeared, which only the graceful path writes.
-#
-# `kubectl exec -- kill -9 1` does not work either: the kernel will not deliver an unhandled signal
-# to PID 1 from inside its own PID namespace. So the kill has to come from the host side, via
-# crictl on the minikube node.
-#
-# MODE=graceful reproduces the old behaviour on purpose, because "how fast is a clean handover"
-# is a worthwhile control to measure against.
-#
-#   ./scripts/leader-kill.sh [watch-seconds]                  # default 420 (past the 5 min expiry)
-#   MODE=graceful ./scripts/leader-kill.sh 120                # the control arm
+#   ./scripts/leader-kill.sh [watch-seconds]     how long to watch; default 420, past the 5 min
+#                                                RavenDB lock expiry. Shorter on PostgreSQL is fine.
+#   MODE=graceful ./scripts/leader-kill.sh 120   the control arm: an ordinary pod delete, so the
+#                                                shutdown hooks DO run. "How fast is a clean
+#                                                handover" is worth measuring against.
+#   DRY_RUN=1 ./scripts/leader-kill.sh           resolve leader, pod, container and validated host
+#                                                pid, print the target, and stop before signalling.
+#   OUT=<dir> ./scripts/leader-kill.sh           where timeline.tsv goes; default
+#                                                runs/leader-kill-<backend>.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
 K="minikube kubectl -- --context=minikube"
 source scripts/backend.sh
 
-TOOLS=".tools/safetylab"
-# Same requirement monitor.sh states: the host-side binary needs the .NET runtime, which this repo
-# provides through `nix develop`. Say so plainly -- the raw failure is a wall of apphost text about
-# DOTNET_ROOT that says nothing about what to do.
-command -v dotnet >/dev/null || {
-    echo "no dotnet on PATH -- run this inside 'nix develop'." >&2
-    exit 2
-}
-if [ ! -x "$TOOLS/safetylab" ]; then
-    echo "leader-kill.sh needs the safetylab binary: ./scripts/monitor.sh deploy (or dotnet publish" >&2
-    echo "    src/SafetyLab -c Release -o $TOOLS) -- it owns the pid resolution and its guards." >&2
-    exit 2
-fi
+# $SAFETYLAB owns the pid resolution and its guards, so it is not optional here.
+require_safetylab
 
 WATCH="${1:-420}"
 BACKEND=$(sim_backend)
@@ -109,10 +88,8 @@ if ! $K get pod "$VICTIM" >/dev/null 2>&1; then
     exit 2
 fi
 
-# NodeStopped is written by the NodeStopped() observer callback, which runs only on the graceful
-# shutdown path -- a SIGKILLed process cannot write it. Counting them before and after the kill is
-# therefore a direct assertion that the nemesis did what it claims, and it is the check that caught
-# the --force --grace-period=0 mistake.
+# NodeStopped is written only on the graceful shutdown path -- a SIGKILLed process cannot write it.
+# Counting before and after is therefore a direct assertion that the nemesis did what it claims.
 stopped_count() {
     case "$BACKEND" in
         ravendb) _raven query per-minute --event NodeStopped 2>/dev/null | awk -F'\t' '{s+=$2} END {print s+0}' ;;
@@ -133,24 +110,15 @@ if [ "$MODE" = "graceful" ]; then
 else
     # SIGKILL the container's host-side process, from the node, outside its PID namespace.
     echo "== SIGKILL from the node (no SIGTERM, no shutdown hooks) =="
-    # Resolving a container to a killable host pid is done in C# (safetylab host-pid), not here.
-    # The shell version of this block grepped the first `"pid"` out of `crictl inspect` -- which is
-    # a namespace descriptor reading 1 -- and ran `kill -9 1` against the minikube node's init. It
-    # survived only because PID 1 ignores unhandled signals from inside its own namespace, and the
-    # run then reported a failover for a kill that never happened.
-    #
-    # `safetylab host-pid` parses .info.pid as JSON and refuses to print anything unless the pid is
-    # > 1 AND /proc/<pid>/cmdline contains ChurnSim. Both rules are unit-tested against a captured
-    # crictl document that still has the misleading "pid": 1 ahead of the real one
-    # (tests/SafetyLab.Tests). If it exits non-zero, nothing gets killed.
-    HOSTPID=$("$TOOLS/safetylab" host-pid --pod "$VICTIM" --container churnsim --expect ChurnSim) || exit 2
+    # `safetylab host-pid` parses crictl's .info.pid as JSON and refuses to print anything unless
+    # the pid is > 1 AND /proc/<pid>/cmdline contains ChurnSim. If it exits non-zero, nothing gets
+    # killed -- which is why the kill target is resolved there and not with a grep here.
+    HOSTPID=$("$SAFETYLAB" host-pid --pod "$VICTIM" --container churnsim --expect ChurnSim) || exit 2
 
     echo "  $VICTIM -> host pid $HOSTPID"
 
-    # DRY_RUN resolves the whole target -- leader, pod, container, validated host pid -- and stops
-    # before the signal. A fault injector ought to be able to show what it would destroy, and it
-    # makes the resolution path testable against a live cluster without spending a five-minute
-    # outage to find out the plumbing works.
+    # DRY_RUN stops here: a fault injector ought to be able to show what it would destroy, and it
+    # makes the resolution path testable without spending a five-minute outage on plumbing.
     if [ -n "${DRY_RUN:-}" ]; then
         echo
         echo "DRY_RUN set -- would kill host pid $HOSTPID in $VICTIM. Nothing was signalled."
@@ -174,12 +142,9 @@ while :; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$now" "${pod:-none}" "${node:--}" "${holder:--}" "${ttl:--}" "${n:--}" >> "$TSV"
 
-    # A NEW leader means a live node that is not the one just killed.
-    #
-    # `leader_row` answers the single word "none" when there is no leader, and `cut -f2` on a line
-    # with no tab returns that whole word -- so "none" has to be excluded explicitly. Without it
-    # this fired at t+0 on the leaderless state and reported the outage as an instant recovery,
-    # which is the exact inversion of the thing being measured.
+    # A NEW leader means a live node that is not the one just killed. "none" must be excluded
+    # explicitly: `leader_row` answers that single word when there is no leader, and `cut -f2` on a
+    # line with no tab returns the whole word -- which reads as an instant recovery.
     if [ -n "$node" ] && [ "$node" != "-" ] && [ "$node" != "none" ] \
        && [ "$node" != "$VICTIM_NODE" ] && [ -z "$FIRST_NEW" ]; then
         FIRST_NEW="$now"
@@ -202,10 +167,8 @@ else
     echo "  leaderless window  : STILL LEADERLESS after ${WATCH}s"
 fi
 
-# The verdict is worthless unless the nemesis actually fired. A NodeStopped record appearing across
-# a run that claims to be a SIGKILL means the victim ran its shutdown, released the lock, and the
-# expiry path was never reached -- so the window above is a graceful-handover measurement wearing
-# the wrong label.
+# The verdict is worthless unless the nemesis actually fired: a NodeStopped record across a run
+# claiming to be a SIGKILL means the expiry path was never reached.
 echo "  NodeStopped        : $STOPPED_BEFORE -> $STOPPED_AFTER"
 if [ "$MODE" != "graceful" ] && [ "${STOPPED_AFTER:-0}" -gt "${STOPPED_BEFORE:-0}" ]; then
     echo

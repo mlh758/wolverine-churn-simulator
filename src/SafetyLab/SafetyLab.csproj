@@ -12,8 +12,8 @@
 
   <ItemGroup>
     <!-- Deliberately NOT a Wolverine reference. The monitor is an outside observer:
-         it must be able to watch a cluster running any Wolverine version (5.39,
-         stock main, the proposal build) without sharing a line of code with it. -->
+         it must be able to watch a cluster running any Wolverine version (a release, stock
+         main, a branch build) without sharing a line of code with it. -->
     <PackageReference Include="Npgsql" Version="9.0.2" />
     <!-- The CLI is the rig's configuration surface, and a silently-ignored flag means measuring
          something other than what was asked for. The hand-rolled Array.IndexOf parser this

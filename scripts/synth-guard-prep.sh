@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Prep for the synth-guard RLS chaos runs: the app must connect as a NON-superuser role, because
-# Postgres row-level security never applies to superusers and the manifest's default connection is
-# `postgres`. Creates the churn_app role, points the deployment at it, and resets the schema so the
-# app recreates it cleanly under the new role. Run once after each deploy.sh (deploy.sh re-applies
-# the manifest, which reverts POSTGRES_CONNECTION to the postgres user).
+# Point the app at a non-superuser role, so the synth-guard RLS fault actually applies to it.
 #
-#   ./scripts/synth-guard-prep.sh
+# DEPENDS ON  the PostgreSQL arm, $SAFETYLAB.
+# REQUIRES    a deployed cluster. RUN IT AFTER EVERY DEPLOY: applying the manifest reverts
+#             POSTGRES_CONNECTION to the postgres user, and row-level security never applies to a
+#             superuser -- so the fault would silently do nothing.
+# PRODUCES    the churn_app role, a deployment pointed at it with SIM_STALE_NODE_TIMEOUT_SECONDS=4
+#             and SIM_JSON_LOGS=true, and bounced pods. MUTATES the cluster.
+#
+# ARGUMENTS   none.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
@@ -21,7 +24,8 @@ if [ "$(sim_backend)" = "ravendb" ]; then
     exit 2
 fi
 
-PGPOD=$($K get pod -l app=pg -o jsonpath='{.items[0].metadata.name}')
+require_safetylab
+PGPOD=$("$SAFETYLAB" pick-pod --label app=pg) || exit 2
 
 $K exec "$PGPOD" -- psql -U postgres -d churnsim -qAt -c "
   do \$\$

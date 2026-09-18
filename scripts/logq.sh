@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # SQL over captured pod logs, on the host.
 #
-# This is what replaced the ClickHouse plan. With SIM_JSON_LOGS=true every pod log line is a JSON
-# object whose `State` holds the message-template parameters as named fields, so DuckDB can read
-# the files directly -- full SQL, window functions and self-joins included, with no database to
-# run and nothing new inside the cluster.
-#
-# That last part is the point. An in-cluster ClickHouse sized itself from the node's advertised
-# host RAM (rootless podman does not enforce `minikube --memory`) and took the whole machine down.
-# Analysis belongs on the host.
-#
-#   ./scripts/capture-logs.sh runs/foo          # dump raw pod logs first
-#   ./scripts/logq.sh runs/foo                  # schema + a summary
-#   ./scripts/logq.sh runs/foo "select ..."     # arbitrary SQL over the logs view
+# DEPENDS ON  duckdb (from `nix develop`), and a directory of raw.*.jsonl from capture-logs.sh or
+#             `safetylab snapshot`.
+# REQUIRES    at least one raw.*.jsonl in <dir>; exits 2 otherwise.
+# PRODUCES    query results on stdout. Reads only.
 #
 # The view `logs` exposes: pod, ts, level, category, message, state (JSON), file.
+#
+# Deliberately on the host and not in the cluster: an in-cluster ClickHouse sized itself from the
+# node's advertised host RAM (rootless podman does not enforce `minikube --memory`) and took the
+# machine down. See docs/harness-traps.md.
+#
+# ARGUMENTS
+#
+#   ./scripts/logq.sh <dir>              schema + a summary
+#   ./scripts/logq.sh <dir> "select ..." arbitrary SQL over the logs view
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

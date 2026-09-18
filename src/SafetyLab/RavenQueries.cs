@@ -13,7 +13,7 @@ namespace SafetyLab;
 /// new image, because the monitor is already deployed and already speaks RavenDB's REST API.
 ///
 /// Output is deliberately dumb TSV with no header, because that is what the scripts' existing
-/// `cut`, `grep` and orphans.py consume.
+/// `cut` and `grep` consume, and what `safetylab snapshot` parses back into rows.
 /// </summary>
 public static class RavenQueries
 {

@@ -1,0 +1,28 @@
+<Project>
+
+  <!-- The Wolverine version under test, in ONE place: ./wolverine-version.
+       Three things need it and each reads that file rather than carrying a copy:
+         - this file, for anything MSBuild builds;
+         - scripts/deploy.sh, for the image tag;
+         - Dockerfile, which passes -p:WolverineVersion only when a build arg was given.
+
+       To change the version under test, edit ./wolverine-version. To override for one build,
+       pass -p:WolverineVersion=<v> (MSBuild) or ./scripts/deploy.sh <v>.
+
+       The condition matters: a global property from -p: cannot be reassigned here, and passing
+       -p:WolverineVersion= (empty) yields EMPTY rather than falling back to this default. That is
+       why the Dockerfile omits the flag entirely instead of passing an empty one. -->
+  <PropertyGroup>
+    <WolverineVersionFile>$(MSBuildThisFileDirectory)wolverine-version</WolverineVersionFile>
+    <WolverineVersion Condition="'$(WolverineVersion)' == '' And Exists('$(WolverineVersionFile)')"
+                      >$([System.IO.File]::ReadAllText('$(WolverineVersionFile)').Trim())</WolverineVersion>
+  </PropertyGroup>
+
+  <!-- Fail loudly rather than restoring Version="" and reporting a missing package. -->
+  <Target Name="RequireWolverineVersion" BeforeTargets="CollectPackageReferences"
+          Condition="'$(MSBuildProjectName)' == 'ChurnSim'">
+    <Error Condition="'$(WolverineVersion)' == ''"
+           Text="No Wolverine version: $(WolverineVersionFile) is missing and -p:WolverineVersion was not passed." />
+  </Target>
+
+</Project>

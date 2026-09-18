@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # Sourced by the measurement scripts. Not executable on its own.
 #
-# Every measurement in this rig is "ask the store a question, get tab-separated text back". On
-# PostgreSQL that is psql inside the pg pod. RavenDB has no psql and its container ships no
-# client worth depending on, so the equivalent is `safetylab query` inside the already-deployed
-# monitor pod, which speaks RavenDB's REST API and takes no Wolverine dependency.
+# DEPENDS ON  a deployed store. The RavenDB path additionally needs a live safetylab pod
+#             (./scripts/monitor.sh deploy) and returns 2 with that instruction when there is none.
+# REQUIRES    nothing; every function reports rather than assumes.
+# PRODUCES    tab-separated text on stdout. db_reset_metrics and db_drop MUTATE; the rest read.
 #
-# The PostgreSQL path below is character-for-character what measure.sh and duplicate-rate.sh
-# already ran. That is deliberate: every number in RESULTS.md was taken through those exact
-# queries, and a refactor that quietly reworded them would break comparability with the entire
-# existing record for no gain.
+# The query text is frozen. Every number in RESULTS.md was taken through these exact queries, and
+# rewording one breaks comparability with the whole existing record for no gain.
+#
+# The exception, 2026-09-18: db_per_node, db_records and db_per_minute had `group by 1` over a
+# select list whose first expression contains an aggregate, and `order by 2` over a one-column
+# list. All three errored on every call since they were written, and psql's stderr went to
+# /dev/null, so measure.sh printed empty sections and a confident `total ...: 0`. No number ever
+# came through them, so there was no comparability to protect.
 #
 #   source scripts/backend.sh
 #   sim_backend            -> postgres | ravendb
-#   db_assigned            -> agentUri <TAB> pod name, sim:// agents only
+#   require_safetylab      -> build $SAFETYLAB if stale, or exit 2
 #   db_placed              -> count of placed sim:// agents
 #   db_nodes               -> node number <TAB> description (= pod name)
 #   db_per_node            -> node id <TAB> agent count
@@ -24,6 +28,28 @@
 
 export PATH="$HOME/.local/bin:$PATH"
 : "${K:=minikube kubectl -- --context=minikube}"
+
+# The host-side binary, which carries most of what these scripts used to decide.
+: "${SAFETYLAB:=.tools/safetylab/safetylab}"
+
+# Rebuilds when any source is newer than the binary. An existence check alone is not enough: a
+# stale binary does not fail, it answers with yesterday's code.
+require_safetylab() {
+    command -v dotnet >/dev/null || {
+        echo "no dotnet on PATH -- run this inside 'nix develop'." >&2
+        exit 2
+    }
+
+    if [ -x "$SAFETYLAB" ] && [ -z "$(find src/SafetyLab -name '*.cs' -newer "$SAFETYLAB" -print -quit)" ]; then
+        return 0
+    fi
+
+    echo "== building safetylab ==" >&2
+    dotnet publish src/SafetyLab -c Release -o "$(dirname "$SAFETYLAB")" -v q --nologo >&2 || {
+        echo "could not build $SAFETYLAB" >&2
+        exit 2
+    }
+}
 
 # Which arm is deployed, read from the deployment itself rather than from an argument. The one
 # thing that must never happen is measuring one backend and filing it as the other, and the
@@ -43,18 +69,22 @@ sim_backend() {
     echo "${value:-postgres}"
 }
 
-_pgpod() { $K get pod -l app=pg -o jsonpath='{.items[0].metadata.name}'; }
+# A LIVE pg pod. Exec-ing into a terminating predecessor fails with "cannot exec into a container
+# in a completed pod", which reads as "the store is unreachable".
+_pgpod() { "$SAFETYLAB" pick-pod --label app=pg; }
 
-_psql() { $K exec "$(_pgpod)" -- psql -U postgres -d churnsim -qAt -c "$1" 2>/dev/null; }
+# psql's stderr is NOT discarded. Sent to /dev/null, an unreachable store, a missing schema and a
+# syntax error all return the empty string -- which every caller then reads as a real answer.
+_psql() {
+    local pod
+    pod=$(_pgpod) || { echo "backend.sh: no live PostgreSQL pod to query" >&2; return 2; }
+    $K exec "$pod" -- psql -U postgres -d churnsim -qAt -c "$1"
+}
 
-# `safetylab query` inside the monitor pod. The monitor is the only container in the cluster that
-# can talk to RavenDB in these terms, so the RavenDB arm needs `./scripts/monitor.sh deploy` before
-# it can be measured at all -- which is worth saying out loud rather than failing obscurely.
+# `safetylab query` inside the monitor pod -- the only container that can talk to RavenDB in these
+# terms, so the RavenDB arm needs `./scripts/monitor.sh deploy` before it can be measured at all.
 _raven() {
-    # A LIVE pod, not `.items[0]`. A restarted Deployment leaves the previous pod behind in
-    # Failed/Succeeded for a while, and exec-ing into it fails with "cannot exec into a container
-    # in a completed pod" -- which reads as "the store is unreachable" at exactly the moment a
-    # measurement is being taken. Same selector trap that live_pods.py exists for.
+    # A LIVE pod: a restarted Deployment leaves its predecessor in Failed/Succeeded for a while.
     local pod
     pod=$($K get pod -l app=safetylab \
             --field-selector=status.phase=Running \
@@ -66,16 +96,6 @@ _raven() {
         return 2
     fi
     $K exec "$pod" -- dotnet safetylab.dll "$@"
-}
-
-db_assigned() {
-    case "$(sim_backend)" in
-        ravendb) _raven query assigned ;;
-        *) _psql "select a.id || chr(9) || n.description
-                    from wolverine.wolverine_node_assignments a
-                    join wolverine.wolverine_nodes n on n.id = a.node_id
-                   where a.id like 'sim://%';" ;;
-    esac
 }
 
 db_placed() {
@@ -98,7 +118,7 @@ db_per_node() {
     case "$(sim_backend)" in
         ravendb) _raven query per-node ;;
         *) _psql "select node_id || chr(9) || count(*)
-                    from wolverine.wolverine_node_assignments group by 1;" ;;
+                    from wolverine.wolverine_node_assignments group by node_id;" ;;
     esac
 }
 
@@ -106,7 +126,7 @@ db_records() {
     case "$(sim_backend)" in
         ravendb) _raven query records ;;
         *) _psql "select event_name || chr(9) || count(*)
-                    from wolverine.wolverine_node_records group by 1 order by 2 desc;" ;;
+                    from wolverine.wolverine_node_records group by event_name order by count(*) desc;" ;;
     esac
 }
 
@@ -117,22 +137,20 @@ db_per_minute() {
         *) _psql "select to_char(date_trunc('minute', timestamp), 'YYYY-MM-DD HH24:MI') || chr(9) || count(*)
                     from wolverine.wolverine_node_records
                    where event_name = '$event'
-                   group by 1 order by 1;" ;;
+                   group by date_trunc('minute', timestamp) order by 1;" ;;
     esac
 }
 
 db_reset_metrics() {
     case "$(sim_backend)" in
         ravendb) _raven admin reset-metrics ;;
-        *) $K exec "$(_pgpod)" -- psql -U postgres -d churnsim -c \
-               "truncate wolverine.wolverine_node_records;" ;;
+        *) _psql "truncate wolverine.wolverine_node_records;" ;;
     esac
 }
 
 db_drop() {
     case "$(sim_backend)" in
         ravendb) _raven admin drop-database ;;
-        *) $K exec "$(_pgpod)" -- psql -U postgres -d churnsim -c \
-               "drop schema if exists wolverine cascade;" ;;
+        *) _psql "drop schema if exists wolverine cascade;" ;;
     esac
 }

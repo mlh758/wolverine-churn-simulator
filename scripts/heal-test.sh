@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # Does the cluster HEAL a duplicated agent, or stay wrong?
 #
-# The question a convergence fix has to be judged on. `duplicate-rate.sh` looks once after the dust
-# settles and cannot answer it: a reconcile sweep that clears a duplicate in ~6s (3 health-check
-# ticks at ChurnSim's 2s cadence) makes the end state read clean, and clean is indistinguishable
-# from "no duplicate ever happened".
+# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, scripts/rollout.sh.
+# REQUIRES    the cluster settled.
+# PRODUCES    a row per iteration appended to runs/heal-test/results.tsv:
+#               iteration outcome healed persisted longest_heal_s
+#             outcome is never | HEALED | PERSISTED | SKIP-no-settle | SKIP-unanalysable.
+#             Raw pod logs and overlaps.txt are kept for every iteration that overlapped.
 #
-# The first version of this script polled the cluster every 15s. That was no better -- a 6s window
-# sampled every 15s is missed most of the time, and three "never" results in a row nearly became
-# "the fix prevents duplication".
+# A single look at the end state cannot answer this: a reconcile sweep that clears a duplicate in
+# ~6s (3 health-check ticks at ChurnSim's 2s cadence) makes the end state read clean, and clean is
+# indistinguishable from "no duplicate ever happened". Polling every 15s is no better -- a 6s
+# window is missed most of the time. So the cluster is not sampled at all: every AGENT-START and
+# AGENT-STOP is already in the pod logs with a timestamp, and one capture at the end recovers the
+# whole timeline at full resolution.
 #
-# So: do not sample the cluster at all. Every AGENT-START and AGENT-STOP is already in the pod logs
-# with a timestamp, so one capture at the end recovers the complete timeline at full resolution.
-# scripts/overlaps.py replays it into residency intervals and classifies every overlap:
+# ARGUMENTS
 #
-#   HEALED     - both copies ran, then one stopped
-#   PERSISTED  - both copies were still running when the log was captured
-#
-# Stock 6.35.0 PERSISTS: an earlier duplicate was still live 40 minutes on.
-#
-#   ./scripts/heal-test.sh [iterations] [watch-seconds]
+#   ./scripts/heal-test.sh [iterations] [watch-seconds]   defaults 8 and 300; watch-seconds is how
+#                                                         long after the rollout to let the cluster
+#                                                         act before capturing
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
@@ -34,11 +34,11 @@ mkdir -p "$OUT"
 [ -f "$TSV" ] || printf 'iteration\toutcome\thealed\tpersisted\tlongest_heal_s\n' > "$TSV"
 
 # The only question this script asks the store is "how many sim agents are placed"; everything
-# else it needs is already in the pod logs. backend.sh answers it on either arm.
+# else it needs is already in the pod logs.
 source scripts/backend.sh
+require_safetylab
 
-live_pods() { $K get pods -l app=churnsim -o json 2>/dev/null | python3 scripts/live_pods.py; }
-placed()    { db_placed; }
+live_pods() { "$SAFETYLAB" pods --label app=churnsim; }
 
 capture() {
     local dir="$1"
@@ -48,23 +48,9 @@ capture() {
     done
 }
 
-wait_settled() {
-    local last=-1 stable=0 n
-    for _ in $(seq 1 120); do
-        n=$(placed)
-        if [ "${n:-0}" = "500" ]; then
-            if [ "$n" = "$last" ]; then
-                stable=$(( stable + 1 ))
-                [ "$stable" -ge 3 ] && return 0
-            else
-                stable=0
-            fi
-        fi
-        last="$n"
-        sleep 10
-    done
-    return 1
-}
+# `safetylab settle`: exit 0 settled (elapsed seconds on stdout), 1 never settled (-1), 2 could
+# not measure. The target is the deployment's SIM_AGENT_COUNT, not a literal written into the loop.
+wait_settled() { "$SAFETYLAB" settle >/dev/null; }
 
 echo "heal-test: $ITERS rollouts, capturing ${WATCH}s after each"
 echo "image: $($K get deployment churnsim -o jsonpath='{.spec.template.spec.containers[0].image}')"
@@ -85,21 +71,30 @@ for i in $(seq 1 "$ITERS"); do
     sleep "$WATCH"
 
     capture "$OUT/iter$i"
-    line=$(python3 scripts/overlaps.py "$OUT/iter$i" --verbose > "$OUT/iter$i/overlaps.txt" 2>&1; head -1 "$OUT/iter$i/overlaps.txt")
-    healed=$(sed -n 's/.*overlaps_healed=\([0-9]*\).*/\1/p' <<<"$line")
-    persisted=$(sed -n 's/.*overlaps_persisted=\([0-9]*\).*/\1/p' <<<"$line")
-    healed=${healed:-0}; persisted=${persisted:-0}
+    # `safetylab overlaps` writes overlaps.txt and prints this file's columns 2-5:
+    #
+    #     outcome <TAB> healed <TAB> persisted <TAB> longest_heal_s
+    #
+    # exit 0 no overlap / 1 overlap found / 2 COULD NOT ANALYSE. The last matters because the
+    # branch below deletes the raw logs on "never" -- an analyser that did not answer is not
+    # evidence of a healthy cluster.
+    row=$("$SAFETYLAB" overlaps "$OUT/iter$i" --tsv); rc=$?
 
-    longest=$(grep -oE 'HEALED .* for [0-9.]+s' "$OUT/iter$i/overlaps.txt" 2>/dev/null \
-              | grep -oE '[0-9.]+s$' | tr -d s | sort -rn | head -1)
+    if [ "$rc" -ge 2 ]; then
+        printf '%s\tSKIP-unanalysable\t-\t-\t-\n' "$i" >> "$TSV"
+        echo "  the overlap analysis was refused -- evidence kept in $OUT/iter$i/"
+        tail -1 "$TSV"; continue
+    fi
 
-    if   [ "$persisted" -gt 0 ]; then outcome=PERSISTED
-    elif [ "$healed"    -gt 0 ]; then outcome=HEALED
-    else                             outcome=never; fi
-
-    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$outcome" "$healed" "$persisted" "${longest:--}" >> "$TSV"
+    printf '%s\t%s\n' "$i" "$row" >> "$TSV"
     tail -1 "$TSV"
-    [ "$outcome" = never ] && rm -f "$OUT/iter$i"/raw.*.jsonl || sed -n '2,6p' "$OUT/iter$i/overlaps.txt"
+
+    # Nothing overlapped: reclaim the logs. Anything else keeps them.
+    if [ "$rc" -eq 0 ]; then
+        rm -f "$OUT/iter$i"/raw.*.jsonl
+    else
+        sed -n '2,6p' "$OUT/iter$i/overlaps.txt"
+    fi
 done
 
 echo

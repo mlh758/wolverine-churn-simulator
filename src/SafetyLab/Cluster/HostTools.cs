@@ -50,6 +50,42 @@ public static class ProcessRunner
 
     public static Result MinikubeSsh(string command)
         => Run("minikube", "ssh", "--", command);
+
+    /// <summary>
+    /// Like <see cref="Kubectl"/>, but stdout is streamed straight to a file instead of buffered
+    /// into a string. A settled pod's log is tens of megabytes of JSON; reading it into memory only
+    /// to write it out again doubles that for no reason, and the <c>\r</c> rewrite that helps
+    /// `minikube ssh` would be editing captured evidence.
+    /// </summary>
+    public static Result KubectlToFile(string path, params string[] args)
+    {
+        var info = new ProcessStartInfo("minikube")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+
+        foreach (var arg in new[] { "kubectl", "--", "--context=minikube" }.Concat(args))
+        {
+            info.ArgumentList.Add(arg);
+        }
+
+        using var process = Process.Start(info)
+                            ?? throw new InvalidOperationException("could not start minikube kubectl");
+
+        // stderr is drained on another thread: a process that fills its stderr pipe while nobody
+        // reads it blocks forever, and `kubectl logs` is chatty enough to do exactly that.
+        var stderr = process.StandardError.ReadToEndAsync();
+
+        using (var file = File.Create(path))
+        {
+            process.StandardOutput.BaseStream.CopyTo(file);
+        }
+
+        process.WaitForExit();
+        return new Result(process.ExitCode, "", stderr.GetAwaiter().GetResult().Replace("\r", ""));
+    }
 }
 
 /// <summary>

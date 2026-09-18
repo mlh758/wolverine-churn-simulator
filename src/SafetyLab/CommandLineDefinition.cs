@@ -49,6 +49,13 @@ public static class CommandLineDefinition
         root.Subcommands.Add(BuildPods());
         root.Subcommands.Add(BuildPickPod());
         root.Subcommands.Add(BuildHostPid());
+        root.Subcommands.Add(BuildSnapshot());
+        root.Subcommands.Add(BuildOverlaps());
+        root.Subcommands.Add(BuildTraces());
+        root.Subcommands.Add(BuildChaos());
+        root.Subcommands.Add(BuildVerifyConfig());
+        root.Subcommands.Add(BuildCount());
+        root.Subcommands.Add(BuildSettle());
 
         return root;
     }
@@ -304,6 +311,246 @@ public static class CommandLineDefinition
 
         command.SetAction(parseResult => HostTools.HostPid(
             parseResult.GetValue(pod)!, parseResult.GetValue(container)!, parseResult.GetValue(expect)!));
+
+        return command;
+    }
+
+    // --------------------------------------------------------------- snapshot
+
+    /// <summary>
+    /// The three-way exit code is the whole point and is stated in the help text, because a caller
+    /// that treats 2 as 1 — or as 0 — has reintroduced the defect this verb was written to remove.
+    /// </summary>
+    private static Command BuildSnapshot()
+    {
+        var directory = new Argument<string>("directory")
+        {
+            Description = "where to write raw.*.jsonl, running.tsv, assigned.tsv, report.txt and snapshot.json"
+        };
+
+        var label = new Option<string>("--label")
+        {
+            Description = "label selector for the app pods", DefaultValueFactory = _ => "app=churnsim"
+        };
+
+        var tsv = new Option<bool>("--tsv")
+        {
+            Description = "print 'verdict running assigned duplicated orphaned missing' instead of the summary line"
+        };
+
+        var command = new Command("snapshot",
+            "Compare agents actually running (from pod logs) against the assignment table. " +
+            "Exit 0 clean, 1 diverged, 2 COULD NOT MEASURE.");
+
+        command.Arguments.Add(directory);
+        command.Options.Add(label);
+        command.Options.Add(tsv);
+
+        command.SetAction(parseResult => Snapshot.Run(
+            parseResult.GetValue(directory)!,
+            parseResult.GetValue(label)!,
+            parseResult.GetValue(tsv)));
+
+        return command;
+    }
+
+    // --------------------------------------------------------------- overlaps
+
+    private static Command BuildOverlaps()
+    {
+        var directory = new Argument<string>("directory")
+        {
+            Description = "a directory of captured raw.*.jsonl pod logs"
+        };
+
+        var grace = new Option<double>("--grace")
+        {
+            Description = "seconds an overlap must exceed to count; below this it is handover, not duplication",
+            DefaultValueFactory = _ => 2.0
+        };
+
+        var tsv = new Option<bool>("--tsv")
+        {
+            Description = "print 'outcome healed persisted longest_heal_s' instead of the summary line"
+        };
+
+        var command = new Command("overlaps",
+            "Replay pod logs into agent residencies and classify every cross-pod overlap. " +
+            "Exit 0 never, 1 overlap found, 2 COULD NOT ANALYSE.");
+
+        command.Arguments.Add(directory);
+        command.Options.Add(grace);
+        command.Options.Add(tsv);
+
+        command.SetAction(parseResult => Overlaps.Run(
+            parseResult.GetValue(directory)!,
+            TimeSpan.FromSeconds(parseResult.GetValue(grace)),
+            parseResult.GetValue(tsv)));
+
+        return command;
+    }
+
+    // ----------------------------------------------------------------- traces
+
+    private static Command BuildTraces()
+    {
+        var minutes = new Option<int>("--minutes")
+        {
+            Description = "lookback window", DefaultValueFactory = _ => 30
+        };
+
+        var service = new Option<string>("--service")
+        {
+            Description = "Jaeger service name", DefaultValueFactory = _ => "churnsim"
+        };
+
+        var operation = new Option<string>("--operation")
+        {
+            Description = "span operation to summarise",
+            DefaultValueFactory = _ => "wolverine_node_assignments"
+        };
+
+        var raw = new Option<bool>("--raw") { Description = "print the Jaeger payload and nothing else" };
+
+        var command = new Command("traces",
+            "Summarise Wolverine's spans from Jaeger. Exit 2 if they could not be read — including " +
+            "when there are none, which is a configuration answer rather than a quiet system.");
+
+        foreach (var option in new Option[] { minutes, service, operation, raw }) command.Options.Add(option);
+
+        command.SetAction(parseResult => Traces.Run(
+            parseResult.GetValue(minutes),
+            parseResult.GetValue(service)!,
+            parseResult.GetValue(operation)!,
+            parseResult.GetValue(raw)));
+
+        return command;
+    }
+
+    // ------------------------------------------------------------------ chaos
+
+    /// <summary>
+    /// The fault injector, PostgreSQL only. Split into arm / disarm / status precisely so a caller
+    /// can guarantee the disarm from a trap and check for a leaked arm before starting.
+    /// </summary>
+    private static Command BuildChaos()
+    {
+        var command = new Command("chaos",
+            "PostgreSQL only, and it MUTATES: hide one node's row from the app role's reads.");
+
+        var arm = new Command("arm",
+            "Choose a non-leader victim and hide its node row. Prints the victim id. Exit 2 if no " +
+            "victim is safe to choose, or if chaos is already armed.");
+        arm.SetAction(_ => ChaosVerbs.Arm());
+
+        var disarm = new Command("disarm",
+            "Remove the fault. Idempotent, so a trap can call it on every exit path.");
+        disarm.SetAction(_ => ChaosVerbs.Disarm());
+
+        var status = new Command("status",
+            "Print armed/disarmed. Exit 1 when armed, so a run can refuse to start on a dirty cluster.");
+        status.SetAction(_ => ChaosVerbs.Status());
+
+        command.Subcommands.Add(arm);
+        command.Subcommands.Add(disarm);
+        command.Subcommands.Add(status);
+
+        return command;
+    }
+
+    // --------------------------------------------------------- verify-config
+
+    private static Command BuildVerifyConfig()
+    {
+        var label = new Option<string>("--label")
+        {
+            Description = "label selector for the pods to verify", DefaultValueFactory = _ => "app=churnsim"
+        };
+
+        var expect = new Option<string[]>("--expect")
+        {
+            Description = "Setting=Value, as the pod's own CONFIG line reports it; repeatable",
+            AllowMultipleArgumentsPerToken = false,
+            Required = true
+        };
+
+        var command = new Command("verify-config",
+            "Assert every live pod reports this configuration from its own startup output. " +
+            "Exit 2 on any disagreement — it refuses rather than warns.");
+
+        command.Options.Add(label);
+        command.Options.Add(expect);
+
+        command.SetAction(parseResult => ChaosVerbs.VerifyConfig(
+            parseResult.GetValue(label)!, parseResult.GetValue(expect) ?? []));
+
+        return command;
+    }
+
+    // ----------------------------------------------------------------- settle
+
+    private static Command BuildSettle()
+    {
+        var expect = new Option<int?>("--expect")
+        {
+            Description = "agents to wait for (default: SIM_AGENT_COUNT, read from the deployment)"
+        };
+        var timeout = new Option<int>("--timeout-seconds")
+        {
+            Description = "give up after this long", DefaultValueFactory = _ => 1200
+        };
+        var poll = new Option<int>("--poll-seconds")
+        {
+            Description = "seconds between reads", DefaultValueFactory = _ => 10
+        };
+        var stable = new Option<int>("--stable-polls")
+        {
+            Description = "consecutive polls the count must hold", DefaultValueFactory = _ => 3
+        };
+        var series = new Option<string?>("--series")
+        {
+            Description = "write the placement series here, one 'elapsed<TAB>placed' per poll"
+        };
+
+        var command = new Command("settle",
+            "Wait for full placement to hold still. Prints elapsed seconds. " +
+            "Exit 0 settled, 1 did not settle, 2 COULD NOT MEASURE.");
+
+        foreach (var option in new Option[] { expect, timeout, poll, stable, series }) command.Options.Add(option);
+
+        command.SetAction(parseResult => Settle.Run(
+            parseResult.GetValue(expect),
+            parseResult.GetValue(timeout),
+            parseResult.GetValue(poll),
+            parseResult.GetValue(stable),
+            parseResult.GetValue(series)));
+
+        return command;
+    }
+
+    // ------------------------------------------------------------------ count
+
+    private static Command BuildCount()
+    {
+        var directory = new Argument<string>("directory")
+        {
+            Description = "a directory of captured raw.*.jsonl pod logs"
+        };
+
+        var contains = new Option<string>("--message")
+        {
+            Description = "count records whose Message contains this text", Required = true
+        };
+
+        var command = new Command("count",
+            "Count log records by message text — the Message field only, not any line that happens " +
+            "to contain the string. Exit 2 if there are no logs to count.");
+
+        command.Arguments.Add(directory);
+        command.Options.Add(contains);
+
+        command.SetAction(parseResult => ChaosVerbs.Count(
+            parseResult.GetValue(directory)!, parseResult.GetValue(contains)!));
 
         return command;
     }

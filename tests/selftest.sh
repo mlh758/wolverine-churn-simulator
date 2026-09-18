@@ -50,12 +50,37 @@ echo
 echo "checker ledger:"
 
 failures=0
+checks=0
+
 for row in "${LEDGER[@]}"; do
   fixture="${row%%:*}"
   expected="${row#*:}"
 
-  actual=$($BIN check "tests/fixtures/$fixture" --json 2>/dev/null \
-    | jq -r '.[] | select((.violations | length) > 0) | .id' | sort | tr '\n' ' ' | sed 's/ $//')
+  # Keep the payload. Reading the ids straight out of a pipe meant a checker that CRASHED produced
+  # no output, `actual` came back empty, and empty is exactly what the `clean:` rows expect -- so a
+  # broken binary passed the two fixtures whose whole job is to prove the checkers stay quiet. The
+  # ledger only means something if the checkers ran, so that is asserted first.
+  json=$($BIN check "tests/fixtures/$fixture" --json 2>/dev/null)
+  n=$(jq 'length' <<<"$json" 2>/dev/null)
+
+  if [ -z "$n" ] || [ "$n" -eq 0 ] 2>/dev/null; then
+    printf '  FAIL %-18s -> the checker produced no results at all (crashed, or wrote no JSON)\n' "$fixture"
+    failures=$((failures + 1))
+    continue
+  fi
+
+  # And that the SAME checkers ran on every fixture. One silently dropping out would otherwise
+  # look like a fixture that stopped triggering it.
+  if [ "$checks" -eq 0 ]; then
+    checks="$n"
+  elif [ "$n" -ne "$checks" ]; then
+    printf '  FAIL %-18s -> ran %s checks; every other fixture ran %s\n' "$fixture" "$n" "$checks"
+    failures=$((failures + 1))
+    continue
+  fi
+
+  actual=$(jq -r '.[] | select((.violations | length) > 0) | .id' <<<"$json" \
+    | sort | tr '\n' ' ' | sed 's/ $//')
   expected=$(echo "$expected" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/^ *//; s/ *$//')
 
   if [ "$actual" = "$expected" ]; then
@@ -68,7 +93,7 @@ done
 
 echo
 if [ "$failures" -eq 0 ]; then
-  echo "ledger holds: every checker fires on its own fault and stays quiet on the others"
+  echo "ledger holds: all $checks checks ran on every fixture, each firing on its own fault"
   exit 0
 fi
 

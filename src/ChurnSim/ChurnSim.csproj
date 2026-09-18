@@ -6,9 +6,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- Overridden by the Docker build arg: 5.39.0 (released), 6.33.0-stock.1
-         (pristine main), or 6.33.0-proposal.1 (GH-3987/GH-3959 implementation) -->
-    <WolverineVersion Condition="'$(WolverineVersion)' == ''">5.39.0</WolverineVersion>
+    <!-- Default in ./Directory.Build.props, from ./wolverine-version.
+         Every WolverineFx reference below pins [$(WolverineVersion)]: the bracket notation is
+         NuGet's EXACT version. A bare Version="x" is a minimum, so a version that does not exist
+         resolves to whatever else is available and warns (NU1603) rather than failing: asking for
+         0.0.0-nope silently built against WolverineFx 0.8.2. This rig measures one specific
+         Wolverine build, so anything but an exact match has to be an error. -->
 
     <!-- Which message store this image is built against: 'postgres' (default) or 'ravendb'.
          A build-time switch rather than a runtime one because the package references differ:
@@ -21,7 +24,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
     <!-- 6.x core no longer ships the Roslyn runtime compiler (GH-2876) -->
-    <PackageReference Include="WolverineFx.RuntimeCompilation" Version="$(WolverineVersion)"
+    <PackageReference Include="WolverineFx.RuntimeCompilation" Version="[$(WolverineVersion)]"
                       Condition="$(WolverineVersion.StartsWith('6'))" />
   </ItemGroup>
 
@@ -29,12 +32,12 @@
        `internal static class SimBackend`, so Program.cs calls SimBackend.Configure with no
        conditional compilation of its own. -->
   <ItemGroup Condition="'$(SimBackend)' != 'ravendb'">
-    <PackageReference Include="WolverineFx.Postgresql" Version="$(WolverineVersion)" />
+    <PackageReference Include="WolverineFx.Postgresql" Version="[$(WolverineVersion)]" />
     <Compile Remove="RavenDbBackend.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(SimBackend)' == 'ravendb'">
-    <PackageReference Include="WolverineFx.RavenDb" Version="$(WolverineVersion)" />
+    <PackageReference Include="WolverineFx.RavenDb" Version="[$(WolverineVersion)]" />
     <Compile Remove="PostgresBackend.cs" />
   </ItemGroup>
 

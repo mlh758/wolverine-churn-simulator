@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
-# Capture a SafetyLab run: the monitor's server-side samples plus every churnsim pod's log,
+# Capture a SafetyLab run -- the monitor's server-side samples plus every churnsim pod's log --
 # into runs/<name>/, then check it.
 #
-#   ./scripts/monitor.sh deploy            # build + deploy the in-cluster monitor (once)
-#   ./scripts/monitor.sh start rollout-1   # begin capturing into runs/rollout-1
-#   ./scripts/monitor.sh mark rollout-end  # timestamp a phase boundary
-#   ./scripts/monitor.sh stop              # end the capture
-#   ./scripts/monitor.sh check [name]      # run the checkers over a captured run
+# DEPENDS ON  a deployed churnsim cluster, podman + minikube for `deploy`, $TOOLS/safetylab
+#             (built here on demand).
+# REQUIRES    for `start`: a live safetylab pod and no capture already active.
+#             for `mark`/`stop`/`check`: an active capture whose run directory still exists.
+# PRODUCES    runs/<name>/history.jsonl (server-side samples), pods.<pod>.jsonl per pod,
+#             marks.jsonl (phase boundaries). `check` exits 1 if any checker failed.
 #
-# Pod logs are followed per-pod and started as pods appear, because `kubectl logs` cannot
-# reach a pod once it is gone -- and during a rolling deploy the pods that matter most are
-# exactly the ones that disappear. A pod replaced while nothing was following it contributes
-# no agent residencies at all, which silently weakens S5/S6/S7. Start the capture BEFORE the
-# rollout, and read the coverage check afterwards.
+# START THE CAPTURE BEFORE THE DISTURBANCE. `kubectl logs` cannot reach a pod once it is gone, and
+# during a rolling deploy the pods that matter most are exactly the ones that disappear. A pod
+# replaced while nothing followed it contributes no agent residencies, which weakens S5/S6/S7 --
+# read the C0 coverage check afterwards.
+#
+# ARGUMENTS
+#
+#   ./scripts/monitor.sh deploy            build + deploy the in-cluster monitor (once per arm)
+#   ./scripts/monitor.sh start <name>      begin capturing into runs/<name>
+#   ./scripts/monitor.sh mark <label>      timestamp a phase boundary
+#   ./scripts/monitor.sh stop              end the capture
+#   ./scripts/monitor.sh check [name]      run the checkers; defaults to the active run
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -49,9 +57,27 @@ safetylab() {
     "$TOOLS/safetylab" "$@"
 }
 
+# Prints the active run name, or explains why there is not one and RETURNS NON-ZERO.
+#
+# Every caller must use `name=$(active_run) || exit 2`. This only ever runs inside a command
+# substitution, so an `exit` here terminates that subshell and nothing else -- and `local x=$(...)`
+# would mask the status behind `local`'s own, so declaration and assignment stay split.
 active_run() {
-    [ -f "$ACTIVE" ] || { echo "no active run -- ./scripts/monitor.sh start <name>" >&2; exit 2; }
-    cat "$ACTIVE"
+    [ -f "$ACTIVE" ] || { echo "no active run -- ./scripts/monitor.sh start <name>" >&2; return 2; }
+
+    local name
+    name=$(cat "$ACTIVE")
+
+    # `.active` outlives the process that wrote it -- a reboot, a kill -9, a `stop` never run --
+    # and can outlive the run directory too. That is a stale marker, not an active capture.
+    [ -d "$RUNS/$name" ] || {
+        echo "$ACTIVE names '$name', but $RUNS/$name does not exist." >&2
+        echo "    That is a stale marker from a capture that was never stopped. Clear it:" >&2
+        echo "      rm $ACTIVE" >&2
+        return 2
+    }
+
+    printf '%s\n' "$name"
 }
 
 cmd_deploy() {
@@ -89,7 +115,16 @@ cmd_start() {
     local dir="$RUNS/$name"
 
     if [ -f "$ACTIVE" ]; then
-        echo "a capture is already running ($(cat "$ACTIVE")) -- stop it first" >&2
+        local previous
+        previous=$(cat "$ACTIVE")
+
+        if [ -d "$RUNS/$previous" ]; then
+            echo "a capture is already running ($previous) -- stop it first" >&2
+        else
+            echo "$ACTIVE names '$previous', whose directory is gone -- a stale marker from a" >&2
+            echo "    capture that was never stopped. Nothing is running. Clear it:" >&2
+            echo "      rm $ACTIVE" >&2
+        fi
         exit 2
     fi
 
@@ -104,19 +139,27 @@ cmd_start() {
     echo "$name" > "$ACTIVE"
     mkdir -p "$dir/.pids"
 
-    # The monitor pod is long-lived and was probably started before this capture, so take only
-    # what it emits from here on. --since=1s beats -f from the beginning: an old pod's backlog
-    # would land in this run's history with timestamps that predate it.
+    # A LIVE monitor pod. `deploy` ends in a `rollout restart`, so the previous pod is still
+    # listed and still phase Running while it terminates -- and following that one yields a
+    # near-empty history.jsonl, which every S-check then passes over.
     local pod
-    pod=$($KUBECTL get pod -l app=safetylab -o jsonpath='{.items[0].metadata.name}')
-    [ -n "$pod" ] || { echo "no safetylab pod -- run './scripts/monitor.sh deploy' first" >&2; exit 2; }
+    pod=$("$TOOLS/safetylab" pick-pod --label app=safetylab) || {
+        echo "no live safetylab pod -- run './scripts/monitor.sh deploy' first" >&2
+        exit 2
+    }
 
     # setsid + disown, not a bare `&`. These outlive `start` on purpose, and the follower loop
     # never exits on its own -- so under any caller that waits for its children (`bash -c`, a
     # script, CI) a bare background job makes `start` hang forever instead of returning. Detaching
     # them into their own session also means a Ctrl-C aimed at this script cannot take the capture
     # down mid-rollout.
-    setsid $KUBECTL logs -f --since=1s "$pod" >> "$dir/history.jsonl" 2>/dev/null &
+    #
+    # RE-ATTACHING, not one `kubectl logs -f`: a single attempt dies with the connection and the
+    # rest of the run then has no server-side history while `stop` still reports a plausible count.
+    #
+    # --since=1s on every attach, because the monitor pod is long-lived and its backlog would
+    # otherwise land in this run's history with timestamps that predate it.
+    setsid bash "$0" __history "$dir" >/dev/null 2>&1 &
     echo $! > "$dir/.pids/monitor"
     disown 2>/dev/null || true
 
@@ -128,6 +171,21 @@ cmd_start() {
     echo "capturing into $dir (monitor pod $pod)"
     echo "  ./scripts/monitor.sh mark <label>   to timestamp a phase"
     echo "  ./scripts/monitor.sh stop           when the run is done"
+}
+
+# Re-attach to the monitor pod's log for as long as the capture is running. Resolves the pod on
+# every pass, so a replacement pod is picked up rather than the loop spinning on a dead name.
+history_loop() {
+    local dir="$1"
+    local pod
+
+    while [ -f "$ACTIVE" ]; do
+        pod=$("$TOOLS/safetylab" pick-pod --label app=safetylab 2>/dev/null)
+        if [ -n "$pod" ]; then
+            $KUBECTL logs -f --since=1s "$pod" >> "$dir/history.jsonl" 2>/dev/null
+        fi
+        sleep 2
+    done
 }
 
 followers_loop() {
@@ -164,14 +222,16 @@ followers_loop() {
 
 cmd_mark() {
     local label="${1:?usage: monitor.sh mark <label>}"
-    local dir="$RUNS/$(active_run)"
+    local name dir
+    name=$(active_run) || exit 2
+    dir="$RUNS/$name"
     printf '{"kind":"mark","ts":"%s","label":"%s"}\n' "$(now)" "$label" >> "$dir/marks.jsonl"
     echo "marked '$label' in $dir"
 }
 
 cmd_stop() {
     local name dir
-    name=$(active_run)
+    name=$(active_run) || exit 2
     dir="$RUNS/$name"
 
     # Give the followers a moment to drain whatever the pods logged last.
@@ -208,13 +268,23 @@ cmd_stop() {
     fi
 
     rm -f "$ACTIVE"
-    echo "stopped; captured $(wc -l < "$dir/history.jsonl" 2>/dev/null || echo 0) samples into $dir"
+
+    # Every server-side check reads history.jsonl, so a capture that recorded none of it does not
+    # fail them -- it passes all of them, over nothing.
+    local samples
+    samples=$(wc -l < "$dir/history.jsonl" 2>/dev/null || echo 0)
+    if [ "${samples:-0}" -eq 0 ]; then
+        echo "WARNING: history.jsonl is EMPTY. No server-side samples were captured, so every" >&2
+        echo "         S-check will pass over nothing. Was the monitor pod live for this run?" >&2
+    fi
+
+    echo "stopped; captured $samples samples into $dir"
     echo "  ./scripts/monitor.sh check $name"
 }
 
 cmd_check() {
     local name="${1:-}"
-    [ -n "$name" ] || name=$(active_run)
+    [ -n "$name" ] || name=$(active_run) || exit 2
     shift 2>/dev/null || true
     safetylab check "$RUNS/$name" "$@"
 }
@@ -222,6 +292,7 @@ cmd_check() {
 case "${1:-}" in
     # Internal: the detached follower loop re-enters the script here.
     __followers) shift; followers_loop "$@" ;;
+    __history)   shift; history_loop "$@" ;;
     deploy) shift; cmd_deploy "$@" ;;
     start)  shift; cmd_start "$@" ;;
     mark)   shift; cmd_mark "$@" ;;

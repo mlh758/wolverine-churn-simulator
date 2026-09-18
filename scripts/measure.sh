@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Quantify assignment churn from the store's node-record history and from agent start/stop log
-# lines across all current pods. Works on either arm: scripts/backend.sh reads SIM_BACKEND off
-# the deployment and routes each question to psql or to `safetylab query`.
+# Assignment churn, from the store's node-record history and from agent start/stop lines in the
+# live pods' logs.
+#
+# DEPENDS ON  a deployed churnsim cluster (either arm). The RavenDB arm additionally needs
+#             ./scripts/monitor.sh deploy.
+# REQUIRES    nothing; reports whatever state the cluster is in.
+# PRODUCES    a report on stdout. Reads only -- nothing is mutated.
+#
+# ARGUMENTS   none.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

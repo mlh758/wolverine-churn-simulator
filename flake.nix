@@ -23,10 +23,9 @@
             pkgs.podman
             pkgs.kubectl
             pkgs.jq
-            # SQL over the captured JSON logs, on the host. Deliberately not an in-cluster
-            # database: ClickHouse sized itself from the node's advertised host RAM (rootless
-            # podman does not enforce minikube's --memory) and took the machine down.
+            # SQL over the captured JSON logs, on the host.
             pkgs.duckdb
+            pkgs.just
           ];
 
           env = {
