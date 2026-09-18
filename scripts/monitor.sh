@@ -74,6 +74,13 @@ cmd_deploy() {
 
     echo "== deploying the monitor ($backend) =="
     $KUBECTL apply -f "$manifest"
+
+    # `apply` reports "unchanged" when only the image CONTENTS moved -- the tag is always
+    # localhost/safetylab:local -- so the running pod keeps the old binary and every measurement
+    # afterwards silently comes from the previous build. Same class as the .tools/safetylab
+    # existence-cache trap: it does not fail, it just answers with yesterday's code. Restart
+    # unconditionally; the pod is cheap and a stale monitor is not.
+    $KUBECTL rollout restart deployment/safetylab
     $KUBECTL rollout status deployment/safetylab --timeout=180s
 }
 

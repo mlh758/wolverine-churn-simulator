@@ -69,12 +69,12 @@ it holds one, and still dispatches unfenced agent commands.
 
 Two structural facts here too:
 
-4. **The assignment set is read through a query, not a SELECT.** It arrives with an `IsStale` flag
+3. **The assignment set is read through a query, not a SELECT.** It arrives with an `IsStale` flag
    and a page limit. Collection queries (`from AgentAssignments`, no filter) are served from the
    collection and cannot be stale — but a filtered one builds an auto-index that can be, and a
    short read would look exactly like a smaller, healthy cluster. The monitor stays on the
    unfiltered form and records both signals regardless; C0 fails the run on either.
-5. **Staleness detection mixes two clocks here as well, and worse.** RavenDB has no `now()`, so the
+4. **Staleness detection mixes two clocks here as well, and worse.** RavenDB has no `now()`, so the
    monitor reads the server's clock from the HTTP `Date` header at one-second resolution. Whatever
    the true app-versus-store skew is, this arm cannot measure it below a second — which is a real
    limit on what a RavenDB stale-node finding can claim.
@@ -144,26 +144,50 @@ recorded via `IWolverineObserver`. Faults reachable without any infrastructure:
 
 This is the layer most likely to find new leadership bugs, and it runs in CI.
 
-**Layer 1b — the RavenDB arm. Built, not yet run for results.**
-Everything in Layer 0 now runs against RavenDB as well: `deploy.sh --backend ravendb`, a
-compare-exchange-reading monitor, S8 on top of S1–S7/L1/C0, and the same measurement scripts. What
-has been established so far is only that the rig works — a 3-node cluster forms, places 500 agents,
-and checks clean end to end. **No RavenDB result is claimed yet**, and none should be until the
-same runs that produced RESULTS.md have been repeated on it.
+**Layer 1b — the RavenDB arm. Built, and it found something. (2026-09-18)**
+Everything in Layer 0 now runs against RavenDB: `deploy.sh --backend ravendb`, a
+compare-exchange-reading monitor, S8 on top of S1-S7/L1/C0, and the same measurement scripts.
 
-The obvious first questions, in order of expected value:
+- **E2 duplicate rate: 12/12 clean** on 6.39.0. Not a store comparison — the sweep (#4404/#4407)
+  first shipped in V6.36.0, so this build contains a fix the PostgreSQL 7/19 baseline predates.
+  `LeadershipAssumed` fired 11 times, so the handover window was genuinely exercised.
+- **Ungraceful leader death leaves the cluster leaderless for ~5 minutes.** Measured 303 s, which
+  is the compare-exchange lock's own `AddMinutes(5)`. Recovery is immediate once it lapses. See
+  RESULTS.md 2026-09-18.
 
-- **E1/E2 on RavenDB.** Is the ~1-in-4 duplicate rate a property of the assignment plane or of the
-  PostgreSQL store? The assignment plane is identical code and the duplicate mechanism found on
-  2026-09-09 is a leadership-handover ordering problem, so the prediction is that it reproduces.
-  A RavenDB rate that differs materially would mean the mechanism is not what we think it is.
-- **The stall, directly.** Kill a leader pod ungracefully (`--grace-period=0`) and measure how long
-  the cluster has no leader. The prediction from the code is "up to five minutes, ended by whichever
-  peer next tries to attain the lock". If the observed number is the full expiry, that is a finding
-  worth reporting on its own — it is a five-minute control-plane outage with no log line.
-- **The key rename.** Does any real sequence leave leadership under both spellings? S1 is now a
-  live check rather than a sentinel on this arm; the fixture proves it can fire, but not that the
-  state is reachable.
+That second one is the "different class of problem" this arm was built to look for, and it is
+structural rather than a bug: a compare-exchange value has no session to die with, which is what
+makes it a good lock and a bad liveness signal. Wolverine uses it as both. Two things sharpen it:
+
+1. **The stall is self-sustaining.** Ejecting a stale node is the leader's job, so the dead node's
+   registration survives — the actor that would clean up the corpse is the one the corpse blocks.
+2. **Nothing in the store shows it.** `placed` read 500/500 for the entire outage while ~126 agents
+   were assigned to a dead node and running nowhere. An operator watching the assignment documents,
+   or Wolverine watching itself, would have seen a healthy fully-placed cluster for five minutes.
+
+**Layer 1c — the partition. Not built, and the most interesting thing left.**
+Everything above is a SINGLE-node RavenDB, so none of RavenDB's replication semantics were
+exercised. Reading the store's source, Wolverine's writes fall into three consistency classes:
+
+| state | mechanism | guarantee |
+|---|---|---|
+| leader / scheduled-job lock | compare-exchange | Raft, majority-committed, linearizable |
+| node registration, agent restrictions | `TransactionMode.ClusterWide` | Raft, majority-committed |
+| **agent assignments** | plain `OpenAsyncSession()` | **single-node write, async multi-master replication** |
+| health checks, node records | plain session | same |
+
+So the lock is *not* Redis-shaped — an acknowledged compare-exchange survives failover. But the
+assignment set is: GH-4407's claim-if-absent guard is `StoreAsync(..., changeVector: string.Empty,
+...)`, enforced by the RavenDB node serving the request, not across the cluster. Under a partition
+two Wolverine nodes talking to two different RavenDB nodes can each claim the same agent, both
+succeed, and the collision surfaces later as a document conflict resolved by policy rather than
+prevented — and neither Wolverine nor this rig configures a conflict-resolution policy.
+
+**Prediction:** a partitioned multi-node RavenDB produces duplicate agents under a perfectly
+coherent leader — the same fingerprint the sweep fixes, arriving by a route the sweep cannot see,
+because the sweep reconciles a node against *its own* assignment documents and those are exactly
+what diverge. Needs a 3-node RavenDB StatefulSet at replication factor 3 and a partition between
+RavenDB nodes. Untested; stated here so it is falsifiable rather than assumed.
 
 **Layer 2 — pod-level faults in minikube. Not built.**
 Only for what Layer 1 cannot fake: SIGSTOP a whole pod, `tc netem` partition pod↔Postgres

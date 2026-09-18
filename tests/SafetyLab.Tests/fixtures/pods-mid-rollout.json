@@ -1,0 +1,20 @@
+{
+  "items": [
+    {
+      "metadata": { "name": "churnsim-old-aaaaa", "deletionTimestamp": "2026-09-18T16:40:00Z" },
+      "status": { "phase": "Running", "containerStatuses": [ { "ready": true, "restartCount": 0 } ] }
+    },
+    {
+      "metadata": { "name": "churnsim-new-bbbbb" },
+      "status": { "phase": "Running", "containerStatuses": [ { "ready": false, "restartCount": 0 } ] }
+    },
+    {
+      "metadata": { "name": "churnsim-new-ccccc" },
+      "status": { "phase": "Running", "containerStatuses": [ { "ready": true, "restartCount": 0 } ] }
+    },
+    {
+      "metadata": { "name": "safetylab-old-ddddd" },
+      "status": { "phase": "Failed", "containerStatuses": [ { "ready": false, "restartCount": 0 } ] }
+    }
+  ]
+}

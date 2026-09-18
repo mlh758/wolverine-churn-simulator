@@ -56,7 +56,7 @@ The backend is a **build-time** choice: `ChurnSim.csproj` selects both the messa
 store package and the wiring file (`PostgresBackend.cs` / `RavenDbBackend.cs`) from
 `-p:SimBackend=`, so an image is single-backend by construction. The deployment
 declares the same value in `SIM_BACKEND` and ChurnSim **refuses to start on a
-mismatch** — a mislabelled arm has cost this rig three launches already.
+mismatch**, so a stale image cannot file results under the wrong store.
 
 ```bash
 ./scripts/deploy.sh                              # postgres (default), WolverineFx 5.39.0
@@ -96,11 +96,21 @@ chmod +x ~/.local/bin/minikube
 
 # rootless podman driver
 minikube config set rootless true
-minikube start --driver=podman --container-runtime=containerd --cpus=4 --memory=6g
+minikube config set memory 8192
+minikube config set cpus no-limit
+minikube start --driver=podman --container-runtime=containerd
 
 # kubectl comes along for free
 minikube kubectl -- get nodes
 ```
+
+`memory` is a real ceiling — the rootless podman driver passes it through and the kernel enforces
+it on the minikube container's cgroup, which is what keeps a runaway pod off the host. `cpus` is
+**not** passed through by that driver, so it is set to `no-limit` rather than to a number that
+would quietly do nothing; every result in `RESULTS.md` was taken on an unconstrained CPU shape.
+Note the ceiling does not propagate *inwards*: `/proc/meminfo` still reports the host's memory to
+everything in the cluster, so anything that sizes itself from available memory needs an explicit
+budget — see [docs/harness-traps.md](docs/harness-traps.md).
 
 ChurnSim and the SafetyLab monitor both build inside
 `mcr.microsoft.com/dotnet/sdk:10.0` images, so no local SDK is needed to run
@@ -215,27 +225,60 @@ pod replaced while nothing was following it contributes no residencies, which si
 weakens S5/S6/S7. This is why C0 exists and why a skipped check reports SKIP, not PASS.
 
 **A checker that has never been seen to fire is decoration.** `tests/selftest.sh` is the
-mutant ledger: seven synthetic fixtures, each injecting one fault, each declaring which
-checks must go red — and that the others stay green.
+mutant ledger: each synthetic fixture injects one fault and asserts which checks must go red —
+and that the others stay green. The `LEDGER` array in the script is the authoritative copy.
 
-```
-$ nix develop --command ./tests/selftest.sh
-  ok   clean              -> []
-  ok   dup-agent          -> [S5 S7]
-  ok   orphan-lock        -> [L1 S3 S4]
-  ok   stranded           -> [S6]
-  ok   no-converge        -> [L1]
-  ok   split-leader       -> [S3]
-  ok   gap                -> [C0]
-  ok   raven-clean        -> []
-  ok   raven-expired-lock -> [L1 S8]
-  ok   raven-split-key    -> [L1 S1]
-  ok   raven-truncated    -> [C0]
+| fixture | fault injected | must go red |
+|---|---|---|
+| `clean` | none — a healthy PostgreSQL run | *nothing* |
+| `dup-agent` | an agent started on a second pod, assignment table untouched | S5, S7 |
+| `orphan-lock` | departed node's advisory lock never released | S3, S4, L1 |
+| `stranded` | assignment row for an agent the pod never started | S6 |
+| `no-converge` | two agents never placed after the rollout | L1 |
+| `split-leader` | leader row and advisory lock name different nodes | S3 |
+| `gap` | a hole in the sample stream | C0 |
+| `raven-clean` | none — a healthy RavenDB run, so the leader checks cannot pass vacuously on an empty `locks` array | *nothing* |
+| `raven-expired-lock` | compare-exchange lock expired and nobody took it over | S8, L1 |
+| `raven-split-key` | leadership held under both spellings of the key at once | S1, L1 |
+| `raven-truncated` | a store read that came back short of its page limit | C0 |
+
+Run it with `nix develop --command ./tests/selftest.sh`. Add a checker, add a fixture and a
+ledger row.
+
+The same command also runs **`tests/SafetyLab.Tests`**, which covers the two layers outside the
+checkers:
+
+- **cluster decisions** — which pods are live, resolving a container to a host pid, reading leader
+  state, and whether a fault injector actually fired. These run against captured fixtures (real
+  `kubectl get pods -o json`, real `crictl inspect`), so they need no cluster.
+- **the CLI contract** — every invocation the scripts and `k8s/` manifests issue must parse, and
+  malformed ones must be rejected. Parsing only; nothing is executed.
+
+Both are pure functions and finish in well under a second, so there is no reason not to run them
+before touching a live experiment.
+
+## Leader failover (`scripts/leader-kill.sh`)
+
+Kills the pod currently holding leadership and times how long the cluster has no leader, writing a
+per-poll timeline to `runs/leader-kill-<backend>/timeline.tsv` (leader pod and node, lock holder,
+seconds to lock expiry, agents placed).
+
+```bash
+nix develop                                    # needs the host-side safetylab binary
+DRY_RUN=1 ./scripts/leader-kill.sh             # resolve the target, signal nothing
+./scripts/leader-kill.sh 420                   # SIGKILL, watch for 420s
+MODE=graceful ./scripts/leader-kill.sh 120     # control arm: an ordinary pod delete
 ```
 
-Add a checker, add a fixture and a ledger row. `raven-clean` is not filler: without it the
-leader-side checkers could pass a RavenDB run vacuously — finding no `pg_locks` rows, because
-there are none — which is precisely how the first live PostgreSQL run passed every leader check.
+The default mode SIGKILLs the container's process from the node, outside its PID namespace, so no
+shutdown hook runs. That distinction is the whole experiment: a graceful shutdown releases the
+leadership lock and hands over in seconds, while an ungraceful one leaves the lock behind to be
+recovered by whatever the backend's own mechanism is. `MODE=graceful` measures the first for
+comparison.
+
+The script asserts its own nemesis fired. `NodeStopped` records are written only on the graceful
+shutdown path, so one appearing during a SIGKILL run means the victim shut down cleanly and the
+run is reported `*** INVALID ***` rather than as a failover measurement.
 
 ## Structured logs and SQL
 

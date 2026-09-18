@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- Every test here is a pure function over a CAPTURED fixture: real `kubectl get pods -o json`,
+       real `crictl inspect` output, real `safetylab query leader` lines. No cluster, no network,
+       so they run in a second and can be run before touching a live experiment.
+
+       This project exists because three defects in one session all came from the shell layer
+       parsing structured data as text, with no way to exercise the logic without a live cluster.
+       The checker layer already had a mutant ledger (tests/selftest.sh); this is the same
+       discipline applied to the cluster-decision layer. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/SafetyLab/SafetyLab.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="fixtures/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

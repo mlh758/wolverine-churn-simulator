@@ -26,10 +26,15 @@ K="minikube kubectl -- --context=minikube"
 ITERS="${1:-12}"
 # A settle at or above this keeps its raw logs even when the iteration is otherwise clean.
 SLOW_SETTLE="${SLOW_SETTLE:-120}"
-OUT="runs/duplicate-rate"
+
+# Overridable, because there are now two arms and a rate is meaningless pooled across stores.
+# Every row carries its backend, and the script refuses to append to a file written under a
+# different one -- the summary at the bottom divides by the row count, so one stray arm's rows
+# silently move the headline number. Files written before the column existed are PostgreSQL.
+OUT="${OUT:-runs/duplicate-rate}"
 TSV="$OUT/results.tsv"
+HEADER=$(printf 'iteration\tbackend\tresult\trunning\tassigned\tduplicated\torphaned\tmissing\tsettle_s')
 mkdir -p "$OUT"
-[ -f "$TSV" ] || printf 'iteration\tresult\trunning\tassigned\tduplicated\torphaned\tmissing\tsettle_s\n' > "$TSV"
 
 # Two questions of the store -- what is placed, and who owns what -- answered on either arm by
 # scripts/backend.sh. The running side never touches the store at all: it is replayed from the pod
@@ -92,8 +97,27 @@ field() { sed -n "s/.*$1=\([0-9]*\).*/\1/p" <<<"$2"; }
 
 gate=$($K get deployment churnsim \
         -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="SIM_STABILITY_WINDOW_SECONDS")]}{.value}{end}')
+BACKEND=$(sim_backend)
+
+if [ -f "$TSV" ]; then
+    existing=$(head -1 "$TSV")
+    if [ "$existing" != "$HEADER" ]; then
+        echo "$TSV was written before rows carried a backend, so its arm cannot be verified." >&2
+        echo "    Those rows are PostgreSQL. Run this arm somewhere else:" >&2
+        echo "      OUT=runs/duplicate-rate-$BACKEND ./scripts/duplicate-rate.sh $ITERS" >&2
+        exit 2
+    fi
+    if [ -n "$(awk -F'\t' -v b="$BACKEND" 'NR>1 && $2 != "" && $2 != b { print; exit }' "$TSV")" ]; then
+        echo "$TSV already holds rows from a different backend. A duplicate rate pooled across" >&2
+        echo "    stores is not a result. Use OUT=runs/duplicate-rate-$BACKEND instead." >&2
+        exit 2
+    fi
+else
+    printf '%s\n' "$HEADER" > "$TSV"
+fi
+
 echo "duplicate-rate: $ITERS rollouts, single arm"
-echo "backend: $(sim_backend)"
+echo "backend: $BACKEND"
 echo "settle gate (GH-4367): $( [ -n "$gate" ] && echo "ON ($gate s)" || echo OFF )"
 
 for i in $(seq 1 "$ITERS"); do
@@ -103,7 +127,7 @@ for i in $(seq 1 "$ITERS"); do
     $K rollout restart deployment/churnsim >/dev/null 2>&1
     $K rollout status deployment/churnsim --timeout=900s >/dev/null 2>&1
     if ! wait_settled >/dev/null; then
-        printf '%s\tSKIP-no-settle\t-\t-\t-\t-\t-\t-\n' "$i" >> "$TSV"; tail -1 "$TSV"; continue
+        printf '%s\t%s\tSKIP-no-settle\t-\t-\t-\t-\t-\t-\n' "$i" "$BACKEND" >> "$TSV"; tail -1 "$TSV"; continue
     fi
     sleep 45
 
@@ -111,7 +135,7 @@ for i in $(seq 1 "$ITERS"); do
     # snapshot is kept, because a dirty start is itself a duplicate from the previous rollout.
     pre=$(snapshot "$OUT/iter$i/pre")
     if ! grep -q "duplicated=0 orphaned=0 missing=0" <<<"$pre"; then
-        printf '%s\tSKIP-dirty-start\t-\t-\t-\t-\t-\t-\n' "$i" >> "$TSV"
+        printf '%s\t%s\tSKIP-dirty-start\t-\t-\t-\t-\t-\t-\n' "$i" "$BACKEND" >> "$TSV"
         echo "  dirty start: $pre"
         echo "     evidence kept: $OUT/iter$i/pre/raw.*.jsonl"
         tail -1 "$TSV"; continue
@@ -131,8 +155,8 @@ for i in $(seq 1 "$ITERS"); do
     elif [ "${orp:-0}" -gt 0 ] || [ "${mis:-0}" -gt 0 ]; then result=DIVERGED
     else result=clean; fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$i" "$result" "$run" "$asg" "$dup" "$orp" "$mis" "$settle" >> "$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$i" "$BACKEND" "$result" "$run" "$asg" "$dup" "$orp" "$mis" "$settle" >> "$TSV"
     tail -1 "$TSV"
 
     if [ "$result" = clean ] && [ "${settle:-0}" -lt "$SLOW_SETTLE" ]; then
@@ -151,9 +175,10 @@ echo "======== SUMMARY ========"
 python3 - "$TSV" <<'PY'
 import sys, collections
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
-c = collections.Counter(r[1] for r in rows if len(r) > 1)
+c = collections.Counter(r[2] for r in rows if len(r) > 2)
 measured = sum(v for k, v in c.items() if not k.startswith("SKIP"))
 dup, div = c.get("DUPLICATE", 0), c.get("DIVERGED", 0)
+print(f"  backend           : {', '.join(sorted({r[1] for r in rows if len(r) > 1}))}")
 print(f"  measured rollouts : {measured}")
 print(f"  duplicate agents  : {dup}" + (f"   ({100*dup/measured:.0f}% of measured)" if measured else ""))
 print(f"  other divergence  : {div}")
@@ -161,7 +186,7 @@ print(f"  clean             : {c.get('clean', 0)}")
 for k, v in sorted(c.items()):
     if k.startswith("SKIP"):
         print(f"  {k:<18}: {v}")
-settles = [float(r[7]) for r in rows if len(r) > 7 and r[7] not in ("-", "-1")]
+settles = [float(r[8]) for r in rows if len(r) > 8 and r[8] not in ("-", "-1")]
 if settles:
     settles.sort()
     print(f"  settle seconds    : median {settles[len(settles)//2]:.0f}  max {settles[-1]:.0f}")

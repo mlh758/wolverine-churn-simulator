@@ -15,6 +15,12 @@
          it must be able to watch a cluster running any Wolverine version (5.39,
          stock main, the proposal build) without sharing a line of code with it. -->
     <PackageReference Include="Npgsql" Version="9.0.2" />
+    <!-- The CLI is the rig's configuration surface, and a silently-ignored flag means measuring
+         something other than what was asked for. The hand-rolled Array.IndexOf parser this
+         replaced returned null for a misspelled flag, so a typo in the database name quietly read
+         the default database instead. System.CommandLine rejects unknown tokens, which is the only
+         reason this dependency is worth its weight. -->
+    <PackageReference Include="System.CommandLine" Version="2.0.12" />
   </ItemGroup>
 
 </Project>

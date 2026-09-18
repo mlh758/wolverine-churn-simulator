@@ -1,0 +1,46 @@
+{
+  "items": [
+    {
+      "metadata": {
+        "name": "churnsim-85c9bf47fd-9qsq6"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "ready": true,
+            "restartCount": 0
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "churnsim-85c9bf47fd-jw8s5"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "ready": true,
+            "restartCount": 1
+          }
+        ]
+      }
+    },
+    {
+      "metadata": {
+        "name": "churnsim-85c9bf47fd-wrf8c"
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "ready": true,
+            "restartCount": 0
+          }
+        ]
+      }
+    }
+  ]
+}

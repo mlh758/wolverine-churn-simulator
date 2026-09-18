@@ -15,6 +15,95 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
+## 2026-09-18 — RavenDB arm: no duplicates post-sweep, but a 5-minute leaderless stall after an ungraceful leader death
+
+First results from the RavenDB arm. `WolverineFx.RavenDb` **6.39.0** (released, from nuget),
+RavenDB server **7.0.9**, single node, net10.0. 3 replicas, `SIM_AGENT_COUNT=500`,
+`SIM_START_DELAY_MS=500`, `SIM_AGENT_MB=0`, **no** `SIM_BATCH_SIZE` (so `AgentStartBatchSize` is
+the shipping default) and **no** `SIM_STABILITY_WINDOW_SECONDS` (GH-4367 settle gate OFF). Every
+value verified from the deployment spec before the run.
+
+minikube under rootless podman with `--memory 8192` (enforced: `memory.max` is a real cgroup
+ceiling) and CPU **unconstrained** — `--cpus` is not passed through by the rootless podman driver,
+which is also true of every earlier entry here, so the CPU shape is unchanged from the PostgreSQL
+runs. RavenDB is held to `RAVEN_Memory_MaxWorkingSet=1024`; see harness-traps.md for why that is
+mandatory rather than tidy.
+
+### E2 — duplicate rate: 12 / 12 clean
+
+| | |
+|---|---|
+| measured rollouts | 12 |
+| duplicated | **0** |
+| orphaned | 0 |
+| missing | 0 |
+| settle | median 41 s, max 51 s |
+
+`LeadershipAssumed` fired 11 times across 30 node starts, so the handover window that creates
+duplicates on PostgreSQL was genuinely exercised — these are not zeros for want of an event.
+
+**This is NOT a store comparison, and must not be read as one.** The PostgreSQL 7/19 figure was
+taken on stock main 6.35.0 (2026-09-09). The GH-3987 reconcile sweep (#4404) and its GH-4407
+hardening first shipped in **V6.36.0**, so 6.39.0 contains a fix the PostgreSQL baseline predates.
+A clean result here is consistent with "the sweep works" and with "RavenDB never had it", and this
+run cannot separate them. The pre-sweep RavenDB arm was deliberately not run — the sweep is merged
+and the interesting question moved on.
+
+### Leader failover — the finding
+
+Kill the pod holding leadership and measure how long the cluster has no leader.
+
+| | graceful (control) | **ungraceful (SIGKILL)** |
+|---|---|---|
+| leaderless window | 6 s | **303 s** |
+| 500 agents re-placed | 28 s | 315 s |
+| `NodeStopped` written | yes | **no** (73 → 73) |
+| lock at t+1 s | **deleted** | held by the dead node, 299 s to expiry |
+
+The ungraceful window is the compare-exchange lock's own `DateTimeOffset.UtcNow.AddMinutes(5)`
+from `RavenDbMessageStore.Locking`, and the recovery is immediate the moment it lapses — at
+t+297 s the TTL read 3 s, at t+303 s a peer held the lock with a fresh 300 s. The cluster was
+never *unable* to elect a leader; it was forbidden to for five minutes.
+
+Why no peer can shorten it: `TryAttainLeadershipLockAsync` offers a challenger two routes and the
+unexpired value closes both. `PutCompareExchangeValueOperation(key, newLock, index: 0)` means
+"create only if absent" and the dead leader's value is still there; `tryTakeOverIfExpiredAsync`
+returns false while `ExpirationTime > UtcNow`. Nothing in the server clears it — a compare-exchange
+value has no session to die with, which is exactly what makes it a good lock and a bad liveness
+signal. Wolverine uses it as both.
+
+Two details make it worse than the number suggests:
+
+**The stall is self-sustaining.** Ejecting a stale node is the *leader's* job. With no leader, the
+dead node's registration stays, so the cluster ran with four registrations for three pods. The
+actor that would clean up the corpse is the one the corpse is blocking.
+
+**The assignment set reported perfect health throughout.** `placed` read **500 of 500 for the
+entire five minutes**, while ~126 of those agents were assigned to a dead node and running
+nowhere. It only dropped to 374 when the new leader finally ejected the corpse, recovering to 500
+twelve seconds later. Anything monitoring the assignment documents — including Wolverine's own
+view of itself — would have reported a fully-placed, healthy cluster for the whole outage. This is
+GH-3987's "assigned but not running" wedge arriving by a different route, and it is why this rig
+reads the pod log stream rather than trusting the table.
+
+The node that eventually took over, `fbdefcd5`, is the **restarted instance of the pod that was
+killed**. It was back within seconds and then blocked by its own predecessor's lock for five
+minutes.
+
+*Caveat — the first attempt at this measured nothing.* `kubectl delete pod --force
+--grace-period=0` still delivers SIGTERM, so Wolverine ran shutdown and *released* the lock; that
+run produced the 6 s figure now shown above as the control arm, and is kept as
+`runs/leader-kill-ravendb-INVALID-graceful/`. The SIGKILL arm asserts its own validity by counting
+`NodeStopped` records across the run, since only the graceful path can write one. See
+harness-traps.md.
+
+*Not yet tested:* everything above is a **single-node** RavenDB. Wolverine writes node
+registration through Raft (`TransactionMode.ClusterWide`) and the leader lock through
+compare-exchange (also Raft), but writes **agent assignments through plain sessions** — single-node
+writes with asynchronous multi-master replication. GH-4407's claim-if-absent guard is enforced per
+RavenDB node, not cluster-wide. On a partitioned multi-node RavenDB that predicts duplicate agents
+under a coherent leader, which no test here can currently reach.
+
 ## 2026-09-11 — GH-3959 collapse on net10.0: the new baseline, and the settle gate does not help
 
 `6.35.0-cap3959.1` — `mine:gh-3987-3959-fixes` rebased onto `origin/main` @ `cd776ae32`, which

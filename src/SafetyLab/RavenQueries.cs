@@ -31,19 +31,13 @@ public static class RavenQueries
     /// </summary>
     private const int MaxScan = 2_000_000;
 
-    public static RavenClient Connect(string[] args)
-    {
-        var url = StringArg(args, "--url")
-                  ?? Environment.GetEnvironmentVariable("RAVENDB_URL")
-                  ?? "http://ravendb:8080";
-        var database = StringArg(args, "--database")
-                       ?? Environment.GetEnvironmentVariable("RAVENDB_DATABASE")
-                       ?? "churnsim";
+    public static RavenClient Connect(string? url, string? database)
+        => new(
+            url ?? Environment.GetEnvironmentVariable("RAVENDB_URL") ?? "http://ravendb:8080",
+            database ?? Environment.GetEnvironmentVariable("RAVENDB_DATABASE") ?? "churnsim",
+            TimeSpan.FromSeconds(30));
 
-        return new RavenClient(url, database, TimeSpan.FromSeconds(30));
-    }
-
-    public static async Task<int> QueryAsync(string[] args)
+    public static async Task<int> RunAsync(string kind, string? url, string? database, string eventName)
     {
         // These run inside `kubectl exec` from shell scripts whose own error handling is a
         // non-zero exit and a line on stderr. A .NET stack trace in the middle of a measurement
@@ -51,7 +45,7 @@ public static class RavenQueries
         // database does not exist yet", which is an ordinary state right after a reset.
         try
         {
-            return await runQueryAsync(args);
+            return await runQueryAsync(kind, url, database, eventName);
         }
         catch (Exception e)
         {
@@ -60,17 +54,9 @@ public static class RavenQueries
         }
     }
 
-    private static async Task<int> runQueryAsync(string[] args)
+    private static async Task<int> runQueryAsync(string kind, string? url, string? database, string eventName)
     {
-        var kind = args.FirstOrDefault(x => !x.StartsWith('-'));
-        if (kind is null)
-        {
-            Console.Error.WriteLine("query: a KIND is required " +
-                                    "(assigned | placed | nodes | per-node | records | per-minute)");
-            return 2;
-        }
-
-        using var client = Connect(args);
+        using var client = Connect(url, database);
         var token = CancellationToken.None;
 
         switch (kind)
@@ -87,6 +73,46 @@ public static class RavenQueries
                     Console.WriteLine($"{agent}\t{(pods.TryGetValue(node, out var pod) ? pod : "unknown")}");
                 }
 
+                return 0;
+            }
+
+            // Who owns 'wolverine://leader/' right now, as "<pod name> <node id>", or the single
+            // word "none" when there is no leader at all. The failover experiments poll this, and
+            // "none" has to be a first-class answer rather than empty output: a leaderless cluster
+            // is the thing being measured, not a failed query.
+            case "leader":
+            {
+                var leader = (await assignmentsAsync(client, token))
+                    .FirstOrDefault(x => x.Agent is "wolverine://leader/" or "wolverine://leader");
+
+                if (leader.Agent is null)
+                {
+                    Console.WriteLine("none");
+                    return 0;
+                }
+
+                var pods = await podsByNodeAsync(client, token);
+                Console.WriteLine($"{(pods.TryGetValue(leader.NodeId, out var pod) ? pod : "unknown")}\t{leader.NodeId}");
+                return 0;
+            }
+
+            // The leadership lock itself, straight from the compare-exchange store:
+            // "<key> <node id> <expires utc> <seconds until expiry>". This is the half that the
+            // assignment row cannot tell you -- on RavenDB the lock outlives its owner, so "who
+            // holds it" and "when does it lapse" is the whole failover question.
+            case "lock":
+            {
+                var rows = await client.CompareExchangeAsync("wolverine/", 256, token);
+                var any = false;
+
+                foreach (var row in rows.Where(x => x.Key.StartsWith("wolverine/leader", StringComparison.Ordinal)))
+                {
+                    any = true;
+                    var ttl = row.ExpiresAt is { } e ? (e - DateTimeOffset.UtcNow).TotalSeconds : double.NaN;
+                    Console.WriteLine($"{row.Key}\t{row.NodeId}\t{row.ExpiresAt:O}\t{ttl:F0}");
+                }
+
+                if (!any) Console.WriteLine("none");
                 return 0;
             }
 
@@ -140,7 +166,7 @@ public static class RavenQueries
             // where-clause would build an auto-index that can.
             case "per-minute":
             {
-                var wanted = StringArg(args, "--event") ?? "AssignmentChanged";
+                var wanted = eventName;
                 var (records, complete) = await scanRecordsAsync(client, token);
 
                 foreach (var group in records
@@ -161,11 +187,11 @@ public static class RavenQueries
         }
     }
 
-    public static async Task<int> AdminAsync(string[] args)
+    public static async Task<int> AdminAsync(string action, string? url, string? database)
     {
         try
         {
-            return await runAdminAsync(args);
+            return await runAdminAsync(action, url, database);
         }
         catch (Exception e)
         {
@@ -174,10 +200,9 @@ public static class RavenQueries
         }
     }
 
-    private static async Task<int> runAdminAsync(string[] args)
+    private static async Task<int> runAdminAsync(string action, string? url, string? database)
     {
-        var action = args.FirstOrDefault(x => !x.StartsWith('-'));
-        using var client = Connect(args);
+        using var client = Connect(url, database);
 
         switch (action)
         {
@@ -288,9 +313,4 @@ public static class RavenQueries
         }
     }
 
-    private static string? StringArg(string[] args, string name)
-    {
-        var index = Array.IndexOf(args, name);
-        return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
-    }
 }

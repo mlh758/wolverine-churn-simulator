@@ -1,0 +1,28 @@
+{
+  "status": {
+    "id": "454633c9e929d225",
+    "state": "CONTAINER_RUNNING"
+  },
+  "info": {
+    "runtimeSpec": {
+      "linux": {
+        "namespaces": [
+          {
+            "type": "pid"
+          }
+        ]
+      }
+    },
+    "config": {
+      "linux": {
+        "security_context": {
+          "namespace_options": {
+            "network": 2,
+            "pid": 1
+          }
+        }
+      }
+    },
+    "pid": 54444
+  }
+}

@@ -51,8 +51,15 @@ _psql() { $K exec "$(_pgpod)" -- psql -U postgres -d churnsim -qAt -c "$1" 2>/de
 # can talk to RavenDB in these terms, so the RavenDB arm needs `./scripts/monitor.sh deploy` before
 # it can be measured at all -- which is worth saying out loud rather than failing obscurely.
 _raven() {
+    # A LIVE pod, not `.items[0]`. A restarted Deployment leaves the previous pod behind in
+    # Failed/Succeeded for a while, and exec-ing into it fails with "cannot exec into a container
+    # in a completed pod" -- which reads as "the store is unreachable" at exactly the moment a
+    # measurement is being taken. Same selector trap that live_pods.py exists for.
     local pod
-    pod=$($K get pod -l app=safetylab -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    pod=$($K get pod -l app=safetylab \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' \
+            2>/dev/null | head -1)
     if [ -z "$pod" ]; then
         echo "backend.sh: the RavenDB arm reads the store through the safetylab pod, and there is none." >&2
         echo "            run ./scripts/monitor.sh deploy first." >&2

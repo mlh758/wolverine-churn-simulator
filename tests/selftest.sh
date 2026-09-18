@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The checkers' mutant ledger.
+# The checkers' mutant ledger, plus the cluster-decision unit tests.
 #
 # Each fixture injects exactly one fault and declares which checks must fail. Both halves
 # matter: a check that never fires is decoration, and a check that fires on everything is
@@ -37,6 +37,17 @@ if [ -z "$BIN" ]; then
 fi
 
 python3 tests/make_fixtures.py >/dev/null || exit 2
+
+# The cluster-decision layer (pod liveness, host-pid resolution, leader state, nemesis validity).
+# Pure functions over captured fixtures -- no cluster, ~30ms. Every one of these is a regression
+# test for a defect that actually shipped into a measurement; see tests/SafetyLab.Tests.
+echo "cluster-decision tests:"
+if ! dotnet test tests/SafetyLab.Tests -v q --nologo 2>&1 | grep -E "^(Passed!|Failed!)" | sed 's/^/  /'; then
+  echo "  FAIL: dotnet test did not report a result" >&2
+  exit 1
+fi
+echo
+echo "checker ledger:"
 
 failures=0
 for row in "${LEDGER[@]}"; do
