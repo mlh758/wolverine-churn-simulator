@@ -45,6 +45,27 @@ internal static class SimBackend
 
         requireNativeControlQueue();
 
+        // RAVENDB_PIN_NODE=true: this node talks ONLY to the url(s) it was given and never learns
+        // the rest of the cluster. The RavenDB client fetches the database group's topology on
+        // startup and fails over to any member it can reach, which is the right behaviour for an
+        // application and the wrong one for a partition experiment: cut this pod's member off and
+        // the client quietly reroutes to the majority, so there is no minority side to observe and
+        // the run measures client failover instead of a split. The replicated arm pins each pod to
+        // its own store member by StatefulSet ordinal (k8s/churnsim-ravendb-cluster.yaml). Off by
+        // default, so the single-node arm and every earlier result are unchanged.
+        var pinNode = Environment.GetEnvironmentVariable("RAVENDB_PIN_NODE") == "true";
+
+        // RAVENDB_REPLICATION_FACTOR: what ensureDatabaseReady creates the database with when it
+        // finds none. Default 1, which is what every single-node run used. The replicated arm
+        // forms its cluster and creates the database at factor 3 BEFORE any pod starts (deploy.sh
+        // runs `safetylab raven-cluster form`), so this only matters after a `reset-schema` on
+        // that arm — where recreating at factor 1 would silently turn a three-member cluster into
+        // three servers replicating nothing.
+        var replicationFactor =
+            int.TryParse(Environment.GetEnvironmentVariable("RAVENDB_REPLICATION_FACTOR"), out var rf) && rf > 0
+                ? rf
+                : 1;
+
         var store = new DocumentStore
         {
             Urls = urls,
@@ -54,8 +75,26 @@ internal static class SimBackend
             Identifier = database
         };
 
+        if (pinNode)
+        {
+            store.Conventions.DisableTopologyUpdates = true;
+        }
+
         store.Initialize();
-        ensureDatabaseReady(store, database, emit);
+        ensureDatabaseReady(store, database, replicationFactor, emit);
+
+        emit("ChurnSim.Startup", $"CONFIG RAVENDB_PIN_NODE={pinNode.ToString().ToLowerInvariant()}",
+            new Dictionary<string, object?>
+            {
+                ["Setting"] = "RAVENDB_PIN_NODE",
+                ["Value"] = pinNode.ToString().ToLowerInvariant()
+            });
+        emit("ChurnSim.Startup", $"CONFIG RAVENDB_REPLICATION_FACTOR={replicationFactor}",
+            new Dictionary<string, object?>
+            {
+                ["Setting"] = "RAVENDB_REPLICATION_FACTOR",
+                ["Value"] = replicationFactor.ToString()
+            });
 
         // Wolverine's RavenDb package takes the store from the container rather than building
         // one, so the app owns its lifetime. Nothing here disposes it: the process only ever
@@ -142,7 +181,7 @@ internal static class SimBackend
     /// the deadline passes so an unreachable server still fails loudly instead of after a silent
     /// minute.
     /// </summary>
-    private static void ensureDatabaseReady(IDocumentStore store, string database, SimLog emit)
+    private static void ensureDatabaseReady(IDocumentStore store, string database, int replicationFactor, SimLog emit)
     {
         var deadline = DateTimeOffset.UtcNow.AddSeconds(60);
         var attempts = 0;
@@ -157,7 +196,8 @@ internal static class SimBackend
             {
                 if (store.Maintenance.Server.Send(new GetDatabaseRecordOperation(database)) is null)
                 {
-                    store.Maintenance.Server.Send(new CreateDatabaseOperation(new DatabaseRecord(database)));
+                    store.Maintenance.Server.Send(
+                        new CreateDatabaseOperation(new DatabaseRecord(database), replicationFactor));
                     created = true;
                 }
 
@@ -167,12 +207,14 @@ internal static class SimBackend
 
                 emit("ChurnSim.Startup",
                     $"CONFIG ravendb database '{database}' ready after {attempts} attempt(s), " +
-                    $"created={created.ToString().ToLowerInvariant()}",
+                    $"created={created.ToString().ToLowerInvariant()}" +
+                    (created ? $" at replication factor {replicationFactor}" : ""),
                     new Dictionary<string, object?>
                     {
                         ["Database"] = database,
                         ["Attempts"] = attempts,
-                        ["Created"] = created
+                        ["Created"] = created,
+                        ["ReplicationFactor"] = created ? replicationFactor : null
                     });
                 return;
             }

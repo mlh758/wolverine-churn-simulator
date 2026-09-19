@@ -41,6 +41,17 @@ deploy version="6.39.0":
 deploy-ravendb version="6.39.0":
     ./scripts/deploy.sh {{version}} --backend ravendb
 
+# E7's store: a 3-member RavenDB cluster at replication factor 3, one pinned churnsim pod per
+# member, and the per-member monitor. Deploys the monitor itself, because forming the cluster
+# runs through it. Needs `just ravendb-license` first.
+deploy-ravendb-cluster version="6.39.0":
+    ./scripts/deploy.sh {{version}} --backend ravendb --topology cluster
+
+# Store a RavenDB license JSON (the free Developer license allows three nodes) as the Secret the
+# replicated store reads. An unlicensed RavenDB refuses to add a second member.
+ravendb-license file:
+    {{kubectl}} create secret generic ravendb-license --from-file=license.json={{file}} --dry-run=client -o yaml | {{kubectl}} apply -f -
+
 # Roll the pods with no code change (new pod template hash), the way a CD pipeline would.
 rollout:
     ./scripts/rollout.sh
@@ -97,6 +108,23 @@ leader-kill-graceful seconds="120":
 leader-kill-dry-run:
     DRY_RUN=1 ./scripts/leader-kill.sh
 
+# E7 — split brain: isolate the leader's store member (and the leader) from the rest, hold past
+# the lock expiry, heal, and check. Needs `just deploy-ravendb-cluster`.
+split-brain hold="420" settle="300":
+    ./scripts/split-brain.sh {{hold}} {{settle}}
+
+# Is a network partition still armed on the node from an earlier run? Exit 1 means yes.
+partition-status:
+    {{safetylab}} partition status
+
+# Remove any armed partition. Idempotent, and safe to run when nothing is armed.
+partition-heal:
+    {{safetylab}} partition heal
+
+# Each RavenDB member's view of the cluster, and the database's group topology.
+raven-cluster-status:
+    source scripts/backend.sh && require_safetylab && _raven raven-cluster status
+
 # One arm of the synthetic-self-guard A/B. PostgreSQL only; `just synth-guard-prep` first.
 synth-guard arm:
     ./scripts/synth-guard-run.sh {{arm}}
@@ -139,9 +167,7 @@ reset-metrics:
 #
 # Drop the store entirely and bounce the pods. Use between DIFFERENT Wolverine builds.
 reset-schema:
-    source scripts/backend.sh && require_safetylab && db_drop
-    {{kubectl}} rollout restart deployment/churnsim
-    {{kubectl}} rollout status deployment/churnsim --timeout=300s
+    source scripts/backend.sh && require_safetylab && db_drop && bounce_workload
     @echo "store dropped and pods bounced"
 
 # Wait for full placement to hold still. Target comes from the deployment's SIM_AGENT_COUNT.

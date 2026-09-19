@@ -30,11 +30,22 @@ namespace SafetyLab;
 ///     app-clock-versus-store-clock skew that staleness detection depends on, not enough to
 ///     quote in milliseconds. C0 says so in the report rather than leaving it to be assumed.
 ///   </item>
+///   <item>
+///     <b>The members.</b> On a replicated store (E7) every one of the above is read from EVERY
+///     cluster member, every tick, and not from the service endpoint. The service would answer
+///     from whichever member the round-robin lands on, which under a partition means the history
+///     flickers between two realities and neither checker can tell which it is looking at. The
+///     first configured url is the <em>primary</em> view and fills the sample's top-level fields
+///     exactly as a single-node capture does; every member — the primary included — also gets a
+///     <see cref="ReplicaView"/> carrying its own Raft view, conflict count and the assignment
+///     rows on which it disagrees with the primary. Compare-exchange rows are captured from every
+///     member and tagged with their source, because "which member says who leads" is the split.
+///   </item>
 /// </list>
 /// </summary>
 public sealed class RavenClusterMonitor : MonitorLoop
 {
-    private readonly RavenClient _client;
+    private readonly IReadOnlyList<RavenClient> _clients;
     private readonly string _serviceName;
     private readonly int _pageSize;
     private readonly TimeSpan _tick;
@@ -46,14 +57,21 @@ public sealed class RavenClusterMonitor : MonitorLoop
     /// </summary>
     private const string WolverineKeyPrefix = "wolverine/";
 
-    public RavenClusterMonitor(RavenClient client, string serviceName, int pageSize, TimeSpan tick, TextWriter output)
+    public RavenClusterMonitor(IReadOnlyList<RavenClient> clients, string serviceName, int pageSize, TimeSpan tick,
+        TextWriter output)
         : base(tick, output)
     {
-        _client = client;
+        if (clients.Count == 0) throw new ArgumentException("at least one RavenDB url is required", nameof(clients));
+
+        _clients = clients;
         _serviceName = serviceName;
         _pageSize = pageSize;
         _tick = tick;
     }
+
+    private RavenClient Primary => _clients[0];
+
+    private bool Replicated => _clients.Count > 1;
 
     protected override async Task<MetaRecord> DescribeAsync(CancellationToken token)
     {
@@ -65,18 +83,43 @@ public sealed class RavenClusterMonitor : MonitorLoop
             DateTimeOffset.UtcNow,
             (int)_tick.TotalMilliseconds,
             0,
-            _client.Database,
-            await _client.BuildVersionAsync(token),
+            Primary.Database,
+            await Primary.BuildVersionAsync(token),
             Backends.RavenDb,
-            $"wolverine/leader/{_serviceName.ToLowerInvariant()}");
+            $"wolverine/leader/{_serviceName.ToLowerInvariant()}",
+            Replicated ? _clients.Select(x => x.Url).ToList() : null);
     }
+
+    /// <summary>Everything one member answered on one tick, before it is folded into the sample.</summary>
+    private sealed record MemberRead(
+        RavenClient Client,
+        IReadOnlyList<CompareExchangeRow> Cmpxchg,
+        RavenQueryResult? NodeQuery,
+        RavenQueryResult? AssignmentQuery,
+        ClusterView? Cluster,
+        long? Conflicts,
+        Exception? Error);
 
     protected override async Task<Sample> TakeSampleAsync(long seq, DateTimeOffset started, CancellationToken token)
     {
+        // Every member in parallel, so a three-member sample costs one round trip and not three,
+        // and so the members' answers are as close to simultaneous as the monitor can make them.
+        // A member that fails is recorded as failed and the others are kept: during a partition
+        // the monitor is deliberately on no side of the cut, but a member that IS unreachable
+        // is a hole in that member's column and nothing else.
+        var reads = await Task.WhenAll(_clients.Select(c => readMemberAsync(c, token)));
+
+        var primary = reads[0];
+        if (primary.Error is not null)
+        {
+            // The primary is what fills the checker-facing fields, so a failed primary is a failed
+            // tick — the same as a single-node capture, and MonitorLoop records the hole.
+            throw primary.Error;
+        }
+
         var warnings = new List<string>();
 
-        var cmpxchg = await _client.CompareExchangeAsync(WolverineKeyPrefix, _pageSize, token);
-        if (cmpxchg.Count >= _pageSize)
+        if (primary.Cmpxchg.Count >= _pageSize)
         {
             warnings.Add($"compare-exchange read hit the {_pageSize}-key page limit");
         }
@@ -86,21 +129,104 @@ public sealed class RavenClusterMonitor : MonitorLoop
         // "collection/X"). That is why no WaitForNonStaleResults is asked for: there is no index
         // to be stale. IsStale is still recorded, because the day that stops being true is
         // exactly the day this monitor must not be believed.
-        var nodeQuery = await _client.QueryAsync($"from WolverineNodes limit 0, {_pageSize}", token);
-        var assignmentQuery = await _client.QueryAsync($"from AgentAssignments limit 0, {_pageSize}", token);
+        note(warnings, primary.NodeQuery!, "WolverineNodes");
+        note(warnings, primary.AssignmentQuery!, "AgentAssignments");
 
-        note(warnings, nodeQuery, "WolverineNodes");
-        note(warnings, assignmentQuery, "AgentAssignments");
+        var nodes = readNodes(primary.NodeQuery!);
+        var assignments = readAssignments(primary.AssignmentQuery!, started);
 
-        var nodes = nodeQuery.Results.Select(readNode).Where(x => x is not null).Select(x => x!).ToList();
-        var assignments = assignmentQuery.Results
-            .Select(x => readAssignment(x, started))
-            .Where(x => x is not null)
-            .Select(x => x!)
-            .ToList();
+        // Lock rows from every member, each tagged with where it was read. On a single-node
+        // capture the tag is left null so those histories look exactly as they always did.
+        var cmpxchg = Replicated
+            ? reads.Where(r => r.Error is null)
+                .SelectMany(r => r.Cmpxchg.Select(row => row with { Node = r.Client.Url }))
+                .ToList()
+            : primary.Cmpxchg;
 
-        return new Sample(seq, started, assignmentQuery.ServerDate ?? nodeQuery.ServerDate, 0,
-            [], nodes, assignments, null, cmpxchg, warnings.Count > 0 ? warnings : null);
+        IReadOnlyList<ReplicaView>? replicas = null;
+        if (Replicated)
+        {
+            var primaryOwners = assignments.ToDictionary(x => x.Id, x => x.NodeId);
+            replicas = reads.Select(r => describeMember(r, primaryOwners, started)).ToList();
+        }
+
+        return new Sample(seq, started, primary.AssignmentQuery!.ServerDate ?? primary.NodeQuery!.ServerDate, 0,
+            [], nodes, assignments, null, cmpxchg, warnings.Count > 0 ? warnings : null, replicas);
+    }
+
+    private async Task<MemberRead> readMemberAsync(RavenClient client, CancellationToken token)
+    {
+        try
+        {
+            var cmpxchg = client.CompareExchangeAsync(WolverineKeyPrefix, _pageSize, token);
+            var nodeQuery = client.QueryAsync($"from WolverineNodes limit 0, {_pageSize}", token);
+            var assignmentQuery = client.QueryAsync($"from AgentAssignments limit 0, {_pageSize}", token);
+
+            // The cluster view and the conflict count only mean something with more than one
+            // member, and they are two more round trips per tick, so a single-node capture does
+            // not pay for them.
+            var cluster = Replicated
+                ? client.ClusterTopologyAsync(token).ContinueWith(t => (ClusterView?)t.Result, token)
+                : Task.FromResult<ClusterView?>(null);
+            var conflicts = Replicated ? client.ConflictCountAsync(token) : Task.FromResult(0L);
+
+            await Task.WhenAll(cmpxchg, nodeQuery, assignmentQuery, cluster, conflicts);
+
+            return new MemberRead(client, await cmpxchg, await nodeQuery, await assignmentQuery,
+                await cluster, Replicated ? await conflicts : null, null);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception e)
+        {
+            return new MemberRead(client, [], null, null, null, null, e);
+        }
+    }
+
+    /// <summary>
+    /// A member's view relative to the primary's. Rows are compared by agent uri and owner: a row
+    /// this member has with a different owner, or one the primary does not have at all, is
+    /// <c>Divergent</c>; a row the primary has and this member does not is <c>Missing</c>. For the
+    /// primary itself both are empty by construction, which is the row that pins the comparison.
+    /// </summary>
+    private static ReplicaView describeMember(MemberRead read, IReadOnlyDictionary<string, Guid> primaryOwners,
+        DateTimeOffset started)
+    {
+        if (read.Error is not null)
+        {
+            return new ReplicaView(read.Client.Url, null, null, null, null, 0, 0, [], [],
+                $"{read.Error.GetType().Name}: {read.Error.Message}");
+        }
+
+        var nodes = readNodes(read.NodeQuery!);
+        var assignments = readAssignments(read.AssignmentQuery!, started);
+
+        var divergent = new List<AssignmentRow>();
+        var seen = new HashSet<string>();
+
+        foreach (var row in assignments)
+        {
+            seen.Add(row.Id);
+            if (!primaryOwners.TryGetValue(row.Id, out var owner) || owner != row.NodeId)
+            {
+                divergent.Add(row);
+            }
+        }
+
+        var missing = primaryOwners.Keys.Where(id => !seen.Contains(id)).OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+        return new ReplicaView(
+            read.Client.Url,
+            read.Cluster?.NodeTag,
+            read.Cluster?.Leader,
+            read.Cluster?.State,
+            read.Conflicts,
+            nodes.Count,
+            assignments.Count,
+            divergent,
+            missing);
     }
 
     private static void note(List<string> warnings, RavenQueryResult result, string collection)
@@ -115,6 +241,12 @@ public sealed class RavenClusterMonitor : MonitorLoop
             warnings.Add($"{collection} read was served from a stale index ({result.IndexName})");
         }
     }
+
+    private static List<NodeRow> readNodes(RavenQueryResult query)
+        => query.Results.Select(readNode).Where(x => x is not null).Select(x => x!).ToList();
+
+    private static List<AssignmentRow> readAssignments(RavenQueryResult query, DateTimeOffset fallback)
+        => query.Results.Select(x => readAssignment(x, fallback)).Where(x => x is not null).Select(x => x!).ToList();
 
     /// <summary>
     /// A <c>WolverineNodes</c> document. <c>Description</c> is <c>Environment.MachineName</c>,

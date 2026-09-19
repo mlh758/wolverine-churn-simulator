@@ -56,15 +56,32 @@ public static class StoreQueries
                     $"'{Backends.Postgres}' nor '{Backends.RavenDb}'");
         }
 
-        var result = ProcessRunner.Kubectl("get", "deployment", "churnsim", "-o", "json");
+        var result = Workload();
         if (!result.Ok)
         {
-            return Outcome<string>.Bad(
-                $"could not read the churnsim deployment, so the arm under test is unknown: " +
-                $"{Summarise(result.StdErr)}");
+            return Outcome<string>.Bad($"the arm under test is unknown: {result.Problem}");
         }
 
-        return Outcome<string>.Good(BackendFromDeployment(result.StdOut));
+        return Outcome<string>.Good(BackendFromDeployment(result.Value!));
+    }
+
+    /// <summary>
+    /// The churnsim workload document, whichever kind it is. The single-store arms run a
+    /// Deployment; the replicated RavenDB arm runs a StatefulSet, because each pod has to be
+    /// pinned to one store member by ordinal and a Deployment's pods have no ordinal. Both carry
+    /// the same pod template shape, so every env-var read below works on either.
+    /// </summary>
+    public static Outcome<string> Workload()
+    {
+        var deployment = ProcessRunner.Kubectl("get", "deployment", "churnsim", "-o", "json");
+        if (deployment.Ok) return Outcome<string>.Good(deployment.StdOut);
+
+        var statefulSet = ProcessRunner.Kubectl("get", "statefulset", "churnsim", "-o", "json");
+        if (statefulSet.Ok) return Outcome<string>.Good(statefulSet.StdOut);
+
+        return Outcome<string>.Bad(
+            "could not read a churnsim deployment or statefulset: " +
+            $"{Summarise(deployment.StdErr)} / {Summarise(statefulSet.StdErr)}");
     }
 
     /// <summary>
@@ -122,13 +139,13 @@ public static class StoreQueries
     /// </summary>
     public static Outcome<int> AgentCount()
     {
-        var result = ProcessRunner.Kubectl("get", "deployment", "churnsim", "-o", "json");
+        var result = Workload();
         if (!result.Ok)
         {
-            return Outcome<int>.Bad($"could not read the churnsim deployment: {Summarise(result.StdErr)}");
+            return Outcome<int>.Bad(result.Problem);
         }
 
-        var value = EnvFromDeployment(result.StdOut, "SIM_AGENT_COUNT");
+        var value = EnvFromDeployment(result.Value!, "SIM_AGENT_COUNT");
         if (value is null)
         {
             return Outcome<int>.Bad(

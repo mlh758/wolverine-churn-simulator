@@ -1,0 +1,133 @@
+# The replicated RavenDB store: three members, one database at replication factor 3. This is the
+# store for the partition experiment (E7, docs/experiments.md) and nothing else — every other
+# RavenDB result was taken on k8s/ravendb.yaml's single member, and the two are not comparable.
+#
+# MUTUALLY EXCLUSIVE with k8s/ravendb.yaml: both define a Service called `ravendb`, and a Service's
+# clusterIP cannot be changed in place from an address to None. deploy.sh deletes the other arm's
+# store before applying this one.
+#
+# A StatefulSet, not a Deployment, because each member needs a STABLE name that the others can
+# dial and that a ChurnSim pod can be pinned to: ravendb-0.ravendb, ravendb-1.ravendb,
+# ravendb-2.ravendb. RAVEN_PublicServerUrl is what a member advertises to its peers and to clients
+# in the cluster topology, so it has to be that per-pod name — advertise the Service name and every
+# member would introduce itself as the round-robin.
+#
+# The members come up PASSIVE. Setup.Mode=None starts a server that answers /build/version and
+# refuses everything else until it is bootstrapped or added to a cluster; three of them are three
+# singletons, not a cluster. `safetylab raven-cluster form` (run by deploy.sh through the monitor
+# pod) bootstraps ravendb-0, adds the other two, and creates the database at factor 3 — and that
+# has to happen before the first ChurnSim pod, which would otherwise create it at factor 1.
+#
+# A LICENSE IS REQUIRED. An unlicensed RavenDB ("license: None") runs one node and refuses to add
+# a second — `PUT /admin/cluster/node` answers 402 LicenseLimitException, measured 2026-09-18 on
+# 7.0.9. The free Developer license (three nodes) is obtained from ravendb.net against an email
+# address, which is why deploy.sh cannot do it for you. Put the license JSON in a Secret:
+#
+#     just ravendb-license path/to/license.json
+#
+# and it reaches every member as RAVEN_License below. deploy.sh refuses --topology cluster while
+# the Secret is missing, because the alternative is a store that forms one member and calls it a
+# cluster. The single-member arm (k8s/ravendb.yaml) needs no license and is unchanged.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ravendb
+spec:
+  # Headless: the name resolves to the member IPs and each member also gets <pod>.ravendb.
+  # Nothing in the replicated arm dials the bare `ravendb` name on purpose; it would land on
+  # whichever member DNS handed out, which under a partition is one of two realities.
+  clusterIP: None
+  selector:
+    app: ravendb
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: tcp
+      port: 38888
+      targetPort: 38888
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ravendb
+spec:
+  serviceName: ravendb
+  replicas: 3
+  # All three at once. Ordered startup would have ravendb-2 waiting on ravendb-1's readiness,
+  # and a passive member is ready the moment it answers /build/version, so there is nothing to
+  # wait for — and `form` waits for all three itself.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: ravendb
+  template:
+    metadata:
+      labels:
+        app: ravendb
+    spec:
+      containers:
+        - name: ravendb
+          # Same pin as k8s/ravendb.yaml, for the same reason.
+          image: docker.io/ravendb/ravendb:7.0.9-ubuntu.22.04-x64
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RAVEN_Setup_Mode
+              value: "None"
+            - name: RAVEN_License_Eula_Accepted
+              value: "true"
+            - name: RAVEN_Security_UnsecuredAccessAllowed
+              value: "PublicNetwork"
+            # The license JSON, from the Secret `just ravendb-license` writes. Marked optional so
+            # the pod schedules without it and the refusal comes from deploy.sh with an explanation,
+            # not from the scheduler with "secret not found".
+            - name: RAVEN_License
+              valueFrom:
+                secretKeyRef:
+                  name: ravendb-license
+                  key: license.json
+                  optional: true
+            - name: RAVEN_ServerUrl
+              value: "http://0.0.0.0:8080"
+            - name: RAVEN_ServerUrl_Tcp
+              value: "tcp://0.0.0.0:38888"
+            # The per-member name, advertised to peers and clients. Fully qualified so it resolves
+            # the same from every pod regardless of its search path.
+            - name: RAVEN_PublicServerUrl
+              value: "http://$(POD_NAME).ravendb.default.svc.cluster.local:8080"
+            - name: RAVEN_PublicServerUrl_Tcp
+              value: "tcp://$(POD_NAME).ravendb.default.svc.cluster.local:38888"
+            # READ docs/harness-traps.md BEFORE REMOVING THIS. Same constraint as the single-node
+            # store, times three: RavenDB sizes itself from the host's advertised RAM, and three
+            # members left to do that on a 30 GB host is the ClickHouse incident again.
+            - name: RAVEN_Memory_MaxWorkingSet
+              value: "768"
+            - name: RAVEN_DataDir
+              value: "/var/lib/ravendb/data"
+          ports:
+            - containerPort: 8080
+            - containerPort: 38888
+          readinessProbe:
+            httpGet:
+              path: /build/version
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 40
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/ravendb
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+      volumes:
+        - name: data
+          emptyDir: {}

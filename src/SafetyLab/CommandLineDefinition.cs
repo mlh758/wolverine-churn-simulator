@@ -28,7 +28,8 @@ public static class CommandLineDefinition
     // drift into disagreeing about what "--database" means.
     private static Option<string?> UrlOption() => new("--url")
     {
-        Description = "RavenDB base url (default: RAVENDB_URL, else http://ravendb:8080)"
+        Description = "RavenDB base url (default: RAVENDB_URL, else http://ravendb:8080). The monitor and " +
+                      "raven-cluster accept a comma-separated list, one per cluster member, primary first."
     };
 
     private static Option<string?> DatabaseOption() => new("--database")
@@ -56,6 +57,8 @@ public static class CommandLineDefinition
         root.Subcommands.Add(BuildVerifyConfig());
         root.Subcommands.Add(BuildCount());
         root.Subcommands.Add(BuildSettle());
+        root.Subcommands.Add(BuildPartition());
+        root.Subcommands.Add(BuildRavenCluster());
 
         return root;
     }
@@ -214,6 +217,20 @@ public static class CommandLineDefinition
                 name, parseResult.GetValue(url), parseResult.GetValue(database), "AssignmentChanged"));
             command.Subcommands.Add(sub);
         }
+
+        // Replication conflicts, current and resolved. `--since` bounds the resolved-revision read;
+        // the partition script passes the partition-start time.
+        var since = new Option<string>("--since")
+        {
+            Description = "ISO-8601 instant; resolved conflicts older than this are not listed",
+            DefaultValueFactory = _ => DateTimeOffset.UtcNow.AddHours(-24).ToString("O")
+        };
+        var conflicts = new Command("conflicts",
+            "replicated RavenDB: current document conflicts and resolved-conflict revisions. Exit 1 if any.");
+        conflicts.Options.Add(since);
+        conflicts.SetAction((parseResult, _) => RavenQueries.RunAsync(
+            "conflicts", parseResult.GetValue(url), parseResult.GetValue(database), parseResult.GetValue(since)!));
+        command.Subcommands.Add(conflicts);
 
         // The only kind that takes a parameter of its own.
         var eventOption = new Option<string>("--event")
@@ -454,6 +471,99 @@ public static class CommandLineDefinition
         command.Subcommands.Add(arm);
         command.Subcommands.Add(disarm);
         command.Subcommands.Add(status);
+
+        return command;
+    }
+
+    // -------------------------------------------------------------- partition
+
+    /// <summary>
+    /// The network partition, same three-verb shape as <c>chaos</c> and for the same reason: the
+    /// heal goes in a trap, and a run refuses to start over a cut that a previous run left behind.
+    /// </summary>
+    private static Command BuildPartition()
+    {
+        var command = new Command("partition",
+            "MUTATES the minikube node's FORWARD chain: cut pod-to-pod traffic between two sets of pods, both ways.");
+
+        var isolate = new Option<string[]>("--isolate")
+        {
+            Description = "pods on the minority side, comma-separated or repeated",
+            Required = true,
+            AllowMultipleArgumentsPerToken = false
+        };
+        var from = new Option<string[]>("--from")
+        {
+            Description = "pods on the majority side, comma-separated or repeated",
+            Required = true,
+            AllowMultipleArgumentsPerToken = false
+        };
+
+        var arm = new Command("arm",
+            "Insert DROP rules for every cross pair and confirm from the node that all of them landed. " +
+            "Exit 2 if any pod is not live, or a partition is already armed.");
+        arm.Options.Add(isolate);
+        arm.Options.Add(from);
+        arm.SetAction(parseResult => PartitionVerbs.Arm(
+            Split(parseResult.GetValue(isolate)), Split(parseResult.GetValue(from))));
+
+        var heal = new Command("heal",
+            "Remove every rule this tool armed and confirm none remain. Idempotent, so a trap can call it.");
+        heal.SetAction(_ => PartitionVerbs.Heal());
+
+        var status = new Command("status",
+            "Print intact/armed with the rules. Exit 1 when armed, so a run can refuse to start.");
+        status.SetAction(_ => PartitionVerbs.Status());
+
+        command.Subcommands.Add(arm);
+        command.Subcommands.Add(heal);
+        command.Subcommands.Add(status);
+
+        return command;
+
+        static string[] Split(string[]? values)
+            => (values ?? []).SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .ToArray();
+    }
+
+    // ---------------------------------------------------------- raven-cluster
+
+    private static Command BuildRavenCluster()
+    {
+        var command = new Command("raven-cluster",
+            "Replicated RavenDB only: form the cluster and create the database at a replication factor, or describe it.");
+
+        var url = UrlOption();
+        var database = DatabaseOption();
+        url.Recursive = true;
+        database.Recursive = true;
+        command.Options.Add(url);
+        command.Options.Add(database);
+
+        var factor = new Option<int>("--replication-factor")
+        {
+            Description = "members the database is created across", DefaultValueFactory = _ => 3
+        };
+
+        var form = new Command("form",
+            "Bootstrap the first url, add the rest as members, create the database. Idempotent. MUTATES the store. " +
+            "Must run before the first ChurnSim pod, which would otherwise create the database at factor 1.");
+        form.Options.Add(factor);
+        form.SetAction((parseResult, _) => RavenClusterAdmin.FormAsync(
+            parseResult.GetValue(url), parseResult.GetValue(database), parseResult.GetValue(factor)));
+
+        var status = new Command("status", "Each member's view of the cluster, and the database's group topology.");
+        status.SetAction((parseResult, _) => RavenClusterAdmin.StatusAsync(
+            parseResult.GetValue(url), parseResult.GetValue(database)));
+
+        var preferred = new Command("preferred",
+            "The member a default (un-pinned) client prefers: the first node of the database group's topology.");
+        preferred.SetAction((parseResult, _) => RavenClusterAdmin.PreferredAsync(
+            parseResult.GetValue(url), parseResult.GetValue(database)));
+
+        command.Subcommands.Add(form);
+        command.Subcommands.Add(status);
+        command.Subcommands.Add(preferred);
 
         return command;
     }

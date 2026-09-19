@@ -11,3 +11,4 @@ evidence/
 __pycache__/
 tests/SafetyLab.Tests/bin/
 tests/SafetyLab.Tests/obj/
+.ravendb-license

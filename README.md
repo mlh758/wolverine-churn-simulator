@@ -86,6 +86,43 @@ Two constraints specific to the RavenDB arm:
 row-level security, which RavenDB has no equivalent of. They refuse to run on the
 RavenDB arm rather than silently measuring something else.
 
+### The replicated RavenDB arm
+
+`just deploy-ravendb-cluster` swaps the single RavenDB pod for a **three-member cluster at
+replication factor 3** (`k8s/ravendb-cluster.yaml`), and it exists for one experiment: E7, the
+network partition (`just split-brain`, [docs/experiments.md](docs/experiments.md)). Nothing measured
+on it is comparable to the single-member RavenDB results, and the results file says which is which.
+
+**It needs a RavenDB license.** An unlicensed server runs one node and refuses to add a second
+(`402 LicenseLimitException`). The free Developer license allows three; request it at
+<https://ravendb.net/license/request>, then `just ravendb-license path/to/license.json` stores it as
+the Secret every member reads. The deploy refuses to start without it. The single-member arm needs
+no license.
+
+Three things differ from the single-member arm, and each is there because without it there is no
+split to observe:
+
+- **ChurnSim is a StatefulSet and each pod is pinned to one member** — `churnsim-N` talks to
+  `ravendb-N` and, with `RAVENDB_PIN_NODE=true`, never learns the others exist. The RavenDB client
+  otherwise fetches the group topology and fails over to any member it can reach, so cutting a pod's
+  member off would make it quietly reroute to the majority. Every script reads the workload kind
+  through `backend.sh`'s `sim_workload`.
+- **The cluster is formed, and the database created at factor 3, before the first ChurnSim pod
+  starts.** `deploy.sh` runs `safetylab raven-cluster form` through the monitor pod. A ChurnSim pod
+  that finds no database creates one at factor 1, and three servers with a factor-1 database is not
+  a replicated store.
+- **The monitor reads every member, not the Service** (`k8s/safetylab-ravendb-cluster.yaml`). Under
+  a partition the members disagree and that disagreement is the finding; read through the headless
+  Service the history would flicker between two views. `ravendb-0` is the primary view that fills
+  the checker-facing fields, and the partition script keeps it on the majority side.
+
+The partition itself is `safetylab partition arm|heal|status`: `DROP` rules in the minikube node's
+`FORWARD` chain, keyed on pod IPs, both directions of every cross pair, each carrying a comment so
+`heal` removes exactly what `arm` added and nothing of kube-proxy's. The observer's pod is on
+neither side. `arm` reads the rules back and refuses a partial arm; `heal` runs from a trap and
+refuses to report success while any rule remains; a run refuses to start over a cut a previous run
+left behind — the same three-verb shape as the PostgreSQL chaos injector, for the same reasons.
+
 ## Running things
 
 ```bash
@@ -211,11 +248,20 @@ terminated, its in-process lock list went on reporting "held", and two nodes bot
 | S5 | **No agent runs on two nodes at once** | the user-visible property: a doubled projection daemon or exclusive listener |
 | S6 | Every assigned agent is running on its assigned node | GH-3987's "assigned but not running" wedge |
 | S7 | Every running agent is assigned to the node running it | an orphan runner — the precursor to S5 |
+| S9 | Every store member agrees on assignment ownership | **replicated RavenDB only** — a member holding an agent under a different owner than the primary view, or lacking its document, past the grace window. Assignments are single-member writes with async replication; this is two claims on one agent seen from outside |
+| S10 | No store member reports document conflicts | **replicated RavenDB only** — RavenDB's own `CountOfConflicts` above zero on any member: two members accepted incompatible writes to one document. Zero grace |
 | L1 | The cluster converges after the last phase marker | one leader, every agent placed once, and it stays that way (on RavenDB a *present but expired* lock is not a leader) |
-| C0 | Observation coverage | sampling gaps, failed samples, monitor↔store clock offset, and — on RavenDB — a query that came back stale or short of its page limit |
+| P1 | The partition took | **partition runs only** — between the `partition-start` and `partition-heal` marks at least one member must have reported losing its Raft leader. A run where none did was not partitioned, whatever the firewall said. SKIPs when the marks are absent |
+| C0 | Observation coverage | sampling gaps, failed samples, monitor↔store clock offset, and — on RavenDB — a query that came back stale or short of its page limit; on the replicated arm, a member the monitor could not read |
 
-S3–S8 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
+S3–S9 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
 of disagreement is the protocol working. What gets reported is divergence that does not end.
+
+On the replicated arm S1 is a check **across members**: every member's compare-exchange value is
+read every tick and tagged with its source, members that agree collapse into one holder, and
+members that name different owners for one key are two. That is what a leadership split looks
+like from outside a Raft cluster that cannot itself hand a key to two owners — the minority member
+keeps serving the last value it committed.
 
 The checkers themselves are backend-agnostic: every leader-side check reads
 `RunHistory.LeaderHolders`, which normalises "a granted advisory lock, attributed through the
@@ -291,6 +337,29 @@ The script asserts its own nemesis fired. `NodeStopped` records are written only
 shutdown path, so one appearing during a SIGKILL run means the victim shut down cleanly and the
 run is reported `*** INVALID ***` rather than as a failover measurement.
 
+## Split brain (E7)
+
+`just split-brain [hold] [settle]` on the replicated RavenDB arm. It settles the cluster, finds the
+leader, hands leadership off gracefully if it sits on `ravendb-0` (the monitor's primary view has to
+stay on the majority side), then isolates **the leader's store member and the leader's pod
+together** from the other two for `hold` seconds — default 420, past the 300 s compare-exchange
+lock expiry — heals, watches for `settle` seconds, and runs everything: the per-member history
+through the checkers, the post-heal pod logs through `safetylab overlaps`, and RavenDB's own
+conflict state through `safetylab query conflicts`.
+
+That is `CUT=zone`, the default: a zone-level partition that no client can route around, and it
+needs the pods pinned (`RAVENDB_PIN_NODE=true`, the manifest's setting) so the stranded pod is the
+leader by construction. `CUT=store` is the control: pods left alone and un-pinned
+(`RAVENDB_PIN_NODE=false`), only the member the default client prefers cut from the other two —
+asking what the default client does. The script verifies the pin from the pods' own output and
+refuses a mismatch. Both have been run once; see RESULTS.md.
+
+Read `P1` in the report before anything else: it says whether the cut actually took. Then `S1`
+(two members naming two lock owners), `S9` (a member holding assignments the majority does not),
+`S10` (the store's own conflict count), `S5` (an agent running on two pods), and the run
+directory's `timeline.tsv` for the glance-at-it view, one column group per member. The reasoning
+behind the design, and the prediction it tests, is E7 in [docs/experiments.md](docs/experiments.md).
+
 ## Structured logs and SQL
 
 ChurnSim writes JSON logs when `SIM_JSON_LOGS=true` — each line a JSON object whose `State` holds
@@ -337,8 +406,10 @@ byte-for-byte comparable with earlier results.
 | Knob | Where | Default | Meaning |
 |---|---|---|---|
 | `SIM_BACKEND` | `k8s/churnsim*.yaml` | `postgres` | which store this arm is; must match the image's build-time `-p:SimBackend=` or ChurnSim refuses to start |
-| `RAVENDB_URLS` / `RAVENDB_DATABASE` | `k8s/churnsim-ravendb.yaml` | `http://ravendb:8080` / `churnsim` | RavenDB arm only; ChurnSim creates the database if it is missing |
-| `RAVEN_Memory_MaxWorkingSet` | `k8s/ravendb.yaml` | 1024 (MB) | **do not remove** — RavenDB otherwise sizes itself from the host's 30 GB, see [harness-traps.md](docs/harness-traps.md) |
+| `RAVENDB_URLS` / `RAVENDB_DATABASE` | `k8s/churnsim-ravendb.yaml` | `http://ravendb:8080` / `churnsim` | RavenDB arm only; ChurnSim creates the database if it is missing. On the replicated arm the url is `ravendb-$(POD_INDEX)`, one member per pod |
+| `RAVENDB_PIN_NODE` | `k8s/churnsim-ravendb-cluster.yaml` | `false` (`true` on the replicated arm) | `DisableTopologyUpdates` on the RavenDB client: the pod talks only to the url it was given and never fails over. Off, a partition is invisible — the client reroutes to the majority |
+| `RAVENDB_REPLICATION_FACTOR` | `k8s/churnsim-ravendb-cluster.yaml` | 1 (3 on the replicated arm) | what ChurnSim creates the database with when it finds none; matters after a `reset-schema` on the replicated arm |
+| `RAVEN_Memory_MaxWorkingSet` | `k8s/ravendb.yaml`, `k8s/ravendb-cluster.yaml` | 1024 / 768 (MB) | **do not remove** — RavenDB otherwise sizes itself from the host's 30 GB, see [harness-traps.md](docs/harness-traps.md) |
 | `SIM_AGENT_COUNT` | `k8s/churnsim.yaml` | 500 | number of `sim://` agents to distribute (ChurnSim falls back to 20 if the var is absent, which `safetylab settle` would then wait for) |
 | `SIM_AGENT_MB` | `k8s/churnsim.yaml` | 0 | resident MB each *running* agent allocates (for GH-3959 overload runs) |
 | `replicas` | `k8s/churnsim.yaml` | 3 | cluster size |

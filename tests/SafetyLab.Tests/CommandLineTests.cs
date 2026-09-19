@@ -41,6 +41,16 @@ public class CommandLineTests
     [InlineData("monitor")]
     [InlineData("monitor", "--backend", "postgres", "--lock-id", "832201495")]
     [InlineData("monitor", "--backend", "ravendb", "--page-size", "4000", "--url", "http://ravendb:8080")]
+    // The replicated arm: one url per member, comma-separated, exactly as k8s/safetylab-ravendb-cluster.yaml
+    // and split-brain.sh spell them.
+    [InlineData("monitor", "--backend", "ravendb", "--url", "http://ravendb-0.ravendb:8080,http://ravendb-1.ravendb:8080")]
+    [InlineData("partition", "arm", "--isolate", "ravendb-2,churnsim-2", "--from", "ravendb-0,ravendb-1,churnsim-0,churnsim-1")]
+    [InlineData("partition", "heal")]
+    [InlineData("partition", "status")]
+    [InlineData("raven-cluster", "form", "--replication-factor", "3")]
+    [InlineData("raven-cluster", "status", "--url", "http://ravendb-0.ravendb:8080,http://ravendb-1.ravendb:8080")]
+    [InlineData("raven-cluster", "preferred")]
+    [InlineData("query", "conflicts", "--url", "http://ravendb-0.ravendb:8080", "--since", "2026-09-18T12:00:00Z")]
     // scripts/monitor.sh
     [InlineData("harvest", "--pod", "churnsim-abc")]
     [InlineData("check", "runs/rollout-1")]
@@ -173,7 +183,7 @@ public class CommandLineTests
         var verbs = root.Subcommands.Select(c => c.Name).ToArray();
 
         Assert.Equal(
-            new[] { "admin", "chaos", "check", "count", "harvest", "host-pid", "monitor", "overlaps", "pick-pod", "pods", "query", "settle", "snapshot", "traces", "verify-config" },
+            new[] { "admin", "chaos", "check", "count", "harvest", "host-pid", "monitor", "overlaps", "partition", "pick-pod", "pods", "query", "raven-cluster", "settle", "snapshot", "traces", "verify-config" },
             verbs.OrderBy(x => x, StringComparer.Ordinal).ToArray());
     }
 }

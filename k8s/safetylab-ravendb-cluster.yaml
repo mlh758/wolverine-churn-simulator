@@ -1,0 +1,56 @@
+# The monitor for the replicated RavenDB store (E7). One difference from k8s/safetylab-ravendb.yaml
+# and it is the whole reason this file exists: --url names EVERY member, not the Service.
+#
+# Under a partition the members disagree — a minority member keeps serving the last compare-exchange
+# value and assignment set it committed while the majority moves on — and that disagreement is the
+# finding. Read through the headless Service the history would flicker between the two views with
+# nothing saying which was which. Read per member, every sample carries all three views, the first
+# url is the primary that fills the checker-facing fields, and S1/S9/S10/P1 compare the rest
+# against it.
+#
+# The monitor pod is on NEITHER side of the cut. `safetylab partition arm` is only ever given
+# churnsim and ravendb pods, so this pod keeps reading every member throughout. If it could not,
+# C0 would say so.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safetylab
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: safetylab
+  template:
+    metadata:
+      labels:
+        app: safetylab
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: safetylab
+          image: localhost/safetylab:local
+          imagePullPolicy: Never
+          args:
+            - "monitor"
+            - "--backend"
+            - "ravendb"
+            - "--tick-ms"
+            - "1000"
+            - "--service"
+            - "churnsim"
+          env:
+            # Primary first. ravendb-0 is the primary view; the partition script makes sure the
+            # isolated member is never ravendb-0, so the checker-facing fields always read the
+            # majority side.
+            - name: RAVENDB_URL
+              value: "http://ravendb-0.ravendb.default.svc.cluster.local:8080,http://ravendb-1.ravendb.default.svc.cluster.local:8080,http://ravendb-2.ravendb.default.svc.cluster.local:8080"
+            - name: RAVENDB_DATABASE
+              value: "churnsim"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

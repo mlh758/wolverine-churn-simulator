@@ -91,14 +91,20 @@ cmd_deploy() {
     # an argument, and it must match the arm that is deployed -- a monitor pointed at an empty
     # Postgres while the cluster runs on RavenDB would produce a history full of nothing and
     # every safety check would pass over it.
-    local backend manifest
+    # The RavenDB arm has two topologies and the difference is the monitor's whole job on the
+    # replicated one: it must read every member, not the Service, or a partition is invisible.
+    # Read off the STORE, not the app workload: on the replicated arm the monitor is deployed
+    # before churnsim exists, because the cluster is formed through it.
+    local backend topology manifest
     backend=$(sim_backend)
-    case "$backend" in
-        ravendb) manifest="k8s/safetylab-ravendb.yaml" ;;
+    topology=$(sim_topology)
+    case "$backend/$topology" in
+        ravendb/cluster) manifest="k8s/safetylab-ravendb-cluster.yaml" ;;
+        ravendb/*) manifest="k8s/safetylab-ravendb.yaml" ;;
         *) manifest="k8s/safetylab.yaml" ;;
     esac
 
-    echo "== deploying the monitor ($backend) =="
+    echo "== deploying the monitor ($backend, $topology) =="
     $KUBECTL apply -f "$manifest"
 
     # `apply` reports "unchanged" when only the image CONTENTS moved -- the tag is always

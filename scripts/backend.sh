@@ -17,6 +17,9 @@
 #
 #   source scripts/backend.sh
 #   sim_backend            -> postgres | ravendb
+#   sim_topology           -> single | cluster   (cluster = the replicated RavenDB store, E7)
+#   sim_workload           -> deployment/churnsim | statefulset/churnsim
+#   bounce_workload        -> restart every churnsim pod and wait, on either workload kind
 #   require_safetylab      -> build $SAFETYLAB if stale, or exit 2
 #   db_placed              -> count of placed sim:// agents
 #   db_nodes               -> node number <TAB> description (= pod name)
@@ -61,12 +64,83 @@ sim_backend() {
     fi
 
     local value
-    value=$($K get deployment churnsim \
+    value=$($K get "$(sim_workload)" \
         -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="SIM_BACKEND")]}{.value}{end}' \
         2>/dev/null)
 
-    # A deployment predating the RavenDB arm carries no SIM_BACKEND and was PostgreSQL.
-    echo "${value:-postgres}"
+    if [ -n "$value" ]; then
+        echo "$value"
+        return 0
+    fi
+
+    # No workload declares it. On the replicated arm the monitor is deployed BEFORE churnsim
+    # (the cluster is formed through it), so fall back to the store that is present. A cluster
+    # with neither workload nor a RavenDB store, or a deployment predating the RavenDB arm, was
+    # PostgreSQL.
+    if $K get statefulset ravendb >/dev/null 2>&1 || $K get deployment ravendb >/dev/null 2>&1; then
+        echo "ravendb"
+    else
+        echo "postgres"
+    fi
+}
+
+# Which workload runs churnsim. The single-store arms are a Deployment; the replicated RavenDB
+# arm is a StatefulSet, because each of its pods is pinned to one store member by ordinal and a
+# Deployment's pods have no ordinal. Answers `deployment/churnsim` when neither exists, so a
+# caller's error message names the thing it expected rather than an empty string.
+sim_workload() {
+    if $K get statefulset churnsim >/dev/null 2>&1; then
+        echo "statefulset/churnsim"
+    else
+        echo "deployment/churnsim"
+    fi
+}
+
+# single: one store pod (k8s/postgres.yaml or k8s/ravendb.yaml). cluster: the three-member
+# RavenDB StatefulSet (k8s/ravendb-cluster.yaml). Read from the cluster, never passed in, for the
+# same reason as sim_backend: a monitor deployed for the wrong topology reads one member of three
+# and every partition check passes over a view that never disagreed with itself.
+sim_topology() {
+    if $K get statefulset ravendb >/dev/null 2>&1; then
+        echo "cluster"
+    else
+        echo "single"
+    fi
+}
+
+# Wait until `count` pods with the label exist and every one of them is Ready. `kubectl rollout
+# status` cannot do this for a StatefulSet with the OnDelete update strategy (it refuses outright),
+# and `kubectl wait` errors when the pods do not exist yet, so the two are staged.
+wait_ready() {
+    # Four statements, not one: bash expands every word of a `local` line before assigning any of
+    # them, so `deadline` would read an unset `timeout` under set -u (docs/harness-traps.md, Shell).
+    local label="$1"
+    local count="$2"
+    local timeout="${3:-300}"
+    local deadline=$(( $(date +%s) + timeout ))
+    while [ "$($K get pods -l "$label" --no-headers 2>/dev/null | wc -l)" -lt "$count" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || { echo "wait_ready: fewer than $count pods with $label after ${timeout}s" >&2; return 1; }
+        sleep 2
+    done
+    $K wait --for=condition=Ready pod -l "$label" --timeout="${timeout}s"
+}
+
+# Replace every churnsim pod and wait for the replacements. `rollout restart` is the Deployment
+# way; the StatefulSet uses OnDelete (so a partition run's pods are never replaced under it) and
+# is bounced by deleting its pods outright.
+bounce_workload() {
+    local workload
+    workload=$(sim_workload)
+    case "$workload" in
+        statefulset/*)
+            $K delete pod -l app=churnsim --wait=true
+            wait_ready app=churnsim "$($K get "$workload" -o jsonpath='{.spec.replicas}')" 300
+            ;;
+        *)
+            $K rollout restart "$workload"
+            $K rollout status "$workload" --timeout=300s
+            ;;
+    esac
 }
 
 # A LIVE pg pod. Exec-ing into a terminating predecessor fails with "cannot exec into a container

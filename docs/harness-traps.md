@@ -91,6 +91,24 @@ deployment spec until it matches intent before bouncing pods.
 here is tagged `:local`, so a rebuilt binary does not change the spec and the old pod keeps
 running — every measurement afterwards silently comes from the previous build.
 
+**`kubectl logs --tail=N` on a stream of 65 KB JSON lines returns fragments.** The container runtime
+splits long lines into partial log entries and `--tail` counts those, so the last "line" is the
+tail of a sample and the one before it is the head of another; a JSON parser sees "extra data".
+Read the whole stream (as `monitor.sh` does) or tail generously and keep only lines that parse.
+
+**`kubectl rollout status` refuses a StatefulSet whose update strategy is `OnDelete`** — "rollout
+status is only available for RollingUpdate strategy type" — and under `set -e` that ends the
+deploy with the store half up. Both StatefulSets on the replicated arm use `OnDelete` on purpose
+(an automatic rolling update would replace a pod, and its IP, and so its side of the cut, under a
+running partition), so they are waited on with `wait_ready` in backend.sh: pods exist, then
+`kubectl wait --for=condition=Ready`. Staged, because `kubectl wait` errors when no pod matches yet.
+
+**A pod's IP is the partition.** The cut is keyed on pod IPs, and a pod replaced during the hold
+comes back on a new IP outside every rule. `OnDelete` keeps the controller from doing that; nothing
+keeps a crash from doing it. The pinned minority pod can still reach its own member throughout, so
+it has no reason to crash — but if a run shows a churnsim pod restart inside the partition window,
+that pod escaped the cut for the rest of the hold, and the run is not what it claims.
+
 ## Fault injection
 
 **`kubectl delete pod --force --grace-period=0` is NOT an ungraceful kill.** It removes the API
@@ -106,6 +124,18 @@ outside the namespace: `minikube ssh` + `crictl inspect` for the host pid, then 
 **Before handing any pid to `kill -9`, check it is `> 1` and that `/proc/<pid>/cmdline` is the
 process you meant.** A fault injector aimed at the wrong process either destroys the rig or, worse,
 quietly injects nothing and leaves a plausible number behind.
+
+**The minikube node's `iptables` cannot load its tables; `iptables-nft` can.** Under rootless
+podman `iptables -S` fails with "can't initialize iptables table `filter': Table does not exist"
+(`ip_tables` is not present and the node cannot insmod), while `iptables-nft` — the binary
+kube-proxy's own rules are written with — works. There is no `tc`-based alternative worth the
+trouble: pod-to-pod traffic on the one node is *forwarded* by the host kernel (kindnet's `ptp`
+CNI, one veth pair and a /32 route per pod), so a `DROP` in `FORWARD` keyed on two pod IPs cuts
+exactly one ordered pair. Insert at position 1, not append: `KUBE-FORWARD` accepts established
+flows earlier in the chain, and a rule appended after it would cut new connections while every
+existing one carried on through the "partition". Every rule this rig writes carries the comment
+`safetylab-partition`, and the heal deletes only lines carrying it — kube-proxy's rules in the same
+chain are not ours to touch.
 
 ## Shell
 
@@ -166,6 +196,36 @@ a *prefix* of the cluster would read as a smaller, healthy one.
 operation returns 503 `NodeIsPassiveException` until then. Creating a database is what bootstraps
 it, so a monitor started against a cold cluster records a hole or two before the first ChurnSim pod
 is up. That is the sampler working; do not read those samples as an outage.
+
+**RavenDB: three passive servers are three singletons, not a cluster.** Creating a database on one
+of them bootstraps *that one* into a one-member cluster and replicates to nobody. The replicated
+arm forms the cluster explicitly (`safetylab raven-cluster form`: bootstrap, add members, create
+the database at factor 3) BEFORE the first ChurnSim pod, because a ChurnSim pod that finds no
+database creates one at factor 1 — and a factor-1 database on a three-member cluster would let
+every partition finding be filed against a store that was never replicated. On that arm
+`RAVENDB_REPLICATION_FACTOR=3` also covers a `reset-schema`.
+
+**RavenDB: an unlicensed server refuses to add a cluster member.** `PUT /admin/cluster/node` on a
+`license: None` server answers `402 LicenseLimitException`, after bootstrapping perfectly happily
+(measured 2026-09-18, 7.0.9). The free Developer license allows three nodes and is a registration
+against an email address, so nothing in this rig can obtain it; `deploy.sh --topology cluster`
+refuses while the `ravendb-license` Secret is absent rather than forming one member and calling it
+a cluster. The members read `RAVEN_License` at START, and the StatefulSet's `OnDelete` strategy
+means `apply` never restarts a pod — so a license added after the pods came up sits unread until
+they are deleted. The cluster deploy deletes them every time for that reason.
+
+**RavenDB: the client fails over, and a partition experiment needs it not to.** The client fetches
+the database group's topology and routes to any member it can reach. Cut a pod's member off and,
+with topology updates on, the pod quietly reroutes to the majority: no minority side exists and the
+run measures client failover instead of a split. `RAVENDB_PIN_NODE=true` sets
+`DisableTopologyUpdates`; the replicated arm's pods are pinned by ordinal and the partition cuts
+the pod as well as its member, so P1 can tell the difference.
+
+**RavenDB: the headless Service is the wrong thing to read a replicated store through.** It
+resolves to every member round-robin, so under a partition a monitor reading `ravendb:8080` would
+see two realities alternating with nothing saying which is which. The replicated arm's monitor is
+given every member url and reads them all on every tick; the first is the primary view and the
+rest are compared against it.
 
 ## Measurement hygiene
 

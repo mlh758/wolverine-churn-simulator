@@ -25,11 +25,14 @@ internal static partial class Verbs
         AppDomain.CurrentDomain.ProcessExit += (_, _) => cancellation.Cancel();
 
         MonitorLoop monitor;
-        RavenClient? raven = null;
+        IReadOnlyList<RavenClient> raven = [];
 
         if (backend == Backends.RavenDb)
         {
-            raven = RavenQueries.Connect(url, database);
+            // One client per member. `--url` (or RAVENDB_URL) may be comma-separated; the first is
+            // the primary view and the rest are read alongside it every tick. A single url is
+            // the single-node arm, unchanged.
+            raven = RavenQueries.ConnectAll(url, database);
             monitor = new RavenClusterMonitor(raven, service, pageSize, tick, Console.Out);
         }
         else
@@ -53,7 +56,7 @@ internal static partial class Verbs
         }
         finally
         {
-            raven?.Dispose();
+            foreach (var client in raven) client.Dispose();
         }
 
         return 0;

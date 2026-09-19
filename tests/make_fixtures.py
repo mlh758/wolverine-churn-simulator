@@ -39,6 +39,10 @@ RAVEN_LEADER_KEY = "wolverine/leader/churnsim"
 RAVEN_LEADER_KEY_UNSUFFIXED = "wolverine/leader"
 RAVEN_LOCK_TTL = timedelta(minutes=5)
 
+# The replicated store's members, as k8s/safetylab-ravendb-cluster.yaml names them. Member 0 is
+# the monitor's primary view.
+REPLICA_URLS = [f"http://ravendb-{i}.ravendb.default.svc.cluster.local:8080" for i in range(3)]
+
 NODES = [
     # (pod name, pod ip, node uuid, node number, backend pid)
     ("churnsim-a", "10.0.0.11", "11111111-1111-1111-1111-111111111111", 1, 101),
@@ -77,26 +81,61 @@ class World:
         # sample) and not nothing (the data may be a prefix of the cluster).
         self.warnings = []
 
+        # Replicated RavenDB only (E7). One entry per store member, keyed by member index; the
+        # monitor's primary view is member 0. `raft_leader` None is what a minority member answers
+        # while cut off. `divergent` is (agent uri, node uuid) rows the member holds with a
+        # different owner than the primary; `missing` is agent uris it has no document for;
+        # `conflicts` is the member's CountOfConflicts. `lock_holder_override` makes that member
+        # report a different owner of the leadership key than the primary does -- which is what
+        # a compare-exchange value looks like from a member that stopped receiving Raft commits.
+        self.replicas = None
+
+    def replicate(self):
+        """Turn this world into a healthy three-member view of itself."""
+        self.replicas = {
+            i: {"raft_leader": "A", "raft_state": "Leader" if i == 0 else "Follower",
+                "conflicts": 0, "divergent": [], "missing": [], "lock_holder_override": None,
+                "error": None}
+            for i in range(3)
+        }
+
 
 def sample(seq, t, w, backend="postgres"):
     locks = []
     cmpxchg = []
 
     if backend == "ravendb":
-        if w.lock_holder is not None:
-            cmpxchg.append({
-                "key": RAVEN_LEADER_KEY,
-                "nodeId": w.lock_holder[2],
-                "expiresAt": iso(t + w.lock_expires_in),
-                "index": 1000 + seq,
-            })
-        for key, node_id in w.extra_locks:
-            cmpxchg.append({
-                "key": key,
-                "nodeId": node_id,
-                "expiresAt": iso(t + RAVEN_LOCK_TTL),
-                "index": 2000 + seq,
-            })
+        def lock_rows(node=None, holder=None):
+            rows = []
+            holder = holder if holder is not None else w.lock_holder
+            if holder is not None:
+                rows.append({
+                    "key": RAVEN_LEADER_KEY,
+                    "nodeId": holder[2],
+                    "expiresAt": iso(t + w.lock_expires_in),
+                    "index": 1000 + seq,
+                })
+            for key, node_id in w.extra_locks:
+                rows.append({
+                    "key": key,
+                    "nodeId": node_id,
+                    "expiresAt": iso(t + RAVEN_LOCK_TTL),
+                    "index": 2000 + seq,
+                })
+            if node is not None:
+                for row in rows:
+                    row["node"] = node
+            return rows
+
+        if w.replicas is None:
+            cmpxchg = lock_rows()
+        else:
+            # Every member's rows, tagged with their source, exactly as RavenClusterMonitor
+            # writes them. Members that agree collapse into one holder in RunHistory.
+            for i, r in sorted(w.replicas.items()):
+                if r["error"] is not None:
+                    continue
+                cmpxchg.extend(lock_rows(REPLICA_URLS[i], r["lock_holder_override"]))
     elif w.lock_holder is not None:
         locks.append({
             "pid": w.lock_holder[4],
@@ -141,17 +180,38 @@ def sample(seq, t, w, backend="postgres"):
     if w.warnings:
         record["warnings"] = list(w.warnings)
 
+    if w.replicas is not None:
+        record["replicas"] = []
+        for i, r in sorted(w.replicas.items()):
+            if r["error"] is not None:
+                record["replicas"].append({
+                    "url": REPLICA_URLS[i], "nodeCount": 0, "assignmentCount": 0,
+                    "divergent": [], "missing": [], "error": r["error"],
+                })
+                continue
+            record["replicas"].append({
+                "url": REPLICA_URLS[i],
+                "nodeTag": "ABC"[i],
+                "raftLeader": r["raft_leader"],
+                "raftState": r["raft_state"],
+                "conflicts": r["conflicts"],
+                "nodeCount": len(nodes),
+                "assignmentCount": len(assignments) + len(r["divergent"]) - len(r["missing"]),
+                "divergent": [{"id": a, "nodeId": n, "started": iso(T0)} for a, n in r["divergent"]],
+                "missing": list(r["missing"]),
+            })
+
     return record
 
 
-def meta_record(backend):
+def meta_record(backend, replicated=False):
     if backend == "ravendb":
         # leaderLockId is a PostgreSQL schema-name hash with no RavenDB counterpart, so the
         # monitor writes 0 rather than a plausible-looking number, and `schema` carries the
         # database name. Keep this identical to RavenClusterMonitor.DescribeAsync.
-        return {
+        record = {
             "kind": "meta",
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "startedUtc": iso(T0),
             "tickMs": 1000,
             "leaderLockId": 0,
@@ -160,6 +220,9 @@ def meta_record(backend):
             "backend": "ravendb",
             "lockKey": RAVEN_LEADER_KEY,
         }
+        if replicated:
+            record["replicas"] = list(REPLICA_URLS)
+        return record
 
     # No "backend" key on purpose: this is what a pre-RavenDB capture looks like, so the
     # fixtures also pin that those still load and still check as PostgreSQL.
@@ -174,21 +237,30 @@ def meta_record(backend):
     }
 
 
-def build(name, mutate=None, skip=None, backend="postgres"):
-    """mutate(tick, world) adjusts state in place; skip(tick) drops a sample entirely."""
+def build(name, mutate=None, skip=None, backend="postgres", replicated=False, marks=None):
+    """mutate(tick, world) adjusts state in place; skip(tick) drops a sample entirely.
+
+    replicated=True gives every tick a healthy three-member view before mutate runs, so a
+    replicated fixture states only its fault. marks overrides the default rollout-end marker.
+    """
     directory = os.path.join(FIXTURES, name)
     shutil.rmtree(directory, ignore_errors=True)
     os.makedirs(directory)
 
-    history = [meta_record(backend)]
+    def world(tick):
+        w = World()
+        if replicated:
+            w.replicate()
+        if mutate:
+            mutate(tick, w)
+        return w
+
+    history = [meta_record(backend, replicated)]
     for tick in range(DURATION):
         if skip and skip(tick):
             continue
         t = T0 + tick * TICK
-        w = World()
-        if mutate:
-            mutate(tick, w)
-        history.append(sample(tick + 1, t, w, backend))
+        history.append(sample(tick + 1, t, world(tick), backend))
 
     # Pod-side stream. Residencies are derived from the same World the samples use, so a
     # fixture only has to state its fault once.
@@ -200,9 +272,7 @@ def build(name, mutate=None, skip=None, backend="postgres"):
     previous = {}
     for tick in range(DURATION):
         t = T0 + tick * TICK
-        w = World()
-        if mutate:
-            mutate(tick, w)
+        w = world(tick)
         current = {(agent, pod) for agent, pod in w.running.items()}
 
         for pair in current - set(previous):
@@ -213,7 +283,8 @@ def build(name, mutate=None, skip=None, backend="postgres"):
                          "agentUri": pair[0], "podName": pair[1]})
         previous = current
 
-    marks = [{"kind": "mark", "ts": iso(T0 + timedelta(seconds=90)), "label": "rollout-end"}]
+    if marks is None:
+        marks = [{"kind": "mark", "ts": iso(T0 + timedelta(seconds=90)), "label": "rollout-end"}]
 
     write(os.path.join(directory, "history.jsonl"), history)
     write(os.path.join(directory, "pods.jsonl"), sorted(pods, key=lambda r: r["ts"]))
@@ -318,6 +389,64 @@ def raven_split_key(tick, w):
         w.extra_locks = [(RAVEN_LEADER_KEY_UNSUFFIXED, NODES[1][2])]
 
 
+# ------------------------------------------------------- the replicated store (E7)
+
+PARTITION_MARKS = [
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=60)), "label": "partition-start"},
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=180)), "label": "partition-heal"},
+]
+
+
+def cut_off(w, member):
+    """What a minority member looks like from outside: it still answers, it knows the members,
+    it has no Raft leader and has fallen to Candidate. Nothing about its data has changed yet."""
+    w.replicas[member]["raft_leader"] = None
+    w.replicas[member]["raft_state"] = "Candidate"
+
+
+def raven_partition(tick, w):
+    """The split, as E7 predicts it, on member 2 between the two marks.
+
+    Leadership: the majority (members 0 and 1) took the lock over -- node B now owns
+    wolverine/leader/churnsim there -- while the cut-off member 2 still serves the value it last
+    committed, naming node A. Two members, two owners of one key: S1 across members.
+
+    Assignments: node A on the minority side re-claimed agent2 and agent3 on member 2 (plain
+    session writes succeed there), while the majority still places them on nodes B and C. So
+    member 2 disagrees with the primary on two rows: S9.
+
+    The leader assignment row on the primary follows the majority (node B), so S2/S3 see one
+    coherent leader on the primary view and stay quiet -- this fixture is the split, and only
+    the split. Recovery after the heal is left out on purpose so the interval is unambiguous.
+    """
+    if 60 <= tick < 180:
+        cut_off(w, 2)
+        w.lock_holder = NODES[1]
+        w.leader = NODES[1][2]
+        w.replicas[2]["lock_holder_override"] = NODES[0]
+        w.replicas[2]["divergent"] = [("sim://agent2/", NODES[0][2]), ("sim://agent3/", NODES[0][2])]
+    elif tick >= 180:
+        w.lock_holder = NODES[1]
+        w.leader = NODES[1][2]
+
+
+def raven_conflicts(tick, w):
+    """A partition that took (member 2 leaderless between the marks, so P1 is satisfied) and,
+    after the heal, member 1 reporting two documents in conflict: the store's own statement that
+    two members accepted incompatible writes to one AgentAssignments document. Every member
+    agrees on ownership throughout, so only S10 has anything to say."""
+    if 60 <= tick < 180:
+        cut_off(w, 2)
+    elif tick >= 180:
+        w.replicas[1]["conflicts"] = 2
+
+
+def raven_partition_noop(tick, w):
+    """The marks say a partition ran; no member ever lost its Raft leader. The cut did not take
+    -- a firewall rule that matched nothing, a client that rerouted -- and every other check in
+    this run passed over an intact cluster. P1 exists to refuse exactly this."""
+
+
 def main():
     os.makedirs(FIXTURES, exist_ok=True)
     print("fixtures:")
@@ -336,6 +465,14 @@ def main():
     build("raven-expired-lock", raven_expired_lock, backend="ravendb")
     build("raven-split-key", raven_split_key, backend="ravendb")
     build("raven-truncated", raven_truncated, backend="ravendb")
+
+    # The replicated store (E7). `raven-replicas-clean` pins that three agreeing members read as
+    # ONE leader and no divergence -- without it, a healthy cluster would trip S1 three times over
+    # and S9 would never have been seen quiet.
+    build("raven-replicas-clean", clean, backend="ravendb", replicated=True)
+    build("raven-partition", raven_partition, backend="ravendb", replicated=True, marks=PARTITION_MARKS)
+    build("raven-conflicts", raven_conflicts, backend="ravendb", replicated=True, marks=PARTITION_MARKS)
+    build("raven-partition-noop", raven_partition_noop, backend="ravendb", replicated=True, marks=PARTITION_MARKS)
 
 
 def build_dup():

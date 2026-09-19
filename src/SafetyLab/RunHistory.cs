@@ -231,9 +231,22 @@ public sealed class RunHistory
     {
         if (IsRavenDb)
         {
+            // On a replicated capture the same key is read from every member and each row is
+            // tagged with its source. Members that AGREE (same key, same owner) are one holder —
+            // a healthy three-member read is one leader, not three. Members that disagree are
+            // separate holders, and the `Where` text names which member said what, because that
+            // disagreement is precisely the partition finding S1 exists to surface here.
             return (sample.Cmpxchg ?? [])
                 .Where(x => IsLeaderLockKey(x.Key))
-                .Select(x => new LeaderHolder($"cmpxchg '{x.Key}' at index {x.Index}", x.NodeId, x.ExpiresAt))
+                .GroupBy(x => (x.Key, x.NodeId))
+                .Select(g =>
+                {
+                    var sources = g.Where(x => x.Node is not null).Select(x => ShortNode(x.Node!)).Distinct().ToList();
+                    var seen = sources.Count > 0 ? $" seen on {string.Join("+", sources)}" : "";
+                    var index = g.Max(x => x.Index);
+                    return new LeaderHolder($"cmpxchg '{g.Key.Key}' at index {index}{seen}", g.Key.NodeId,
+                        g.Max(x => x.ExpiresAt));
+                })
                 .ToList();
         }
 
@@ -241,6 +254,34 @@ public sealed class RunHistory
             .Select(x => new LeaderHolder($"pid {x.Pid} ({x.ClientAddr})", NodeForAddress(x.ClientAddr, sample.Ts),
                 null))
             .ToList();
+    }
+
+    /// <summary>
+    /// Was this capture read from more than one RavenDB member? Decides whether S9/S10/P1 have
+    /// anything to say, and is false for every history written before the replicated arm.
+    /// </summary>
+    public bool IsReplicated => Meta?.Replicas is { Count: > 1 } || Samples.Any(x => x.Replicas is { Count: > 0 });
+
+    /// <summary>The member urls the monitor read, primary first; empty on a single-node capture.</summary>
+    public IReadOnlyList<string> ReplicaUrls
+        => Meta?.Replicas ?? Samples.FirstOrDefault(x => x.Replicas is { Count: > 0 })?.Replicas!
+            .Select(x => x.Url).ToList() ?? [];
+
+    /// <summary>
+    /// "ravendb-2" out of "http://ravendb-2.ravendb.default.svc.cluster.local:8080" — the host's
+    /// first label, which on the StatefulSet is the pod name. Falls back to the whole url when
+    /// it does not parse, so a report never shows an empty source.
+    /// </summary>
+    public static string ShortNode(string url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Host.Length > 0)
+        {
+            var host = uri.Host;
+            var dot = host.IndexOf('.');
+            return dot > 0 ? host[..dot] : host;
+        }
+
+        return url;
     }
 
     /// <summary>How the leader lock is named in a report line, for the header of a run.</summary>

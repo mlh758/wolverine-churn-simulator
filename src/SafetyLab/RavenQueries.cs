@@ -33,9 +33,27 @@ public static class RavenQueries
 
     public static RavenClient Connect(string? url, string? database)
         => new(
-            url ?? Environment.GetEnvironmentVariable("RAVENDB_URL") ?? "http://ravendb:8080",
+            FirstUrl(url),
             database ?? Environment.GetEnvironmentVariable("RAVENDB_DATABASE") ?? "churnsim",
             TimeSpan.FromSeconds(30));
+
+    /// <summary>
+    /// One client per comma-separated url, in the order given. The monitor reads every member of
+    /// a replicated store this way; the query verbs take the first only, because a TSV answer
+    /// has one column for "the store" and a caller that wants a specific member's view passes
+    /// that member's url.
+    /// </summary>
+    public static IReadOnlyList<RavenClient> ConnectAll(string? url, string? database)
+    {
+        var db = database ?? Environment.GetEnvironmentVariable("RAVENDB_DATABASE") ?? "churnsim";
+        return Urls(url).Select(u => new RavenClient(u, db, TimeSpan.FromSeconds(30))).ToList();
+    }
+
+    public static IReadOnlyList<string> Urls(string? url)
+        => (url ?? Environment.GetEnvironmentVariable("RAVENDB_URL") ?? "http://ravendb:8080")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static string FirstUrl(string? url) => Urls(url)[0];
 
     public static async Task<int> RunAsync(string kind, string? url, string? database, string eventName)
     {
@@ -179,6 +197,47 @@ public static class RavenQueries
                 }
 
                 return complete ? 0 : 1;
+            }
+
+            // Replication conflicts, current and already-resolved: "<state> <doc id> <change vector
+            // or resolution> <last modified>". Current conflicts are documents with more than one
+            // live version; resolved ones are the losing versions RavenDB kept as revisions after a
+            // resolver picked a winner. Both are printed because which of the two a run produces
+            // depends on the database's resolver configuration, and neither Wolverine nor this rig
+            // sets one — so what the default does is part of E7's answer. Exit 1 if any were found,
+            // 0 if the store answered with none, 2 if it could not be asked.
+            case "conflicts":
+            {
+                var since = DateTimeOffset.TryParse(eventName, out var parsed)
+                    ? parsed
+                    : DateTimeOffset.UtcNow.AddHours(-24);
+                var any = false;
+
+                foreach (var conflict in await client.ConflictsAsync(Page, token))
+                {
+                    any = true;
+                    var id = conflict.TryGetProperty("Id", out var i) ? i.GetString() : "?";
+                    var vector = conflict.TryGetProperty("ChangeVector", out var v) ? v.GetString() : "?";
+                    var modified = conflict.TryGetProperty("LastModified", out var m) ? m.GetString() : "?";
+                    Console.WriteLine($"conflict\t{id}\t{vector}\t{modified}");
+                }
+
+                foreach (var revision in await client.ResolvedConflictsAsync(since, Page, token))
+                {
+                    any = true;
+                    var metadata = revision.TryGetProperty("@metadata", out var md) ? md : default;
+                    var id = metadata.ValueKind == JsonValueKind.Object && metadata.TryGetProperty("@id", out var i)
+                        ? i.GetString() : "?";
+                    var flags = metadata.ValueKind == JsonValueKind.Object && metadata.TryGetProperty("@flags", out var f)
+                        ? f.GetString() : "?";
+                    var modified = metadata.ValueKind == JsonValueKind.Object &&
+                                   metadata.TryGetProperty("@last-modified", out var m)
+                        ? m.GetString() : "?";
+                    Console.WriteLine($"resolved\t{id}\t{flags}\t{modified}");
+                }
+
+                if (!any) Console.WriteLine("none");
+                return any ? 1 : 0;
             }
 
             default:

@@ -17,6 +17,43 @@ public sealed record RavenQueryResult(
 }
 
 /// <summary>
+/// One server's answer to <c>/cluster/topology</c>: who it thinks it is, who it thinks leads, and
+/// which servers it thinks are members. Parsed leniently — a field RavenDB stops sending becomes
+/// null, never an exception, because the monitor must keep sampling through whatever the cluster
+/// does to itself.
+/// </summary>
+public sealed record ClusterView(
+    string? NodeTag,
+    string? Leader,
+    string? State,
+    IReadOnlyDictionary<string, string> Members)
+{
+    public static ClusterView Parse(JsonElement root)
+    {
+        var members = new Dictionary<string, string>();
+
+        if (root.TryGetProperty("Topology", out var topology) &&
+            topology.TryGetProperty("Members", out var raw) &&
+            raw.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var member in raw.EnumerateObject())
+            {
+                members[member.Name] = member.Value.GetString() ?? "";
+            }
+        }
+
+        return new ClusterView(
+            str(root, "NodeTag"),
+            str(root, "Leader"),
+            str(root, "CurrentState"),
+            members);
+
+        static string? str(JsonElement e, string name)
+            => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    }
+}
+
+/// <summary>
 /// The RavenDB half of "an outside observer with no Wolverine dependency".
 ///
 /// Deliberately raw HTTP against the documented REST surface rather than <c>RavenDB.Client</c>.
@@ -41,6 +78,9 @@ public sealed class RavenClient : IDisposable
     }
 
     public string Database => _database;
+
+    /// <summary>The server this client talks to, as configured — what a replica view is tagged with.</summary>
+    public string Url => _http.BaseAddress!.ToString().TrimEnd('/');
 
     /// <summary>
     /// Run an RQL query. Callers pass their own <c>limit</c>: paging is the caller's problem
@@ -208,6 +248,152 @@ public sealed class RavenClient : IDisposable
 
         using var response = await _http.SendAsync(request, token);
         await throwOnErrorAsync(response, $"drop database {_database}", token);
+    }
+
+    // ------------------------------------------------------------ cluster reads
+
+    /// <summary>
+    /// The database's own statistics. Only <c>CountOfConflicts</c> is read: on a replicated
+    /// database it is the number of documents that currently have more than one version because
+    /// two members accepted different writes, and it is the cheapest server-side signal that
+    /// the assignment plane's claim-if-absent guard has been defeated by replication.
+    /// </summary>
+    public async Task<long> ConflictCountAsync(CancellationToken token)
+    {
+        using var response = await _http.GetAsync($"databases/{_database}/stats", token);
+        await throwOnErrorAsync(response, "database stats", token);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        return doc.RootElement.TryGetProperty("CountOfConflicts", out var count) && count.TryGetInt64(out var value)
+            ? value
+            : 0;
+    }
+
+    /// <summary>
+    /// This member's view of the Raft cluster. Deliberately THIS member's: under a partition the
+    /// answer differs by member, and that difference is the finding. A minority member reports no
+    /// leader, and its state falls out of Leader/Follower into Candidate.
+    /// </summary>
+    public async Task<ClusterView> ClusterTopologyAsync(CancellationToken token)
+    {
+        using var response = await _http.GetAsync("cluster/topology", token);
+        await throwOnErrorAsync(response, "cluster topology", token);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        return ClusterView.Parse(doc.RootElement);
+    }
+
+    /// <summary>
+    /// The documents currently in conflict, with the change vector and owner of every version.
+    /// RavenDB keeps the versions side by side until a resolver (or a client) picks one; if the
+    /// database has a resolver that runs first, this is empty and the evidence has moved to the
+    /// resolved-conflict revisions instead — read both.
+    /// </summary>
+    public async Task<IReadOnlyList<JsonElement>> ConflictsAsync(int pageSize, CancellationToken token)
+    {
+        using var response = await _http.GetAsync(
+            $"databases/{_database}/replication/conflicts?start=0&pageSize={pageSize}", token);
+        await throwOnErrorAsync(response, "replication conflicts", token);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        return doc.RootElement.TryGetProperty("Results", out var results)
+            ? results.EnumerateArray().Select(x => x.Clone()).ToList()
+            : [];
+    }
+
+    /// <summary>
+    /// Conflicts the server has already resolved since a point in time. RavenDB stores the losing
+    /// versions as revisions flagged <c>Conflicted</c>/<c>Resolved</c> whether or not revisions
+    /// are otherwise enabled, so a conflict that a resolver picked a winner for in the same tick
+    /// still leaves this trace behind. What the resolver picked, and by what rule, is part of E7's
+    /// result — neither Wolverine nor this rig configures one.
+    /// </summary>
+    public async Task<IReadOnlyList<JsonElement>> ResolvedConflictsAsync(DateTimeOffset since, int pageSize,
+        CancellationToken token)
+    {
+        using var response = await _http.GetAsync(
+            $"databases/{_database}/revisions/resolved?since={Uri.EscapeDataString(since.UtcDateTime.ToString("O"))}&take={pageSize}",
+            token);
+        await throwOnErrorAsync(response, "resolved conflict revisions", token);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        return doc.RootElement.TryGetProperty("Results", out var results)
+            ? results.EnumerateArray().Select(x => x.Clone()).ToList()
+            : [];
+    }
+
+    /// <summary>The database group: which members hold this database, and as what role.</summary>
+    public async Task<IReadOnlyList<(string Tag, string Url, string Role)>> DatabaseTopologyAsync(
+        CancellationToken token)
+    {
+        using var response = await _http.GetAsync($"topology?name={Uri.EscapeDataString(_database)}", token);
+        await throwOnErrorAsync(response, "database topology", token);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        var rows = new List<(string, string, string)>();
+
+        if (!doc.RootElement.TryGetProperty("Nodes", out var nodes)) return rows;
+
+        foreach (var node in nodes.EnumerateArray())
+        {
+            rows.Add((
+                node.TryGetProperty("ClusterTag", out var tag) ? tag.GetString() ?? "?" : "?",
+                node.TryGetProperty("Url", out var url) ? url.GetString() ?? "?" : "?",
+                node.TryGetProperty("ServerRole", out var role) ? role.GetString() ?? "?" : "?"));
+        }
+
+        return rows;
+    }
+
+    // ----------------------------------------------------------- cluster admin
+
+    /// <summary>
+    /// Turn a passive, freshly started server into a one-node cluster. A node in
+    /// <c>Setup.Mode=None</c> stays passive until either this runs or another cluster's leader
+    /// adds it, and every database operation against a passive node is a 503.
+    /// </summary>
+    public async Task BootstrapAsync(CancellationToken token)
+    {
+        using var response = await _http.PostAsync("admin/cluster/bootstrap", null, token);
+        await throwOnErrorAsync(response, "cluster bootstrap", token);
+    }
+
+    /// <summary>Add another (passive) server to this member's cluster. Runs on the current leader.</summary>
+    public async Task AddNodeAsync(string url, string tag, CancellationToken token)
+    {
+        using var response = await _http.PutAsync(
+            $"admin/cluster/node?url={Uri.EscapeDataString(url)}&tag={Uri.EscapeDataString(tag)}&watcher=false",
+            null, token);
+        await throwOnErrorAsync(response, $"add cluster node {tag} ({url})", token);
+    }
+
+    public async Task<bool> DatabaseExistsAsync(CancellationToken token)
+    {
+        using var response = await _http.GetAsync(
+            $"admin/databases?name={Uri.EscapeDataString(_database)}", token);
+
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return false;
+        await throwOnErrorAsync(response, "database record", token);
+        return true;
+    }
+
+    /// <summary>
+    /// Create the database across <paramref name="replicationFactor"/> members. ChurnSim creates
+    /// it with factor 1 when it finds none, so on the replicated arm this must run BEFORE the
+    /// first ChurnSim pod starts, or the "cluster" is three servers replicating nothing.
+    /// </summary>
+    public async Task CreateDatabaseAsync(int replicationFactor, CancellationToken token)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put,
+            $"admin/databases?name={Uri.EscapeDataString(_database)}&replicationFactor={replicationFactor}")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { DatabaseName = _database, Settings = new Dictionary<string, string>() }),
+                Encoding.UTF8, "application/json")
+        };
+
+        using var response = await _http.SendAsync(request, token);
+        await throwOnErrorAsync(response, $"create database {_database} (factor {replicationFactor})", token);
     }
 
     public async Task<string> BuildVersionAsync(CancellationToken token)

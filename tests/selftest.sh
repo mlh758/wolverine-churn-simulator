@@ -26,6 +26,15 @@ LEDGER=(
   "raven-expired-lock:S8 L1"
   "raven-split-key:S1 L1"
   "raven-truncated:C0"
+  # The replicated store (E7). raven-replicas-clean pins that three members agreeing on one lock
+  # read as ONE holder and that S9/S10 stay quiet on a healthy cluster. raven-partition is the
+  # predicted split: two members naming two lock owners (S1) and a minority member holding
+  # assignment rows the majority does not (S9). raven-partition-noop has the marks of a partition
+  # run and no member that ever lost its Raft leader -- the cut did not take, and P1 refuses it.
+  "raven-replicas-clean:"
+  "raven-partition:S1 S9"
+  "raven-conflicts:S10"
+  "raven-partition-noop:P1"
 )
 
 BIN="${SAFETYLAB_BIN:-}"

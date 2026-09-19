@@ -15,6 +15,177 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
+## 2026-09-19 — E7 split brain, run 2 (store-tier cut, default client): nothing happened, and that is the result
+
+The control for run 1, below. Same cluster, same build, same 420 s hold; the two differences are
+the ones the experiment turns on. **`RAVENDB_PIN_NODE=false`** — the default RavenDB client, with
+topology updates on — verified from every pod's own CONFIG line before the cut. And **only the store
+member was cut**: `ravendb-0`, which `safetylab raven-cluster preferred` reported as the first node
+of the database group's topology and therefore the member every un-pinned client was on, was
+isolated from `ravendb-1` and `ravendb-2`; the three ChurnSim pods were not touched and could reach
+every member throughout. Monitor primary view moved to `ravendb-1` for this run so the checker-facing
+fields read the majority. Run directory `runs/split-brain-e7-run2-store`.
+
+| | |
+|---|---|
+| the cut | 431 s (03:35:51 → 03:43:02); P1: `ravendb-0` leaderless for 427 of them |
+| leader's client failover | **16 s**: last renewal on `ravendb-0` at index 10454, next committed on the majority at 03:36:07 — inside one renewal cycle |
+| errors logged by the leader | **none.** Not one `Error trying to attain a leadership lock`; the failover was invisible to Wolverine |
+| leadership | never lost, never split (S1, S3, S8 all pass); `ravendb-0` served its stale copy of the lock, same owner, counting down to −133 s, and was overwritten within a second of the heal |
+| agent events, any pod, cut + heal | **0** — nothing started, nothing stopped |
+| duplicates | none (S5); `safetylab overlaps`: 0 |
+| assignment divergence | none (S9) |
+| convergence after heal | 0.7 s (L1), held 313 s |
+| conflicts | `CountOfConflicts` never above zero (S10). **924 resolved-conflict revisions**, exactly 308 on each of the three node-registration documents, from the heal until **5 min 12 s** after it — the same storm as run 1, same duration to the second, this time with no client having written to the isolated member at all |
+| coverage | one 5.4 s monitor blind spot at 03:36:52 (C0); nothing above sits inside it |
+
+**Read with run 1.** The pair separates two things run 1 alone could not. A partition that the
+client can route around costs Wolverine on RavenDB one renewal cycle and nothing else: the default
+client did exactly what it should, and "probably fine" is now measured rather than assumed. A
+partition that strands a pod with its store member — the zone cut, which no client setting can
+route around — is where run 1's 300 s stall and 166 duplicates live. So the finding narrows to what
+the single-member entry already said, with one extension: **the five-minute compare-exchange
+expiry is the RavenDB-specific issue**, and its cost under a zone partition is a live node
+running agents that the majority re-places and cannot tell to stop, for as long as the stall plus
+the cut lasts.
+
+The one thing that recurred identically in both runs and is not yet explained is the
+resolved-conflict storm on the three `WolverineNodes` documents: 308 revisions per document over
+5 min 12 s after the heal, whether or not anyone wrote to the isolated member during the cut. No
+agent-side effect either time. Worth a look at what RavenDB does with the heartbeat writes' change
+vectors when a member rejoins, before deciding it is nothing.
+
+## 2026-09-18 — E7 split brain, run 1 (zone cut): the isolated leader wrote nothing; the majority duplicated its agents for the length of the stall
+
+First run of the network-partition experiment on the **replicated** RavenDB arm. One run; treat
+every number below as an observation, not a rate. `WolverineFx.RavenDb` **6.39.0**, RavenDB server
+**7.0.9** as a **three-member cluster at replication factor 3** (free Developer license), net10.0.
+3 ChurnSim replicas as a StatefulSet, `churnsim-N` given `ravendb-N` as its url, `SIM_AGENT_COUNT=500`,
+`SIM_START_DELAY_MS=500`, `SIM_AGENT_MB=0`, no `SIM_BATCH_SIZE`, no `SIM_STABILITY_WINDOW_SECONDS`.
+Monitor at a 1 s tick reading every member; `ravendb-0` is the primary view. Run directory
+`runs/split-brain-e7-run1` (48 MB, kept). minikube shape as in the single-member entry below.
+
+**What was cut, and what it models.** Leader `churnsim-1` on `ravendb-1`. `ravendb-1` **and**
+`churnsim-1` were isolated together from the other four pods for **424 s** (22:51:39 → 22:58:43),
+both directions of every cross pair, via DROP rules in the node's FORWARD chain. That is a
+**zone-style partition**: an application node and its nearest store member on one side, the rest
+of the cluster on the other. It is not a store-tier-only partition — the pod could not reach any
+majority member, so no client, pinned or not, could have routed around it.
+
+`RAVENDB_PIN_NODE=true` was set for this run, and it matters to say what it did and did not do. It
+disables the RavenDB client's topology updates, so each pod talks only to the member it was given.
+It did **not** manufacture the failure mode: with the pod cut from `ravendb-0` and `ravendb-2`, a
+default client would have tried them, failed, and landed on `ravendb-1` just the same. What the pin
+decided was *which* pod ended up on the isolated side, by making pod-to-member affinity
+deterministic — the default client sends every pod to the first node in the database group's
+topology and only fails over when it cannot be reached, so without the pin the isolated pod would
+have been whichever one the partition separated from that node. The pin is what makes "isolate the
+leader with its member" a reproducible experiment rather than a coin flip. The store-tier-only cut,
+where the pods can still reach the majority and the default client is expected to route around it,
+is the control (run 2, below).
+
+P1: `ravendb-1` reported no Raft leader for 421 of the 424 s. The monitor read all three members
+throughout.
+
+### What happened, by the clock
+
+| t (s) | majority side (`ravendb-0`/`2`, `churnsim-0`/`2`) | minority side (`ravendb-1`, `churnsim-1`) |
+|---|---|---|
+| 0–299 | lock still names `churnsim-1`, TTL counting down 298 → 5, **nobody can renew or take over** | leader keeps leading on its local field; `Error trying to attain a leadership lock` every ~17 s (×16), `Error trying to perform agent health checks` ×2; **reassigns nothing** — no agent event anywhere on the cluster |
+| 299 | `churnsim-0` assumes leadership the second the lock lapses; sees `churnsim-1`'s registration as stale (its health checks never left `ravendb-1`); **starts its 166 agents on `churnsim-0` (83) and `churnsim-2` (83)** | `churnsim-1` steps down at t+300: "the leadership advisory lock was released server-side" — its own copy expired. **It keeps running all 166 agents**; nothing can tell it to stop, the control queue runs through the store |
+| 300–424 | 500 placed, 250/250 on two nodes; lock `churnsim-0` | `ravendb-1` still serves the **expired** lock naming `churnsim-1` (S8 fires on this member) and the old leader row; 502 assignment docs, 167 of them disagreeing with the majority (S9) |
+| 424 (heal) | within 3 s the leader **deletes** the 166 rows (500 → 334 placed) and stops the 83+83 agents | still running 166 agents, now unassigned everywhere |
+| 484 | the leader **re-places the same 166 on `churnsim-0`/`2`** (334 → 500) — `churnsim-1` still not counted as live | still running them: second duplicate window |
+| 539 | deletes them again (→ 334), stops 83+83; `ravendb-1`'s stale documents finally agree with the primary at t+537 | `churnsim-1`'s reconcile sweep claims its 166 running agents back into the table, 50 per tick (`MaxLocalAgentReconciliationsPerTick`) |
+| 551 | **converged**: 167 / 166 / 167, one leader, held 187 s to the end of the capture | |
+
+### The findings
+
+| | |
+|---|---|
+| leaderless window (majority) | **300 s** — the compare-exchange expiry, again; the majority could not take over a lock the minority could not renew |
+| old leader's belief after losing its store | **300 s**, then it stepped down on its own local expiry |
+| leadership split as seen by the *store* | 126 s (S1): `ravendb-1` served the expired value naming `churnsim-1` while `ravendb-0`/`2` named `churnsim-0`, until the heal |
+| leadership split as *believed* by Wolverine nodes | **~1 s** — `churnsim-0` assumed at 22:56:38, `churnsim-1` stepped down at 22:56:39 |
+| duplicate agents | **166 of 500**, two windows: **126 s** (takeover → heal) and **55 s** (t+484 → t+539, after the heal). 332 overlap intervals, all healed, **0 persisted** |
+| assignment divergence from the minority | **none written**: the isolated leader added no claims. The 167 rows `ravendb-1` disagreed on were the *pre-cut* state it could not update (S9, 238 s, ending 115 s after the heal) |
+| document conflicts | `CountOfConflicts` **never above zero** on any member at a 1 s tick (S10 passes). But `revisions/resolved` lists **1257 resolved-conflict revisions**, every one on the **three node-registration documents** (ids = the node ids), created from the heal until **5 min 12 s after it** — a health-check-cadence conflict storm on `WolverineNodes`, resolved by RavenDB's default before the monitor could see it. **No conflict on any `AgentAssignments` document.** |
+| convergence after heal | 127 s (L1), held 187 s |
+
+### What this says about the prediction
+
+Read alongside the single-member entry below: the dominant structural finding on RavenDB is still
+the **five-minute stall** — the compare-exchange lock that no one can renew and no one can take
+over until it expires. Everything in this run sits downstream of it. The majority could not act for
+300 s; when it finally did, the isolated node had been running unreachable for 300 s and kept
+running for another 124. A shorter lease would have shrunk both windows, and the duplicates are a
+consequence of the stall plus unreachability rather than a separate RavenDB replication defect.
+
+The Layer 1c prediction — the minority leader keeps claiming agents into its own member, the
+claims collide with the majority's after the heal, and the collision surfaces as document
+conflicts — **did not happen**, and the reason is visible in the minority leader's log: every lock
+renewal failed from 15 s into the cut, every health-check pass errored, and it changed nothing.
+Whether that is because ejecting a stale node is a cluster-wide transaction that cannot commit on
+the minority, or because the failing health-check loop never reached the assignment step, this run
+cannot say; either way the isolated leader was **inert**, not rogue.
+
+The duplicates came from the other side. The **majority** took the lock at expiry, treated the
+isolated node as dead because its heartbeats could not replicate, and re-placed its 166 agents —
+on a node that was alive, running them, and unreachable by the stop command that would have
+fixed it. That is the same unfenced shape E2's handover duplicates have, arriving by a route the
+reconcile sweep cannot close while the cut stands: the sweep on `churnsim-1` compared against
+`ravendb-1`'s copy of the table, which still said it owned everything.
+
+The second duplicate window is the one to look at next. For 115 s after the heal the majority
+leader did not count `churnsim-1` as live, deleted and re-placed the same 166 rows twice, and it
+was `churnsim-1`'s **own sweep** — GH-4407's claim-if-absent — that ended it, not the leader. And
+1257 resolved conflicts on three heartbeat documents, for five minutes after a seven-minute cut,
+is a cost nobody configured: neither Wolverine nor this rig sets a resolver, so RavenDB picked the
+latest version 1257 times and kept a revision each time.
+
+### Options noted, not decided
+
+Two things the run points at, written down so they are not lost; neither is settled and neither
+has been tried.
+
+- **Self-stop on lost quorum.** The isolated node had the evidence — sixteen failed lock renewals
+  from 15 s in — and acted on none of it. A node that stops its agents and releases its claims
+  after N consecutive failures to prove quorum turns the duplicate window into an unavailability
+  window and rejoins as an empty node, which is also the clean fix for the 115 s post-heal
+  flip-flop (no stale claims to merge). The leader gets the signal for free from the lock renewal;
+  a follower would need a probe — a cluster-wide no-op write, or `/cluster/topology` reporting no
+  Raft leader — because on RavenDB its plain-session writes keep succeeding on its own member. The
+  trade is timing: it must stop before the majority re-places, which under the 300 s expiry means
+  agents running nowhere for most of that window. Does not address a stale leader that its peers
+  can still reach; fencing is the complement, not the alternative.
+- **Quorum writes for assignments.** Assignment turnover is rare — a handful of writes per
+  handover, then nothing — so moving `AgentAssignments` from a plain session to a cluster-wide
+  transaction would cost little and would close the divergence route outright: a claim that
+  cannot commit on the minority is a claim that never happened, on any member. Node registration
+  already uses this mode. It would not have changed run 1's duplicates (the isolated leader wrote
+  nothing) but it removes the case this experiment was built to look for, and makes the heal a
+  plain rejoin rather than a merge.
+
+Testable here as written: a patched build, both hold durations, and the measurement is the
+duplicate window (S5) against the running-nowhere window (S6 with the placed count).
+
+### Caveats
+
+- **One run.** The takeover time is structural (the expiry); the duplicate counts and the
+  post-heal flip-flop may not be.
+- **This is the zone cut, not the store-tier cut.** The pod was isolated with its member, so
+  client failover had nowhere to go and the control queue could not reach it — which is why the
+  stop commands never arrived. A partition that cuts only the store members from each other,
+  with every pod still able to reach the majority, is a different experiment and is run 2.
+- **The pin fixed pod-to-member affinity, nothing else.** See "What was cut" above. Without it
+  the same failure mode exists for whichever pod the partition strands; with it, the stranded pod
+  is the leader by construction.
+- **Hold 420 s is one arm.** A hold *under* 300 s never lets the majority take over, and the two
+  halves of E7 predict different behaviour there. Not yet run.
+- The monitor lost 4.7 s once during the cut (C0). Nothing in the story above sits inside it.
+- Conflict evidence is from `ravendb-0`'s `revisions/resolved` since the cut began; the other
+  members were not asked.
+
 ## 2026-09-18 — RavenDB arm: no duplicates post-sweep, but a 5-minute leaderless stall after an ungraceful leader death
 
 First results from the RavenDB arm. `WolverineFx.RavenDb` **6.39.0** (released, from nuget),

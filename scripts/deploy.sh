@@ -16,11 +16,19 @@
 #
 # ARGUMENTS
 #
-#   ./scripts/deploy.sh [version] [--backend postgres|ravendb]
+#   ./scripts/deploy.sh [version] [--backend postgres|ravendb] [--topology single|cluster]
 #
 #     version   defaults to the contents of ./wolverine-version, which is also what
 #               Directory.Build.props and the Dockerfile read. Change the version under test by
 #               editing that file; pass one here to override for a single run.
+#
+#     --topology cluster   RavenDB only: the three-member store for the partition experiment (E7),
+#               k8s/ravendb-cluster.yaml, with one PINNED churnsim pod per member (a StatefulSet,
+#               k8s/churnsim-ravendb-cluster.yaml) and the per-member monitor. The order here is
+#               load-bearing: store, then monitor, then `raven-cluster form` THROUGH the monitor
+#               (bootstrap, add members, create the database at factor 3), then churnsim — because
+#               a churnsim pod that finds no database creates one at factor 1, and three servers
+#               with a factor-1 database is not a replicated store.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,19 +42,23 @@ VERSION_FILE="wolverine-version"
 VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
 [ -n "$VERSION" ] || { echo "deploy.sh: $VERSION_FILE is empty" >&2; exit 2; }
 BACKEND="postgres"
+TOPOLOGY="single"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --backend) BACKEND="${2:?--backend needs postgres or ravendb}"; shift 2 ;;
+    --topology) TOPOLOGY="${2:?--topology needs single or cluster}"; shift 2 ;;
     -*) echo "deploy.sh: unknown option $1" >&2; exit 2 ;;
     *) VERSION="$1"; shift ;;
   esac
 done
 
-case "$BACKEND" in
-  postgres) STORE_MANIFEST="k8s/postgres.yaml"; STORE_LABEL="pg"; APP_MANIFEST="k8s/churnsim.yaml" ;;
-  ravendb)  STORE_MANIFEST="k8s/ravendb.yaml";  STORE_LABEL="ravendb"; APP_MANIFEST="k8s/churnsim-ravendb.yaml" ;;
-  *) echo "deploy.sh: --backend must be 'postgres' or 'ravendb', not '$BACKEND'" >&2; exit 2 ;;
+case "$BACKEND/$TOPOLOGY" in
+  postgres/single) STORE_MANIFEST="k8s/postgres.yaml"; STORE_LABEL="pg"; APP_MANIFEST="k8s/churnsim.yaml" ;;
+  ravendb/single)  STORE_MANIFEST="k8s/ravendb.yaml";  STORE_LABEL="ravendb"; APP_MANIFEST="k8s/churnsim-ravendb.yaml" ;;
+  ravendb/cluster) STORE_MANIFEST="k8s/ravendb-cluster.yaml"; STORE_LABEL="ravendb"; APP_MANIFEST="k8s/churnsim-ravendb-cluster.yaml" ;;
+  postgres/cluster) echo "deploy.sh: --topology cluster is RavenDB only (PostgreSQL is a single node here by design)" >&2; exit 2 ;;
+  *) echo "deploy.sh: --backend must be 'postgres' or 'ravendb' and --topology 'single' or 'cluster', not '$BACKEND'/'$TOPOLOGY'" >&2; exit 2 ;;
 esac
 
 # The RavenDB arm needs the native ravendb:// control queue for Balanced-mode agent commands.
@@ -56,6 +68,19 @@ esac
 if [ "$BACKEND" = "ravendb" ] && [[ "$VERSION" == 5.* ]]; then
   echo "deploy.sh: WolverineFx.RavenDb $VERSION predates the native RavenDB control queue," >&2
   echo "           so Balanced durability cannot elect a control endpoint. Use a 6.x build." >&2
+  exit 2
+fi
+
+# The replicated store needs a RavenDB license before it can be formed: an unlicensed server
+# allows one node and refuses to add a second (402 LicenseLimitException). Refuse now, before a
+# multi-minute image build, rather than after forming one member and calling it a cluster. The
+# license is a registration against an email address on ravendb.net, so it cannot be fetched here.
+if [ "$TOPOLOGY" = "cluster" ] && ! $KUBECTL get secret ravendb-license >/dev/null 2>&1; then
+  echo "deploy.sh: --topology cluster needs a RavenDB license, and Secret 'ravendb-license' does not exist." >&2
+  echo "           An unlicensed RavenDB runs one node and refuses to add members. Get the free Developer" >&2
+  echo "           license (three nodes) from https://ravendb.net/license/request, then:" >&2
+  echo "             just ravendb-license path/to/license.json" >&2
+  echo "           and re-run this deploy. See k8s/ravendb-cluster.yaml." >&2
   exit 2
 fi
 
@@ -74,20 +99,82 @@ podman save "$TAG" -o /tmp/churnsim-local.tar
 minikube image load /tmp/churnsim-local.tar
 rm -f /tmp/churnsim-local.tar
 
-echo "== Deploying $BACKEND =="
+# The two RavenDB topologies both own a Service named `ravendb` and a workload named `churnsim`,
+# and neither can be converted into the other in place (a Service's clusterIP is immutable, and a
+# Deployment is not a StatefulSet). Whichever the OTHER topology left behind is removed first. The
+# store's emptyDir goes with it, which is fine: a store is dropped between builds anyway.
+# Keyed on the other topology's STORE workload existing, so re-deploying the same topology leaves
+# its own Service alone (deleting and recreating a headless Service mid-run would drop every
+# member's DNS name for a moment).
+echo "== Clearing the other topology's objects, if any =="
+if [ "$TOPOLOGY" = "cluster" ]; then
+  if $KUBECTL get deployment ravendb >/dev/null 2>&1; then
+    $KUBECTL delete deployment ravendb --wait=true
+    $KUBECTL delete service ravendb --ignore-not-found
+  fi
+  $KUBECTL delete deployment churnsim --ignore-not-found --wait=true
+else
+  if $KUBECTL get statefulset ravendb >/dev/null 2>&1; then
+    $KUBECTL delete statefulset ravendb --wait=true
+    $KUBECTL delete service ravendb --ignore-not-found
+  fi
+  if $KUBECTL get statefulset churnsim >/dev/null 2>&1; then
+    $KUBECTL delete statefulset churnsim --wait=true
+    $KUBECTL delete service churnsim --ignore-not-found
+  fi
+fi
+
+echo "== Deploying $BACKEND ($TOPOLOGY) =="
 $KUBECTL apply -f "$STORE_MANIFEST"
-$KUBECTL rollout status "deployment/$STORE_LABEL" --timeout=300s
+if [ "$TOPOLOGY" = "cluster" ]; then
+  # A fresh store every deploy. The members read RAVEN_License from the Secret at START, and the
+  # StatefulSet's OnDelete strategy means `apply` never replaces a running pod — so a license added
+  # after the pods came up would sit unread while `form` failed on the same 402 as before. Deleting
+  # the pods also empties their emptyDir, so the members come back passive and `form` rebuilds the
+  # cluster from nothing; that is the same "drop the store between builds" rule the single arms
+  # follow, made explicit.
+  source scripts/backend.sh
+  $KUBECTL delete pod -l app=ravendb --ignore-not-found --wait=true
+  # Both StatefulSets use OnDelete, which `rollout status` refuses; wait on the pods instead.
+  wait_ready app=ravendb 3 300
+
+  # The monitor is how anything outside the cluster talks to RavenDB (there is no psql to exec
+  # into), and forming the cluster is such a conversation. It reads the topology off the cluster
+  # to pick its manifest, which is why the StatefulSet has to exist before it is deployed.
+  echo "== Deploying the monitor (the cluster is formed through it) =="
+  ./scripts/monitor.sh deploy
+
+  echo "== Forming the RavenDB cluster and creating the database at replication factor 3 =="
+  _raven raven-cluster form --replication-factor 3
+else
+  $KUBECTL rollout status "deployment/$STORE_LABEL" --timeout=300s
+fi
 
 echo "== Deploying churnsim (3 replicas) on $TAG =="
 $KUBECTL apply -f "$APP_MANIFEST"
-$KUBECTL set image deployment/churnsim churnsim="$TAG"
-$KUBECTL rollout status deployment/churnsim --timeout=300s
+if [ "$TOPOLOGY" = "cluster" ]; then
+  # OnDelete update strategy: setting the image changes nothing running, so the pods are
+  # deleted and come back on the new image. Deleting before they exist is a no-op.
+  $KUBECTL set image statefulset/churnsim churnsim="$TAG"
+  $KUBECTL delete pod -l app=churnsim --ignore-not-found --wait=true
+  wait_ready app=churnsim 3 300
+else
+  $KUBECTL set image deployment/churnsim churnsim="$TAG"
+  $KUBECTL rollout status deployment/churnsim --timeout=300s
+fi
 
 $KUBECTL get pods -o wide
 
-if [ "$BACKEND" = "ravendb" ]; then
+if [ "$BACKEND" = "ravendb" ] && [ "$TOPOLOGY" = "single" ]; then
   echo
   echo "note: the RavenDB arm reads the store through the safetylab pod (there is no psql to"
   echo "      exec into), so measure.sh and the experiment scripts need it deployed:"
   echo "        ./scripts/monitor.sh deploy"
+fi
+
+if [ "$TOPOLOGY" = "cluster" ]; then
+  echo
+  echo "note: the replicated arm is measured by ./scripts/split-brain.sh (just split-brain)."
+  echo "      The monitor is already deployed and reads every member; the churnsim pods are"
+  echo '      pinned churnsim-N -> ravendb-N. `just raven-cluster-status` shows the topology.'
 fi

@@ -59,10 +59,18 @@ public static class Checkers
             RuntimeAgentExclusivity(history, options, residencies),
             AssignedButNotRunning(history, options, residencies),
             RunningButNotAssigned(history, options, residencies),
+            ReplicaAgreement(history, options),
+            NoDocumentConflicts(history),
             Convergence(history, options, residencies),
+            PartitionTook(history),
             Coverage(history)
         ];
     }
+
+    /// <summary>The marks a partition run writes, and P1 reads. Spelled once.</summary>
+    public const string PartitionStartMark = "partition-start";
+
+    public const string PartitionHealMark = "partition-heal";
 
     // ---------------------------------------------------------------- safety
 
@@ -439,6 +447,113 @@ public static class Checkers
         return new CheckResult("S7", "Every running agent is assigned to the node running it", violations, []);
     }
 
+    // ----------------------------------------------------------- replication
+
+    /// <summary>
+    /// Replicated RavenDB only, and the assignment half of E7.
+    ///
+    /// Agent assignments are written with a plain session — a single-member write with
+    /// asynchronous multi-master replication — and GH-4407's claim-if-absent guard is enforced by
+    /// the member serving the request, not across the cluster. So under a partition two members
+    /// can each accept a claim on the same agent and both succeed. From outside, that is two
+    /// members holding different owners for one agent uri, and this reports exactly that: any
+    /// member whose assignment set differs from the primary's for longer than the grace window.
+    /// Replication lag on a healthy cluster is milliseconds, so anything the grace window lets
+    /// through is the store having two answers, not one answer arriving late.
+    /// </summary>
+    private static CheckResult ReplicaAgreement(RunHistory history, CheckOptions options)
+    {
+        if (!history.IsReplicated)
+        {
+            return new CheckResult("S9", "Every store member agrees on assignment ownership", [],
+            [
+                history.IsRavenDb
+                    ? "skipped: single-member RavenDB capture — there is no second copy of the assignment set to disagree"
+                    : "skipped: PostgreSQL is a single node; the assignment table has one copy"
+            ])
+            {
+                Skipped = true
+            };
+        }
+
+        var violations = Condense(history.Good, options.Grace, sample =>
+        {
+            var disagreeing = (sample.Replicas ?? [])
+                .Where(r => r.Error is null && (r.Divergent.Count > 0 || r.Missing.Count > 0))
+                .ToArray();
+
+            if (disagreeing.Length == 0) return null;
+
+            var worst = disagreeing.OrderByDescending(r => r.Divergent.Count + r.Missing.Count).First();
+            var example = worst.Divergent.FirstOrDefault();
+            var shown = example is null
+                ? $"{worst.Missing.Count} agent(s) the primary places that it has no document for"
+                : $"e.g. {example.Id} owned by node {example.NodeId} there";
+
+            return $"{disagreeing.Length} member(s) disagree with the primary view; " +
+                   $"{RunHistory.ShortNode(worst.Url)} differs on {worst.Divergent.Count} row(s) and lacks " +
+                   $"{worst.Missing.Count} ({shown})";
+        });
+
+        var everCompared = history.Good.Any(s => s.Replicas is { Count: > 1 } && s.Replicas.Count(r => r.Error is null) > 1);
+        var notes = new List<string>
+        {
+            $"primary view is {RunHistory.ShortNode(history.ReplicaUrls.FirstOrDefault() ?? "?")}; every other " +
+            "member is compared against it row by row on every tick"
+        };
+
+        if (!everCompared)
+        {
+            notes.Add("no tick ever had two readable members, so nothing here was actually compared — read C0");
+        }
+
+        return new CheckResult("S9", "Every store member agrees on assignment ownership", violations, notes);
+    }
+
+    /// <summary>
+    /// Replicated RavenDB only. A document conflict is the store's own statement that two members
+    /// accepted incompatible writes to one document — for <c>AgentAssignments</c>, two claims on
+    /// one agent. Zero grace, because a conflict that a resolver clears within a tick is still a
+    /// conflict that happened; the 1s sampling is the floor on what this can see, not a reason to
+    /// wait. Read alongside the run's <c>conflicts.tsv</c>, which the partition script takes
+    /// after the heal and which also lists conflicts already resolved.
+    /// </summary>
+    private static CheckResult NoDocumentConflicts(RunHistory history)
+    {
+        if (!history.IsReplicated)
+        {
+            return new CheckResult("S10", "No store member reports document conflicts", [],
+                ["skipped: conflicts need two members accepting writes; this capture had one store endpoint"])
+            {
+                Skipped = true
+            };
+        }
+
+        var violations = Condense(history.Good, TimeSpan.Zero, sample =>
+        {
+            var conflicted = (sample.Replicas ?? []).Where(r => r.Conflicts is > 0).ToArray();
+            if (conflicted.Length == 0) return null;
+
+            return string.Join(", ", conflicted.Select(r =>
+                $"{RunHistory.ShortNode(r.Url)} reports {r.Conflicts} conflicted document(s)"));
+        });
+
+        var everCounted = history.Good.Any(s => (s.Replicas ?? []).Any(r => r.Conflicts is not null));
+        var notes = new List<string>
+        {
+            "neither Wolverine nor this rig configures a conflict resolver, so a conflict that never shows here " +
+            "may have been resolved by RavenDB's default within one tick — the post-heal conflicts.tsv lists " +
+            "resolved-conflict revisions too"
+        };
+
+        if (!everCounted)
+        {
+            notes.Add("no member ever answered with a conflict count, so nothing here was exercised");
+        }
+
+        return new CheckResult("S10", "No store member reports document conflicts", violations, notes);
+    }
+
     // -------------------------------------------------------------- liveness
 
     /// <summary>
@@ -544,6 +659,102 @@ public static class Checkers
         return new CheckResult("L1", "The cluster converges after the last phase marker", violations, notes);
     }
 
+    // -------------------------------------------------------------- nemesis
+
+    /// <summary>
+    /// The fault injector must prove it fired (docs/harness-traps.md). A partition run writes
+    /// <c>partition-start</c> and <c>partition-heal</c> marks; between them at least one member
+    /// must have reported LOSING its Raft leader — that is what a minority member does when it
+    /// can no longer reach a majority, and it is the one thing the store itself says about being
+    /// cut off. A run whose members all saw a leader throughout was not partitioned, whatever the
+    /// firewall rules said, and every finding in it is a finding about an intact cluster.
+    ///
+    /// Skipped, not passed, when the marks are absent: a rollout capture has no partition to
+    /// prove.
+    /// </summary>
+    private static CheckResult PartitionTook(RunHistory history)
+    {
+        var start = history.Marks.FirstOrDefault(m => m.Label == PartitionStartMark);
+        var heal = history.Marks.LastOrDefault(m => m.Label == PartitionHealMark);
+
+        if (start is null)
+        {
+            return new CheckResult("P1", "The partition took: a member lost its Raft leader while cut off", [],
+                [$"skipped: no '{PartitionStartMark}' mark — this run injected no partition"])
+            {
+                Skipped = true
+            };
+        }
+
+        if (!history.IsReplicated)
+        {
+            return new CheckResult("P1", "The partition took: a member lost its Raft leader while cut off",
+            [
+                new Violation(start.Ts, heal?.Ts ?? start.Ts,
+                    "a partition mark is present but the capture read a single store endpoint, so no member's " +
+                    "view of the cut was recorded at all")
+            ], []);
+        }
+
+        var end = heal?.Ts ?? history.Good.LastOrDefault()?.Ts ?? start.Ts;
+        var window = history.Good.Where(s => s.Ts >= start.Ts && s.Ts <= end).ToArray();
+        var notes = new List<string>();
+
+        if (heal is null)
+        {
+            notes.Add($"no '{PartitionHealMark}' mark — the window runs to the end of the capture");
+        }
+
+        // Per member: how long it reported no Raft leader inside the window.
+        var leaderless = new Dictionary<string, int>();
+        var unreadable = new Dictionary<string, int>();
+
+        foreach (var sample in window)
+        {
+            foreach (var replica in sample.Replicas ?? [])
+            {
+                var name = RunHistory.ShortNode(replica.Url);
+                if (replica.Error is not null)
+                {
+                    unreadable[name] = unreadable.GetValueOrDefault(name) + 1;
+                    continue;
+                }
+
+                if (string.IsNullOrEmpty(replica.RaftLeader))
+                {
+                    leaderless[name] = leaderless.GetValueOrDefault(name) + 1;
+                }
+            }
+        }
+
+        var tick = history.Meta is { TickMs: > 0 } meta ? meta.TickMs / 1000.0 : 1.0;
+
+        foreach (var (name, ticks) in leaderless.OrderBy(x => x.Key))
+        {
+            notes.Add($"{name} reported no Raft leader for ~{ticks * tick:F0}s of the {(end - start.Ts).TotalSeconds:F0}s window");
+        }
+
+        foreach (var (name, ticks) in unreadable.OrderBy(x => x.Key))
+        {
+            notes.Add($"{name} was unreadable by the monitor for ~{ticks * tick:F0}s of the window — the monitor " +
+                      "is meant to sit on neither side of the cut; if this is the isolated member, the rig cut " +
+                      "the observer too");
+        }
+
+        var violations = new List<Violation>();
+        if (leaderless.Count == 0)
+        {
+            violations.Add(new Violation(start.Ts, end,
+                window.Length == 0
+                    ? "no samples fall inside the partition window, so the cut was not observed at all"
+                    : "no member ever reported losing its Raft leader during the partition window — the cut " +
+                      "did not take, and this run measured an intact cluster"));
+        }
+
+        return new CheckResult("P1", "The partition took: a member lost its Raft leader while cut off",
+            violations, notes);
+    }
+
     // -------------------------------------------------------------- coverage
 
     /// <summary>
@@ -630,6 +841,30 @@ public static class Checkers
                           ? " — RavenDB has no now(), so this comes from the HTTP Date response header and is " +
                             "only accurate to a second; do not read sub-second figures from it"
                           : ""));
+        }
+
+        // A member the monitor could not read is a hole in that member's column of the history,
+        // and S9/S10/P1 are silent about what they could not see. The observer is meant to sit
+        // on neither side of a partition, so on a partition run this is the rig, not the store.
+        if (history.IsReplicated)
+        {
+            notes.Add($"replicated capture: {history.ReplicaUrls.Count} member(s) read every tick, primary " +
+                      $"{RunHistory.ShortNode(history.ReplicaUrls.FirstOrDefault() ?? "?")}");
+
+            var memberFailures = history.Good
+                .SelectMany(s => s.Replicas ?? [])
+                .Where(r => r.Error is not null)
+                .GroupBy(r => RunHistory.ShortNode(r.Url))
+                .ToArray();
+
+            if (memberFailures.Length > 0)
+            {
+                var failed = history.Good.Where(s => (s.Replicas ?? []).Any(r => r.Error is not null)).ToArray();
+                violations.Add(new Violation(failed[0].Ts, failed[^1].Ts,
+                    $"member read failures: " + string.Join(", ", memberFailures.Select(g =>
+                        $"{g.Key} ×{g.Count()} (first: {g.First().Error})")) +
+                    " — S9/S10/P1 are blind to that member for those ticks"));
+            }
         }
 
         notes.Add($"{history.Identities.Count} node identity record(s), " +

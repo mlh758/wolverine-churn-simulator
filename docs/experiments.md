@@ -165,7 +165,7 @@ makes it a good lock and a bad liveness signal. Wolverine uses it as both. Two t
    were assigned to a dead node and running nowhere. An operator watching the assignment documents,
    or Wolverine watching itself, would have seen a healthy fully-placed cluster for five minutes.
 
-**Layer 1c — the partition. Not built, and the most interesting thing left.**
+**Layer 1c — the partition. Built and run once (2026-09-18); see E7 and RESULTS.md. The prediction below did not hold — the isolated leader wrote nothing — and the duplicates came from the majority instead.**
 Everything above is a SINGLE-node RavenDB, so none of RavenDB's replication semantics were
 exercised. Reading the store's source, Wolverine's writes fall into three consistency classes:
 
@@ -188,6 +188,7 @@ coherent leader — the same fingerprint the sweep fixes, arriving by a route th
 because the sweep reconciles a node against *its own* assignment documents and those are exactly
 what diverge. Needs a 3-node RavenDB StatefulSet at replication factor 3 and a partition between
 RavenDB nodes. Untested; stated here so it is falsifiable rather than assumed.
+The experiment that tests it, and the leader-election half of the same question, is E7.
 
 **Layer 2 — pod-level faults in minikube. Not built.**
 Only for what Layer 1 cannot fake: SIGSTOP a whole pod, `tc netem` partition pod↔Postgres
@@ -321,6 +322,100 @@ have separated the arms anyway.
 - **Status:** run against the proposal build. Stock thrashes (655 rows in 5 min, never converges);
   capacity-aware holds (2 rows in 7 min) and recovers on scale-out. See RESULTS.md 2026-09-04.
 
+### E7 — split brain on a RavenDB cluster (`scripts/split-brain.sh`) — **run twice, 2026-09-18/19**
+
+- **Question:** during a network partition between RavenDB nodes, what do leader election and
+  agent assignment actually do? Two halves, because the store treats them differently:
+  1. **Leadership.** The lock is compare-exchange, so the *server* cannot hand it to two owners —
+     the minority side simply cannot write it. But `HasLeadershipLock()` never asks the server.
+     A leader whose RavenDB node lands in the minority keeps believing it leads, on a local field,
+     for up to the five-minute expiry, while the majority side is free to take the lock over once
+     it lapses. The question is how long two nodes *believe* they lead at once, what each of them
+     dispatches while it does, and how quickly the stale one notices when the partition heals.
+  2. **Assignments.** Plain sessions, single-node writes, async replication. Two leaders — or one
+     leader and one stale believer — writing claim-if-absent assignments to different RavenDB
+     nodes should both succeed, and the collision should surface after the heal as a document
+     conflict rather than a refused write. That is the Layer 1c prediction: duplicate agents by a
+     route the reconcile sweep cannot see.
+- **Method:** `just deploy-ravendb-cluster`, then `just split-brain [hold] [settle]`. A 3-member
+  RavenDB StatefulSet at replication factor 3 (`k8s/ravendb-cluster.yaml`), ChurnSim as a
+  StatefulSet with `churnsim-N` pinned to `ravendb-N` (`k8s/churnsim-ravendb-cluster.yaml`), and a
+  partition that isolates one member *together with its ChurnSim pod* from the other two. Pinning
+  is `RAVENDB_PIN_NODE=true`, which sets `DisableTopologyUpdates` on the RavenDB client: otherwise
+  it fetches the group topology and fails over to any reachable member, cutting only the
+  store-to-store links makes every Wolverine node quietly reroute to the majority, and there is no
+  split to observe — the run measures client failover instead. The script settles the cluster,
+  reads the leader, hands leadership off gracefully while it sits on `ravendb-0` (the monitor's
+  primary view has to stay on the majority side), and then the leader's member is the minority:
+  no need to kill anything to get the leader onto the isolated side, because the side is chosen
+  around the leader. Default hold is 420 s, past the 300 s lock expiry so the majority gets to
+  take the lock over while the old leader still believes; a hold under 300 s is the other arm
+  and worth running too, because the two halves above predict different behaviour on either
+  side of that line.
+- **The cut:** `safetylab partition arm|heal|status`. `DROP` rules in the minikube node's `FORWARD`
+  chain, keyed on pod IPs, both directions of every cross pair — minikube's `ptp` CNI forwards
+  pod-to-pod traffic through the host kernel, so this cuts exactly the named pairs and touches no
+  pod. Each rule carries a comment so `heal` deletes exactly what `arm` added and none of
+  kube-proxy's rules in the same chain; `arm` reads the rules back and refuses a partial arm;
+  `heal` runs from a trap and refuses to report success while any rule remains; a run refuses to
+  start over a cut a previous run left behind. Verified live 2026-09-18 with a TCP probe from the
+  isolated member: reachable, unreachable while armed, reachable after the heal.
+- **Instrument:** the monitor samples *every* member, not the Service (`k8s/safetylab-ravendb-
+  cluster.yaml`), because during a partition the answer differs by member and the whole finding is
+  in that difference. Every sample carries the primary's view in the usual fields plus a
+  `ReplicaView` per member: its Raft view (`/cluster/topology`), its `CountOfConflicts`, and the
+  assignment rows on which it disagrees with the primary, stored as a diff rather than a second
+  copy. Compare-exchange rows are tagged with their source member, so S1 is a check *across*
+  members — agreeing members collapse to one holder, disagreeing ones are two. Three checkers
+  exist for this arm alone: **S9** (a member holding assignments the primary does not, past the
+  grace window), **S10** (any member's conflict count above zero, zero grace), and **P1** (the
+  nemesis must prove it fired: between the `partition-start` and `partition-heal` marks at least
+  one member must have reported losing its Raft leader). The pod logs carry the belief side —
+  `LeadershipAssumed` and every `AGENT-START`/`AGENT-STOP` — so `safetylab overlaps` gives the
+  duplicate timeline exactly as in E5, and `safetylab query conflicts` reads RavenDB's current
+  conflicts *and* its resolved-conflict revisions after the heal, because neither Wolverine nor
+  this rig sets a conflict-resolution policy and whatever the default does is part of the result.
+  The mutant ledger has four fixtures for this: a healthy three-member read (one leader, S9/S10
+  quiet), the predicted split (S1 + S9), a post-heal conflict (S10), and a partition that never
+  took (P1).
+- **Finding:** two nodes logging leadership and dispatching agent commands over the same interval;
+  assignment documents in conflict after the heal, or silently resolved to one side while the
+  other side's agents keep running; the stale believer surviving past the heal by more than a
+  health-check period. A minority-side leader that stops dispatching within a tick of losing the
+  store, and a heal that leaves zero conflicts and zero duplicates, would be a real negative
+  result — say so if it happens.
+- **Artifact:** a monitor or a ChurnSim pod on the wrong side of the cut. The rig's own partition
+  is the first suspect for any "nobody led for N minutes" reading; record which side each pod and
+  the monitor were on, in the run directory, before reading the checkers.
+- **Artifact:** client failover masquerading as a split (see Method). If every node's log shows
+  the same store URL throughout, the partition did not hold on the client side.
+- **Caveat:** everything measured so far on the RavenDB arm is single-node, so none of the
+  replication behaviour this depends on has been exercised even once. Expect the first runs to
+  be about the rig — StatefulSet bootstrap, database creation racing across three nodes
+  ([harness-traps.md](harness-traps.md) already records the single-node version of that race).
+- **Two cuts, one knob.** `CUT=zone` (default) isolates the leader's store member *and* the
+  leader's pod — a zone-level partition, which no client can route around; it needs
+  `RAVENDB_PIN_NODE=true` so that "the leader's member" is a fact and the stranded pod is the
+  leader by construction. `CUT=store` isolates only the member the default client prefers (the
+  first node of the database group's topology, which every un-pinned client is on) and leaves the
+  pods alone — a store-tier partition, which asks what the default client does. Each verifies the
+  pin from the pods' own CONFIG lines before doing anything.
+- **Status: run once per cut (RESULTS.md, 2026-09-18 and -19).** *Zone cut:* the prediction's
+  assignment half did not hold — the isolated leader's every lock renewal and health-check pass
+  failed and it **wrote nothing**, stepping down on its own local expiry at t+300, one second
+  after the majority took the lock. Belief split ~1 s; store-level split (S1, the minority member
+  serving the expired key) 126 s. The duplicates came from the **majority**, which treated the
+  isolated live node as dead at takeover and re-placed its 166 agents onto nodes that ran them
+  alongside it for 126 s, plus a second 55 s window after the heal while the leader flip-flopped
+  on whether the node was live. 0 persisted. *Store cut, default client:* the leader failed over
+  in 16 s inside one renewal cycle, logged no error, and **nothing happened** — no agent event,
+  no split, convergence 0.7 s after the heal. So the RavenDB-specific issue is the five-minute
+  expiry, and its cost under a zone partition is a live node whose agents the majority re-places
+  and cannot tell to stop. Both runs left an identical, unexplained storm of resolved-conflict
+  revisions on the three node-registration documents for 5 min 12 s after the heal (308 per
+  document), with no agent-side effect. **Next:** the sub-300 s zone hold, a repeat of the zone
+  cut for the post-heal flip-flop, and a look at the heartbeat conflict storm.
+
 ## What would change our minds
 
 - **On thread A:** a duplicate rate of zero across 16+ clean iterations would mean the single
@@ -329,6 +424,16 @@ have separated the arms anyway.
 - **On thread B:** S1–S4 continuing to pass through Layer 1's fault injection would be a genuine
   positive result about the advisory-lock design, worth saying out loud. The absence of findings
   under *rolling deploys alone* is not that result and should not be reported as one.
+- **On the RavenDB partition (E7):** a stale leader that stops dispatching as soon as its store
+  is unreachable, and assignments that never conflict after a heal, would mean the consistency
+  classes in Layer 1c are not the failure they read as — either the client is doing more than
+  the source suggests or the sweep catches it after all. That would be worth as much as the
+  prediction coming true. *Run 1 landed here on the assignment half:* the isolated leader wrote
+  nothing and no assignment document ever conflicted. What it did not do is make the partition
+  safe — the majority duplicated the isolated node's agents for three minutes across two windows.
+  The mind-changing result now would be a repeat where the majority's takeover does **not**
+  re-place a live-but-unreachable node's agents, or a sub-300 s hold that produces no duplicate
+  at all.
 
 ## Standing rules for this rig
 

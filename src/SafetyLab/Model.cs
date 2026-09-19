@@ -30,8 +30,9 @@ public static class Backends
 ///
 /// <paramref name="Backend"/> and <paramref name="LockKey"/> were added with the RavenDB arm and
 /// default to null so that every run directory captured before them still loads and still checks:
-/// a history with no backend is a PostgreSQL history, which is what all of them were. Schema
-/// version 2.
+/// a history with no backend is a PostgreSQL history, which is what all of them were.
+/// <paramref name="Replicas"/> (schema version 3) lists every RavenDB member url the monitor
+/// read; null means a single store endpoint, which is every capture before the replicated arm.
 /// </summary>
 public record MetaRecord(
     DateTimeOffset StartedUtc,
@@ -40,10 +41,11 @@ public record MetaRecord(
     string Schema,
     string ServerVersion,
     string? Backend = null,
-    string? LockKey = null)
+    string? LockKey = null,
+    IReadOnlyList<string>? Replicas = null)
 {
     public string Kind => "meta";
-    public int SchemaVersion => 2;
+    public int SchemaVersion => 3;
 
     public string BackendName => string.IsNullOrWhiteSpace(Backend) ? Backends.Postgres : Backend;
 }
@@ -82,12 +84,57 @@ public record LockRow(
 /// <c>wolverine/scheduled</c>. Both forms are captured deliberately: leadership split across the
 /// two spellings would be invisible if the monitor watched only one, and it is exactly the shape
 /// of bug the Postgres S1 sentinel was written to catch.
+///
+/// <paramref name="Node"/> names the RavenDB server this row was read FROM, and is null on a
+/// single-node capture. On a replicated store the same key is read from every member on every
+/// tick, and the whole point of doing so is that under a network partition the members disagree:
+/// a minority node keeps serving the last value it committed while the majority moves on. Two
+/// rows with the same key and different owners, each tagged with its source, is what a split
+/// looks like from outside. <c>RunHistory.LeaderHolders</c> collapses agreeing replicas into one
+/// holder so a healthy three-node read is one leader, not three.
 /// </summary>
 public record CompareExchangeRow(
     string Key,
     Guid? NodeId,
     DateTimeOffset? ExpiresAt,
-    long Index);
+    long Index,
+    string? Node = null);
+
+/// <summary>
+/// One RavenDB cluster member's view of the store on one tick, for the replicated arm (E7).
+///
+/// The sample's top-level <c>Nodes</c> and <c>Assignments</c> come from the FIRST configured url
+/// (the primary view) exactly as on a single-node capture, so every existing checker runs
+/// unchanged. What a replica view adds is the difference: <paramref name="Divergent"/> lists the
+/// assignment rows this member holds with a different owner than the primary (or that the
+/// primary lacks), and <paramref name="Missing"/> the agent uris the primary places that this
+/// member has no document for. Both are empty on a healthy cluster within replication lag, which
+/// is milliseconds; either staying non-empty is S9. Assignments are plain single-node writes with
+/// asynchronous multi-master replication, so a partition is exactly where this diverges — and it
+/// is stored as a diff rather than a second copy because 500 assignment rows per member per second
+/// would triple the history for no information.
+///
+/// <paramref name="RaftLeader"/> and <paramref name="RaftState"/> are the member's own view of the
+/// Raft cluster (<c>/cluster/topology</c>): a partitioned minority member reports no leader and a
+/// Candidate/Follower state, which is how P1 proves the partition actually took rather than
+/// assuming it did. <paramref name="Conflicts"/> is the database's <c>CountOfConflicts</c>: two
+/// members accepting different writes to the same document produce one the moment they
+/// re-replicate, unless a resolver silently picks a winner first. S10 reads it.
+///
+/// <paramref name="Error"/> is set and the rest left empty when this member could not be read.
+/// That is coverage (the monitor's problem), not divergence (the store's), and C0 reports it.
+/// </summary>
+public record ReplicaView(
+    string Url,
+    string? NodeTag,
+    string? RaftLeader,
+    string? RaftState,
+    long? Conflicts,
+    int NodeCount,
+    int AssignmentCount,
+    IReadOnlyList<AssignmentRow> Divergent,
+    IReadOnlyList<string> Missing,
+    string? Error = null);
 
 public record NodeRow(Guid Id, int NodeNumber, DateTimeOffset HealthCheck, string Description);
 
@@ -107,6 +154,10 @@ public record AssignmentRow(string Id, Guid NodeId, DateTimeOffset Started);
 /// — a RavenDB query whose result set hit the monitor's page limit, or one the server reported as
 /// served from a stale index. Neither is an <paramref name="Error"/> (there is real data here) and
 /// neither may be silent (the data may be short). The coverage check reports them.
+///
+/// <paramref name="Replicas"/> is present only on a replicated RavenDB capture: one
+/// <see cref="ReplicaView"/> per cluster member, including the primary. Null on every earlier
+/// history, which loads and checks exactly as before.
 /// </summary>
 public record Sample(
     long Seq,
@@ -118,7 +169,8 @@ public record Sample(
     IReadOnlyList<AssignmentRow> Assignments,
     string? Error = null,
     IReadOnlyList<CompareExchangeRow>? Cmpxchg = null,
-    IReadOnlyList<string>? Warnings = null)
+    IReadOnlyList<string>? Warnings = null,
+    IReadOnlyList<ReplicaView>? Replicas = null)
 {
     public string Kind => "sample";
 }

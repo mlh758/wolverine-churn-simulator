@@ -1,0 +1,95 @@
+# ChurnSim for the replicated RavenDB store (E7). Diff this against k8s/churnsim-ravendb.yaml:
+# the pod template is meant to be identical except for the three things named below, and if it
+# is not, a partition finding is confounded with a configuration difference.
+#
+# 1. A StatefulSet, not a Deployment. Each pod is PINNED to one store member by ordinal —
+#    churnsim-N talks to ravendb-N and only ravendb-N — and a Deployment's pods have no ordinal.
+#    Every script that says `deployment/churnsim` reads the workload through backend.sh's
+#    sim_workload on this arm.
+# 2. RAVENDB_URLS is that one member, and RAVENDB_PIN_NODE=true stops the client learning the
+#    others. Without the pin the RavenDB client fetches the group topology and fails over to any
+#    member it can reach, so cutting a pod's member off would make it quietly reroute to the
+#    majority — no minority side, no split, and the run measures client failover instead.
+# 3. RAVENDB_REPLICATION_FACTOR=3, so a `reset-schema` on this arm recreates the database across
+#    the cluster and not on one member.
+#
+# Both sides of a partition are STILL running: a pod on the minority side can reach its own store
+# member throughout. That is the experiment — what does a node do when its store accepts its
+# writes but cannot commit to Raft.
+apiVersion: v1
+kind: Service
+metadata:
+  name: churnsim
+spec:
+  # A StatefulSet needs a governing Service. Nothing dials it.
+  clusterIP: None
+  selector:
+    app: churnsim
+  ports:
+    - name: placeholder
+      port: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: churnsim
+spec:
+  serviceName: churnsim
+  replicas: 3
+  podManagementPolicy: Parallel
+  # OnDelete: the partition script never rolls this workload, and an automatic rolling update
+  # would replace a pod — and its IP, and so its side of the cut — under a running partition.
+  # deploy.sh sets the image and deletes the pods explicitly.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: churnsim
+  template:
+    metadata:
+      labels:
+        app: churnsim
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: churnsim
+          image: localhost/churnsim:local
+          imagePullPolicy: Never
+          env:
+            - name: SIM_BACKEND
+              value: "ravendb"
+            # The ordinal, from the label the StatefulSet controller stamps on every pod.
+            - name: POD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: RAVENDB_URLS
+              value: "http://ravendb-$(POD_INDEX).ravendb.default.svc.cluster.local:8080"
+            - name: RAVENDB_PIN_NODE
+              value: "true"
+            - name: RAVENDB_REPLICATION_FACTOR
+              value: "3"
+            - name: RAVENDB_DATABASE
+              value: "churnsim"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SIM_AGENT_COUNT
+              value: "500"
+            - name: SIM_AGENT_MB
+              value: "0"
+            - name: SIM_START_DELAY_MS
+              value: "500"
+            - name: ROLLOUT_STAMP
+              value: "initial"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

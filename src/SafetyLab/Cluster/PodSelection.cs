@@ -3,7 +3,12 @@ using System.Text.Json;
 namespace SafetyLab.Cluster;
 
 /// <summary>One pod, as much of it as any decision here needs.</summary>
-public sealed record PodInfo(string Name, string Phase, bool Ready, bool Terminating, int RestartCount)
+/// <param name="Ip">
+/// <c>status.podIP</c>, or empty before the network is attached. The partition injector keys its
+/// firewall rules on this, and refuses a pod without one rather than writing a rule that matches
+/// nothing.
+/// </param>
+public sealed record PodInfo(string Name, string Phase, bool Ready, bool Terminating, int RestartCount, string Ip = "")
 {
     /// <summary>
     /// Live means Running, Ready, and NOT terminating — all three, because each one alone has
@@ -76,7 +81,11 @@ public static class PodSelection
                     : 0);
             }
 
-            pods.Add(new PodInfo(name, phase, ready, terminating, restarts));
+            var ip = status.ValueKind == JsonValueKind.Object && status.TryGetProperty("podIP", out var addr)
+                ? addr.GetString() ?? ""
+                : "";
+
+            pods.Add(new PodInfo(name, phase, ready, terminating, restarts, ip));
         }
 
         return pods;
