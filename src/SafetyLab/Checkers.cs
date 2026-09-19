@@ -63,6 +63,9 @@ public static class Checkers
             NoDocumentConflicts(history),
             Convergence(history, options, residencies),
             PartitionTook(history),
+            LockHolderIsAlive(history, options),
+            LockKillTook(history),
+            DbCutTook(history),
             Coverage(history)
         ];
     }
@@ -71,6 +74,27 @@ public static class Checkers
     public const string PartitionStartMark = "partition-start";
 
     public const string PartitionHealMark = "partition-heal";
+
+    /// <summary>
+    /// The marks a lock-session run writes, and K1 reads. One per ARM, because the two arms
+    /// expect opposite outcomes: terminate takes the lock away, cancel proves an interrupted
+    /// connection does not. A single mark made K1 fail every correct control run and say "the
+    /// session was never terminated" about a run that never tried to terminate one.
+    /// </summary>
+    public const string LockKillMark = "lock-kill";
+
+    public const string LockCancelMark = "lock-cancel";
+
+    /// <summary>
+    /// The marks an app-to-store partition run writes (E9), and K2 reads. Deliberately NOT
+    /// <see cref="PartitionStartMark"/>: that one means "a cut between RavenDB cluster members",
+    /// which P1 proves by a member losing its Raft leader. Cutting an app node from its database
+    /// is a structurally different fault with different evidence — there are no Raft members to
+    /// ask — and sharing one label would put P1 red on every correct run of it.
+    /// </summary>
+    public const string DbCutStartMark = "db-cut-start";
+
+    public const string DbCutHealMark = "db-cut-heal";
 
     // ---------------------------------------------------------------- safety
 
@@ -659,6 +683,83 @@ public static class Checkers
         return new CheckResult("L1", "The cluster converges after the last phase marker", violations, notes);
     }
 
+    /// <summary>
+    /// The leadership lock is held by a node that is still HEARTBEATING.
+    ///
+    /// <see cref="OrphanedLeaderLock"/> (S4) catches a lock held by a node that has left the
+    /// registry. This catches the case that one cannot: a node that is still registered, still
+    /// listed, still owns the leader row — and has stopped writing to the database at all.
+    ///
+    /// That is what an app-to-store partition does on PostgreSQL, and it is worth a check of its
+    /// own precisely because nothing else in the store shows it. The session holding the advisory
+    /// lock stays alive on the server (it is the client that cannot reach it), so the lock is
+    /// still held and no peer can take it. The assignment table is frozen mid-health, which reads
+    /// as fully placed. The node that would eject a stale registration is the leader, and the
+    /// leader is the one that is cut off. So every other check here passes over a cluster that has
+    /// stopped making progress — the same "nothing in the store shows it" shape the RavenDB
+    /// five-minute stall had, arriving by a different route.
+    ///
+    /// Grace-windowed like the rest: ChurnSim heartbeats every 2 s, so a tick or two of an
+    /// unchanged <c>health_check</c> is sampling, not silence.
+    /// </summary>
+    private static CheckResult LockHolderIsAlive(RunHistory history, CheckOptions options)
+    {
+        const string title = "The leader lock is not held by a node that stopped heartbeating";
+
+        if (history.IsRavenDb)
+        {
+            return new CheckResult("S11", title, [],
+            [
+                "skipped: RavenDB's leadership lock is a document that names its owner and carries an " +
+                "expiry, so a holder that stopped writing is S8's stall rather than this"
+            ])
+            { Skipped = true };
+        }
+
+        // Last time each node's health_check was observed to CHANGE. A value that never moves is
+        // the signal; the absolute value is a database clock and the sample's is the monitor's,
+        // so the two are never compared to each other (docs/harness-traps.md, two clocks).
+        var lastChange = new Dictionary<Guid, DateTimeOffset>();
+        var lastSeen = new Dictionary<Guid, DateTimeOffset>();
+
+        var violations = Condense(history.Good, options.Grace, sample =>
+        {
+            foreach (var node in sample.Nodes)
+            {
+                if (!lastSeen.TryGetValue(node.Id, out var previous) || previous != node.HealthCheck)
+                {
+                    lastChange[node.Id] = sample.Ts;
+                }
+
+                lastSeen[node.Id] = node.HealthCheck;
+            }
+
+            var holder = history.LeaderHolders(sample).FirstOrDefault();
+            if (holder?.NodeId is not { } nodeId) return null;
+
+            // A holder that is no longer registered is S4's, not this one.
+            if (sample.Nodes.All(x => x.Id != nodeId)) return null;
+            if (!lastChange.TryGetValue(nodeId, out var changed)) return null;
+
+            var silent = sample.Ts - changed;
+            return silent >= options.Grace
+                ? $"node {nodeId} ({holder.Where}) holds {history.LeaderLockDescription} but its health_check " +
+                  $"has not moved for {silent.TotalSeconds:F0}s — it is still registered, so nothing will eject " +
+                  "it, and its session still holds the lock, so no peer can take it"
+                : null;
+        });
+
+        var everHeld = history.Good.Any(s => history.LeaderHolders(s).Any(x => x.NodeId is not null));
+        var notes = new List<string>();
+        if (!everHeld)
+        {
+            notes.Add("no attributable lock holder was observed in this run, so this check had nothing to " +
+                      "examine — on PostgreSQL attribution needs the identity records in pods.jsonl");
+        }
+
+        return new CheckResult("S11", title, violations, notes);
+    }
+
     // -------------------------------------------------------------- nemesis
 
     /// <summary>
@@ -753,6 +854,281 @@ public static class Checkers
 
         return new CheckResult("P1", "The partition took: a member lost its Raft leader while cut off",
             violations, notes);
+    }
+
+    /// <summary>
+    /// The other nemesis that must prove it fired — E8's lock-session kill, and the PostgreSQL
+    /// counterpart of <see cref="PartitionTook"/>.
+    ///
+    /// The fault is <c>pg_terminate_backend</c> on the backend holding the leadership advisory
+    /// lock: the session dies, and because a session-level advisory lock has no expiry and no
+    /// owner column, its death <em>is</em> the release. The node is told nothing, which is the
+    /// whole point. But the statement returning true proves only that a signal was delivered, and
+    /// there are several ways for the run to be measuring an undisturbed cluster anyway — the
+    /// resolved pid belonged to some other connection, the monitor was watching the wrong lock id
+    /// (the id is <c>schemaName.GetDeterministicHashCode()</c>, and watching 9999999 finds
+    /// nothing on every tick), or the capture started after the kill. In all of them every other
+    /// check in this run passes over a cluster that never lost its lock.
+    ///
+    /// So the assertion is made against the capture rather than the injector: a backend was
+    /// observed holding the lock before the mark, and that same pid is not still holding it
+    /// afterwards. A new pid is a fired fault too — the leader reconnecting is a new session, and
+    /// what the experiment measures is what the cluster did in between.
+    ///
+    /// Skipped, not passed, when the mark is absent: a rollout capture has no lock kill to prove.
+    /// </summary>
+    private static CheckResult LockKillTook(RunHistory history)
+    {
+        var title = "The lock-session kill took: the advisory lock left the backend holding it";
+
+        var mark = history.Marks.FirstOrDefault(m => m.Label is LockKillMark or LockCancelMark);
+        if (mark is null)
+        {
+            return new CheckResult("K1", title, [],
+                [$"skipped: no '{LockKillMark}' or '{LockCancelMark}' mark — this run signalled no lock session"])
+            {
+                Skipped = true
+            };
+        }
+
+        // The cancel arm's whole claim is the opposite one, so it is a different assertion rather
+        // than the same one with the sign flipped in prose.
+        var cancelled = mark.Label == LockCancelMark;
+        if (cancelled) title = "The cancelled connection kept its lock: an interrupted statement is not a lost lock";
+
+        if (history.IsRavenDb)
+        {
+            return new CheckResult("K1", title,
+            [
+                new Violation(mark.Ts, mark.Ts,
+                    "a lock-kill mark is present on a RavenDB capture. RavenDB's leadership lock is a " +
+                    "compare-exchange document with an expiry and no session to terminate, so whatever this " +
+                    "run injected, it was not this fault — see S8 for the RavenDB shape")
+            ], []);
+        }
+
+        var samples = history.Good.ToArray();
+        var before = samples.LastOrDefault(s => s.Ts <= mark.Ts && history.LeaderLockHolders(s).Any());
+
+        if (before is null)
+        {
+            return new CheckResult("K1", title,
+            [
+                new Violation(samples.FirstOrDefault()?.Ts ?? mark.Ts, mark.Ts,
+                    $"no sample before the signal observed {history.LeaderLockDescription} held at all, so there " +
+                    "is nothing to show it was taken away. Either the capture started after the kill, or the " +
+                    "monitor is watching the wrong lock id — in which case every leader check in this run is " +
+                    "vacuous, and S1's sentinel note says the same thing")
+            ], []);
+        }
+
+        var victim = history.LeaderLockHolders(before).First().Pid;
+        var after = samples.Where(s => s.Ts > mark.Ts).ToArray();
+
+        if (after.Length == 0)
+        {
+            return new CheckResult("K1", title,
+            [
+                new Violation(mark.Ts, mark.Ts,
+                    $"pid {victim} held {history.LeaderLockDescription} at the signal and the capture ends there — " +
+                    "nothing was observed afterwards, so the run says nothing about what the fault did")
+            ], []);
+        }
+
+        var notes = new List<string>();
+        var released = after.FirstOrDefault(s => history.LeaderLockHolders(s).All(x => x.Pid != victim));
+
+        // ---- the cancel arm: the lock is supposed to stay exactly where it was.
+        if (cancelled)
+        {
+            if (released is null)
+            {
+                notes.Add($"pid {victim} kept {history.LeaderLockDescription} for the whole " +
+                          $"{(after[^1].Ts - mark.Ts).TotalSeconds:F0}s after its statement was cancelled — the " +
+                          "control arm behaved as designed, so a lock that DID move in the terminate arm moved " +
+                          "because the session died and not because the connection was disturbed");
+                return new CheckResult("K1", title, [], notes);
+            }
+
+            return new CheckResult("K1", title,
+            [
+                new Violation(mark.Ts, released.Ts,
+                    $"pid {victim} lost {history.LeaderLockDescription} " +
+                    $"{(released.Ts - mark.Ts).TotalSeconds:F1}s after its statement was cancelled. The SERVER " +
+                    "keeps the session and its lock through a cancellation, so something on the client side " +
+                    "dropped the connection in response — that is a finding about the node, and it also means " +
+                    "this run is not the control arm it was filed as")
+            ], notes);
+        }
+
+        // ---- the terminate arm: the lock must have left the backend that held it.
+        if (released is null)
+        {
+            return new CheckResult("K1", title,
+            [
+                new Violation(mark.Ts, after[^1].Ts,
+                    $"pid {victim} still holds {history.LeaderLockDescription} for the whole {(after[^1].Ts - mark.Ts).TotalSeconds:F0}s " +
+                    "after the kill. The session was never terminated, so this run measured an undisturbed cluster")
+            ], notes);
+        }
+
+        notes.Add($"pid {victim} lost {history.LeaderLockDescription} {(released.Ts - mark.Ts).TotalSeconds:F1}s " +
+                  "after the mark");
+
+        // How long nothing held it, and who has it now. Both are the measurement rather than the
+        // check: on PostgreSQL the lock is free the instant the session dies, so this window is
+        // the cluster's own detect-and-reacquire time and not a property of the store.
+        var reclaimed = after.FirstOrDefault(s => s.Ts >= released.Ts && history.LeaderLockHolders(s).Any());
+
+        if (reclaimed is null)
+        {
+            notes.Add($"NOBODY took the lock for the remaining {(after[^1].Ts - released.Ts).TotalSeconds:F0}s of " +
+                      "the capture — the cluster was left leaderless by a single terminated connection, which is " +
+                      "the finding this experiment is for. Read it with S3 (does the leader row still name the " +
+                      "old node?) and L1 (did it ever converge?)");
+        }
+        else
+        {
+            var holder = history.LeaderLockHolders(reclaimed).First();
+            var who = history.NodeForAddress(holder.ClientAddr, reclaimed.Ts) is { } node
+                ? $"node {node}" + (history.PodForNode(node) is { } pod ? $" ({pod})" : "")
+                : "a backend the identity map cannot place";
+
+            notes.Add($"the lock was unheld for {(reclaimed.Ts - released.Ts).TotalSeconds:F1}s, then taken by " +
+                      $"pid {holder.Pid} = {who}");
+        }
+
+        return new CheckResult("K1", title, [], notes);
+    }
+
+    /// <summary>
+    /// E9's nemesis proving it fired: an app-to-store partition, PostgreSQL.
+    ///
+    /// P1 cannot answer this. Its evidence is a RavenDB member reporting the loss of its Raft
+    /// leader, and there is no Raft here — the fault is a firewall rule between one application
+    /// pod and the database. The database-side evidence is different and better: a node that
+    /// cannot reach the store stops writing its heartbeat, so its <c>health_check</c> stops
+    /// advancing while every peer's keeps moving. That is visible from outside with no cooperation
+    /// from the cut-off node, which is the whole point of watching from the store.
+    ///
+    /// What this does NOT assert is that the cut-off node kept the lock — that is the measurement
+    /// (and S11's violation), not the proof, and folding it in here would put K2 red on a
+    /// successful experiment. K2 answers one question: did any node actually lose the database?
+    /// </summary>
+    private static CheckResult DbCutTook(RunHistory history)
+    {
+        const string title = "The app-to-store cut took: a node stopped heartbeating while it was cut off";
+
+        var start = history.Marks.FirstOrDefault(m => m.Label == DbCutStartMark);
+        if (start is null)
+        {
+            return new CheckResult("K2", title, [],
+                [$"skipped: no '{DbCutStartMark}' mark — this run cut nothing off from the store"])
+            {
+                Skipped = true
+            };
+        }
+
+        if (history.IsRavenDb)
+        {
+            return new CheckResult("K2", title,
+            [
+                new Violation(start.Ts, start.Ts,
+                    "an app-to-store cut mark is present on a RavenDB capture. This experiment is the " +
+                    "PostgreSQL one; the RavenDB store partition is E7, and P1 is the check that proves it")
+            ], []);
+        }
+
+        var heal = history.Marks.LastOrDefault(m => m.Label == DbCutHealMark);
+        var end = heal?.Ts ?? history.Good.LastOrDefault()?.Ts ?? start.Ts;
+        var window = history.Good.Where(x => x.Ts >= start.Ts && x.Ts <= end).ToArray();
+        var notes = new List<string>();
+
+        if (heal is null)
+        {
+            notes.Add($"no '{DbCutHealMark}' mark — the window runs to the end of the capture");
+        }
+
+        if (window.Length == 0)
+        {
+            return new CheckResult("K2", title,
+            [
+                new Violation(start.Ts, end,
+                    "no samples fall inside the cut window, so the partition was not observed at all")
+            ], notes);
+        }
+
+        // Per node, the longest stretch inside the window over which health_check never moved.
+        var lastValue = new Dictionary<Guid, DateTimeOffset>();
+        var silentSince = new Dictionary<Guid, DateTimeOffset>();
+        var longest = new Dictionary<Guid, TimeSpan>();
+
+        foreach (var sample in window)
+        {
+            foreach (var node in sample.Nodes)
+            {
+                if (lastValue.TryGetValue(node.Id, out var previous) && previous == node.HealthCheck)
+                {
+                    var since = silentSince.TryGetValue(node.Id, out var from) ? from : sample.Ts;
+                    silentSince[node.Id] = since;
+                    var run = sample.Ts - since;
+                    if (!longest.TryGetValue(node.Id, out var best) || run > best) longest[node.Id] = run;
+                }
+                else
+                {
+                    silentSince.Remove(node.Id);
+                }
+
+                lastValue[node.Id] = node.HealthCheck;
+            }
+        }
+
+        // ChurnSim heartbeats every 2s (Durability.HealthCheckPollingTime), so anything beyond a
+        // few cadences is silence rather than sampling. Deliberately generous: this decides
+        // whether a run counts at all, and a false "it fired" is worse than a re-run.
+        var threshold = TimeSpan.FromSeconds(5);
+        var silent = longest.Where(x => x.Value >= threshold).OrderByDescending(x => x.Value).ToList();
+
+        foreach (var (nodeId, duration) in silent)
+        {
+            var pod = history.PodForNode(nodeId) is { } name ? $" ({name})" : "";
+            notes.Add($"node {nodeId}{pod} stopped heartbeating for {duration.TotalSeconds:F0}s of the " +
+                      $"{(end - start.Ts).TotalSeconds:F0}s window");
+        }
+
+        // Who held the lock while the cut was on, and did it ever move? This is the measurement
+        // the experiment exists for; S11 is what turns it red.
+        var holders = window
+            .SelectMany(x => history.LeaderHolders(x))
+            .Select(x => x.NodeId)
+            .Where(x => x is not null)
+            .Distinct()
+            .ToList();
+
+        notes.Add(holders.Count switch
+        {
+            0 => "nothing held the leadership lock at any point inside the window",
+            1 => $"the leadership lock never moved during the cut — node {holders[0]} held it throughout" +
+                 (silent.Any(x => x.Key == holders[0])
+                     ? ", and that is the node that stopped heartbeating: no peer could take a lock whose " +
+                       "session is still alive on the server, and no node ejects a registration that is " +
+                       "still listed. Read S11 and L1"
+                     : ""),
+            _ => $"the leadership lock changed hands {holders.Count - 1} time(s) during the cut"
+        });
+
+        if (silent.Count == 0)
+        {
+            return new CheckResult("K2", title,
+            [
+                new Violation(start.Ts, end,
+                    "every registered node kept heartbeating for the whole window, so no node lost the " +
+                    "database. The cut did not take — whatever the firewall rules said — and this run " +
+                    "measured an intact cluster")
+            ], notes);
+        }
+
+        return new CheckResult("K2", title, [], notes);
     }
 
     // -------------------------------------------------------------- coverage

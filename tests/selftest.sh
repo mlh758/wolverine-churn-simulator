@@ -19,6 +19,24 @@ LEDGER=(
   "no-converge:L1"
   "split-leader:S3"
   "gap:C0"
+  # E8, the lock-session kill. `lock-kill` is the fault landing: the leader row outlives the lock
+  # by 20s, which is S3. `lock-kill-noop` has the mark and a lock that never moved -- the nemesis
+  # did not fire, every other check passes over an undisturbed cluster, and K1 is the only thing
+  # that can tell the two runs apart.
+  "lock-kill:S3"
+  "lock-kill-noop:K1"
+  # The control arm asserts the OPPOSITE: `lock-cancel` is the same undisturbed cluster as
+  # lock-kill-noop under the other mark and must be wholly clean, while `lock-cancel-moved` is a
+  # lock that left after a mere cancel -- the client dropped its connection, which is a finding
+  # and not a control. Without this pair K1 failed every correct control run.
+  "lock-cancel:"
+  "lock-cancel-moved:S3 K1"
+  # E9, the app-to-store cut. `db-cut` is the leader losing the database while its session -- and
+  # so its lock -- stays alive on the server: the assignment table reads as a perfectly healthy
+  # fully-placed cluster throughout, and S11 is the only check that refuses it. `db-cut-noop` is
+  # the cut that never took, which only K2 can distinguish from a quiet run.
+  "db-cut:S11"
+  "db-cut-noop:K2"
   # The RavenDB arm. raven-clean pins that the leader-side checkers read compare-exchange
   # evidence rather than only pg_locks -- without it they would pass a RavenDB run vacuously,
   # which is the same way the first live PostgreSQL run passed every leader check.

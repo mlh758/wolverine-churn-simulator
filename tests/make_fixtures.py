@@ -76,6 +76,11 @@ class World:
         self.lock_expires_in = RAVEN_LOCK_TTL
         self.extra_locks = []
 
+        # Nodes that have stopped writing their health_check, mapped to the instant it froze.
+        # That is what an app-to-store partition looks like from the database: the node is still
+        # registered, still owns its rows, and has simply stopped saying anything. E9/K2.
+        self.silent = {}
+
         # A tick that SUCCEEDED but is not fully trustworthy -- a query served from a stale index,
         # or one that came back short of its page limit. Not an error (there is real data on the
         # sample) and not nothing (the data may be a prefix of the cluster).
@@ -150,7 +155,7 @@ def sample(seq, t, w, backend="postgres"):
         })
 
     nodes = [
-        {"id": n[2], "nodeNumber": n[3], "healthCheck": iso(t), "description": n[0]}
+        {"id": n[2], "nodeNumber": n[3], "healthCheck": iso(w.silent.get(n[2], t)), "description": n[0]}
         for n in NODES if n[2] in w.live
     ]
 
@@ -341,6 +346,110 @@ def split_leader(tick, w):
         w.lock_holder = NODES[1]
 
 
+# ------------------------------------------------------- the lock-session kill (E8)
+
+# The leader's backend is terminated at the mark. A session-level advisory lock has no expiry and
+# no owner column, so its release is instantaneous and nothing is written anywhere saying so --
+# the only trace is the lock's absence from pg_locks. The node keeps believing it leads, because
+# lock-loss detection is a `select 1` liveness ping that reports the last known state when its
+# gate is busy.
+LOCK_KILL_MARKS = [
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=60)), "label": "lock-kill"},
+]
+
+# The control arm marks itself differently, because it asserts the OPPOSITE outcome:
+# pg_cancel_backend interrupts the statement and the server keeps the session, and so the lock.
+# One shared label made K1 fail every correct control run — found by running it, 2026-09-19.
+LOCK_CANCEL_MARKS = [
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=60)), "label": "lock-cancel"},
+]
+
+# The same node, reconnected. PostgreSQL gives the new connection a different backend pid, which
+# is exactly why K1 reads the pid: a leader that re-attains the lock seconds later still lost it,
+# and a check comparing node identity instead would call that an undisturbed cluster.
+NODE_A_RECONNECTED = (NODES[0][0], NODES[0][1], NODES[0][2], NODES[0][3], 201)
+
+
+def lock_kill(tick, w):
+    """E8: the leader's lock session is terminated, and for 20s nothing holds the lock.
+
+    Node A stays alive, registered, and still owns the wolverine://leader/ row the whole time --
+    that is the fault, not an omission. The server took the lock away from a node that was never
+    told, so for 20 seconds the cluster has a leader row backed by no server-side claim, which is
+    the GH-2602 shape and what S3 reports. At tick 80 node A notices and re-attains the lock on a
+    new connection: the same node, a new pid.
+    """
+    if 60 <= tick < 80:
+        w.lock_holder = None
+    elif tick >= 80:
+        w.lock_holder = NODE_A_RECONNECTED
+
+
+def lock_kill_noop(tick, w):
+    """The marks say a lock session was killed; the lock never left pid 101.
+
+    pg_terminate_backend answers false rather than throwing when the pid has gone, the resolved
+    pid can belong to some other connection, and a monitor watching the wrong lock id sees a
+    plausible unchanging lock forever. All three produce this: a run filed as a lock-loss
+    measurement, taken against a cluster that never lost its lock, with every other check passing
+    honestly. K1 exists to refuse exactly this.
+    """
+
+
+def lock_cancel_moved(tick, w):
+    """The control arm, and the lock moved anyway.
+
+    The server keeps a cancelled session and its advisory lock (checked against PostgreSQL 17.7),
+    so a lock that leaves after a cancel says the CLIENT dropped its connection in response to the
+    cancellation — a finding about the node in its own right, and a run that is not the control
+    arm it was filed as. The same sample shape as `lock-kill`; only the mark differs, which is the
+    whole point.
+    """
+    if 60 <= tick < 80:
+        w.lock_holder = None
+    elif tick >= 80:
+        w.lock_holder = NODE_A_RECONNECTED
+
+
+# ------------------------------------------------- the app-to-store partition (E9)
+
+DB_CUT_MARKS = [
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=60)), "label": "db-cut-start"},
+    {"kind": "mark", "ts": iso(T0 + timedelta(seconds=180)), "label": "db-cut-heal"},
+]
+
+CUT_AT = T0 + timedelta(seconds=60)
+
+
+def db_cut(tick, w):
+    """E9: the leader is cut off from PostgreSQL, and keeps the lock anyway.
+
+    The inverse of E8. There the session died and the lock died with it; here the session is
+    perfectly alive on the server -- it is the CLIENT that cannot reach it -- so the advisory lock
+    stays held by a node that has stopped writing. Its health_check freezes at the moment of the
+    cut while both peers keep heartbeating, which is the only thing the store shows and is what K2
+    reads.
+
+    Nothing else moves: node A stays registered (the node that would eject a stale registration is
+    the leader, and the leader is the one cut off), the leader row still names it, and all six
+    agents stay placed. So the assignment table reads as a perfectly healthy fully-placed cluster
+    for the whole outage -- the same "nothing in the store shows it" shape as the RavenDB stall.
+    S11 is the check that refuses to let that read as health.
+    """
+    if 60 <= tick < 180:
+        w.silent = {NODES[0][2]: CUT_AT}
+
+
+def db_cut_noop(tick, w):
+    """The marks say a cut ran; every node kept heartbeating throughout.
+
+    A rule that matched nothing, a pod that came back on a new IP outside every rule, a cut aimed
+    at the wrong pod. The cluster was intact for the whole window and every other check in the run
+    passes honestly over it. K2 exists to refuse exactly this, and S11 must stay quiet -- a lock
+    held by a node that never stopped heartbeating is not a stall.
+    """
+
+
 def raven_expired_lock(tick, w):
     """The RavenDB failover stall, and the fault that has no PostgreSQL counterpart.
 
@@ -456,6 +565,23 @@ def main():
     build("no-converge", no_converge)
     build("split-leader", split_leader)
     build("gap", clean, skip=lambda tick: 150 <= tick < 180)
+
+    # E8. `lock-kill` is the fault landing (S3: a leader row with no lock behind it);
+    # `lock-kill-noop` is the nemesis that did not fire, which every other check passes over.
+    build("lock-kill", lock_kill, marks=LOCK_KILL_MARKS)
+    build("lock-kill-noop", lock_kill_noop, marks=LOCK_KILL_MARKS)
+
+    # The control arm, both ways round. `lock-cancel` is the SAME unchanged cluster as
+    # `lock-kill-noop` under the other mark, and it must come back clean — those two fixtures
+    # together are what stop K1 reading one arm's success as the other's failure.
+    build("lock-cancel", lock_kill_noop, marks=LOCK_CANCEL_MARKS)
+    build("lock-cancel-moved", lock_cancel_moved, marks=LOCK_CANCEL_MARKS)
+
+    # E9, the app-to-store cut. `db-cut` is the fault landing: S11 refuses a lock held by a node
+    # that stopped heartbeating, and K2 confirms the cut took. `db-cut-noop` is the cut that did
+    # not take, where K2 is the only thing that can tell the two runs apart.
+    build("db-cut", db_cut, marks=DB_CUT_MARKS)
+    build("db-cut-noop", db_cut_noop, marks=DB_CUT_MARKS)
     build_dup()
 
     # The RavenDB arm. `raven-clean` is not filler: it is the evidence that the leader-side

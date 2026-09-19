@@ -117,8 +117,9 @@ lock never retained by a departed node; the cluster converging after a disturban
 **Status: nothing found yet in the deploy-churn scenario.** S1–S4 have passed on every run since
 the checker identifier bugs were fixed. That is a real (if unexciting) result for rolling deploys
 specifically — but it is *only* rolling deploys. The scenarios most likely to break leadership are
-the ones this rig does not yet inject: backend termination, app↔DB partition, process pause, clock
-skew, DB failover. Those are Layer 1 and Layer 2 below.
+the ones this rig mostly does not yet inject: app↔DB partition, process pause, clock skew, DB
+failover. Those are Layer 1 and Layer 2 below. Backend termination is the exception — it is E8,
+built 2026-09-19 and described below.
 
 ## The layered plan
 
@@ -132,7 +133,10 @@ the README for the property table. Everything below assumes this exists, because
 N Wolverine hosts in one process against real Postgres, a seeded random fault schedule, history
 recorded via `IWolverineObserver`. Faults reachable without any infrastructure:
 
-- `pg_terminate_backend` / `pg_cancel_backend` on the lock session
+- `pg_terminate_backend` / `pg_cancel_backend` on the lock session — **now built as E8**, though
+  against the real cluster rather than in-process: `scripts/lock-kill.sh`. The in-process version
+  is still worth having (it is seedable and runs in CI); what E8 settles is that the fault is
+  reachable and what it looks like from outside
 - killing the heartbeat connection *independently* of the lock connection — these can diverge and
   that state combination is untested
 - stalling a node's health-check loop (simulated GC pause) → the fencing test for fact (1) above
@@ -190,10 +194,15 @@ what diverge. Needs a 3-node RavenDB StatefulSet at replication factor 3 and a p
 RavenDB nodes. Untested; stated here so it is falsifiable rather than assumed.
 The experiment that tests it, and the leader-election half of the same question, is E7.
 
-**Layer 2 — pod-level faults in minikube. Not built.**
-Only for what Layer 1 cannot fake: SIGSTOP a whole pod, `tc netem` partition pod↔Postgres
-(materially different from a backend kill — the lock stays held server-side until TCP keepalive
-gives up), restart Postgres under load, per-pod clock skew.
+**Layer 2 — pod-level faults in minikube. Partly built: the app↔store partition is E9.**
+The pod↔Postgres partition is built and run — as `FORWARD` DROP rules rather than `tc netem`, the
+same mechanism E7 uses — and it confirmed the parenthetical below outright: the lock stays held
+server-side, for at least as long as the cut, and the node never notices. What is still not built:
+SIGSTOP a whole pod, restart Postgres under load, per-pod clock skew.
+
+*(Original note, now measured: "materially different from a backend kill — the lock stays held
+server-side until TCP keepalive gives up." E8 and E9 are the two halves, and they disagree
+completely.)*
 
 **The formal models** are the third leg and already exist, on the `p-models` branch of the
 `mine` fork of the Wolverine repo (the maintainer declined them upstream): P specs for
@@ -321,6 +330,142 @@ have separated the arms anyway.
   floor or thrash forever?
 - **Status:** run against the proposal build. Stock thrashes (655 rows in 5 min, never converges);
   capacity-aware holds (2 rows in 7 min) and recovers on scale-out. See RESULTS.md 2026-09-04.
+
+### E8 — the leader's lock session dies under it (`scripts/lock-kill.sh`) — **both arms run, 2026-09-19**
+
+- **Question:** a PostgreSQL leader's connection goes away — it timed out, a pooler bounced, an
+  operator killed the session, a blip interrupted it — and with it, instantly and silently, goes
+  its leadership. How long does the node keep believing it leads, what does it dispatch while it
+  does, and does the cluster come back?
+- **Why it is a different experiment from leader-kill.sh.** That one kills the leader's *process*:
+  the lock goes because there is nobody left to hold it, and the node that lost it is not around
+  to act on a stale belief. This one leaves the node running, healthy and serving agents, and
+  takes only the lock. What is under test is the gap between server-side truth and the node's
+  belief, which is where both structural facts above bite at once: lock-loss detection is a
+  `select 1` liveness ping that reports the last known state when its gate is busy, so the belief
+  is *designed* to lag, and `StartAgent`/`StopAgent`/`AssignAgent` carry no leader epoch, so
+  whatever the lagging believer dispatches is executed unconditionally. GH-2602 is this shape.
+- **Method:** settle, start a capture, mark `lock-kill`, `pg_terminate_backend` the backend
+  holding advisory lock `schemaName.GetDeterministicHashCode()`, watch for 180 s, capture the pod
+  logs, run the checkers and `safetylab overlaps`. One row per 5 s poll to `timeline.tsv`: who
+  holds the lock, who the assignment table says leads, how many agents are placed.
+- **The fault is a terminated session, and it has to be.** A session-level advisory lock has no
+  expiry and no owner column — the death of its session *is* its release. Nothing outside that
+  session can release it: `pg_advisory_unlock(id)` only ever touches the **calling** session's own
+  lock table, so from psql it releases nothing, returns `false`, and says so in a WARNING on
+  stderr, where `2>/dev/null` puts it out of sight. An injector written that way runs its full
+  duration, injects nothing, and leaves a plausible number behind — harness-traps.md rule 4, and
+  the reason this is stated here rather than discovered later. Measured rather than assumed
+  (2026-09-19, PostgreSQL 17.7): the unlock returns `f` and the lock survives; the terminate
+  returns `t` and the lock is gone; a terminate aimed at a pid that has already died returns `f`
+  with psql still exiting **0** under `ON_ERROR_STOP=1`, which is why the boolean is read and the
+  lock is re-read afterwards.
+- **The control arm is `MODE=cancel`:** `pg_cancel_backend` interrupts the connection's current
+  statement and leaves the session, and so the lock, in place — verified on the same 17.7 server:
+  a long-lived session sees `ERROR: canceling statement due to user request` and keeps its lock.
+  If the lock moves anyway on the real cluster, that is the **client** dropping its connection in
+  response to the cancellation, which is a finding about Wolverine in its own right and is
+  reported as one. "A blip is not a lost lock" is what
+  the default arm's finding needs to be a finding against, and the verdict logic treats the two
+  modes as expecting opposite outcomes so one cannot quietly become a second copy of the other.
+- **Arm safety:** there is none to have, and that is the point — a terminated session leaves no
+  state behind for a later run to trip over, unlike the RLS fault (E6) or the partition (E7). What
+  replaces it is proof: `safetylab lock-chaos kill` reads the lock back from the server afterwards
+  and exits 2 with `*** THE FAULT DID NOT FIRE ***` unless it moved, and **K1** asserts the same
+  thing against the capture — the pid holding the lock before the mark must not still hold it
+  after. The two are deliberately separate: the injector can only speak for the instant it ran,
+  and the run is what gets filed.
+- **Refusals, each its own named reason:** a lock nobody holds (usually the wrong lock id — the
+  `LeaderLockId = 9999999` constant sits in the same class as `_lockId` and is unused by the
+  leadership path), a backend merely *queued* on the lock, two granted holders at once
+  (impossible in PostgreSQL, so the filter is wrong and killing either would hit an unrelated
+  session), a holder with no `client_addr`, and a holder whose address is not the leader pod's —
+  that last is the state this experiment exists to create, so a cluster already in it is not a
+  starting point.
+- **Finding:** a node logging leadership work, or dispatching agent commands, after the lock left
+  it; a leader row naming a node with no lock behind it for longer than the grace window (S3); a
+  cluster that does not re-elect at all (L1, K1's note about nobody taking the lock); duplicate
+  agents in the post-kill logs. A cluster that notices within a health-check period and re-attains
+  cleanly is a real negative result — say so if that is what happens.
+- **Result (2026-09-19): that negative, and it is worth having.** 6.39.0 detects the terminated
+  connection itself — `Lost advisory-lock connection … clearing held lock ids 832201495`
+  (`PostgresqlNodePersistence.cs:529`) — steps down, and triggers an election; a peer held the
+  lock inside one 1 s sampling tick, with no waiter ever queued on it. Every check green, no
+  duplicates, 500/500 placed throughout. The control arm's lock did not move for 124 s, so the
+  terminate arm's handover is attributable to the session dying rather than to its connection
+  being disturbed. See RESULTS.md.
+- **What it does NOT cover, and is the obvious next run.** The detection path above fires because
+  the server sends the client a FATAL and the connection breaks *visibly*. A connection that dies
+  where the client cannot tell — a silent drop, TCP keepalive deciding the timing — never reaches
+  it, and that is exactly the app↔DB partition in Layer 2. E8's result makes that experiment more
+  interesting rather than less.
+- **Resolution limit.** The monitor ticks at 1000 ms (`k8s/safetylab.yaml`), so "the lock was
+  unheld for 0.0 s" means *below one tick*, never zero. The leaderless window is the number this
+  experiment exists to produce, so a rerun at `--tick-ms 100` is the way to actually produce it.
+- **Artifact:** a lock that moved for a reason other than the fault. The node may have been mid-
+  handover, or the pod may have restarted; the timeline and the capture both name pods, and K1's
+  notes say which pid took the lock next.
+
+### E9 — the leader loses its database, not its lock (`scripts/db-partition.sh`) — **run 2026-09-19, and it found something**
+
+- **Question:** E8 killed the lock *session* and the client found out immediately. What happens
+  when the connection dies where the client cannot tell — a partition, a hung store, a saturated
+  link? The lock is not released, because nothing released it: the session is alive on the server
+  and it is the client that cannot reach it.
+- **Method:** `just db-partition [hold] [settle]`. Resolve the leader through
+  `safetylab lock-chaos status` (so "the leader" means the node whose address holds the advisory
+  lock), cut its pod from the `pg` pod both ways with `safetylab partition arm`, hold, heal from a
+  trap, watch, and check. The monitor and every psql read sit in other pods on the database side
+  of the cut, so the observer keeps full sight of the lock throughout.
+- **Marks and proof:** `db-cut-start` / `db-cut-heal`, deliberately NOT E7's `partition-start` —
+  that fault is proved by a RavenDB member losing its Raft leader, and there is no Raft here.
+  **K2** proves this one from the database side instead: a node that cannot reach the store stops
+  advancing its `health_check` while its peers keep going, which is visible from outside with no
+  cooperation from the cut-off node.
+- **Finding (2026-09-19): the lock strands and nothing notices.** 180 s cut; the node stopped
+  heartbeating for 179 s of it; the advisory lock never moved off its session; the leader row never
+  changed; the node was never ejected (the actor that ejects stale registrations is the leader, and
+  the leader is the one cut off); `placed` read 500/500 throughout. The node logged
+  `Error writing the heartbeat` ten times and **zero** step-downs — against E8's build, on the same
+  cluster, where the terminate arm produced a step-down immediately. Recovery on heal was 0.3 s.
+  See RESULTS.md.
+- **So the detection path is connection-break-shaped.** 6.39.0 handles a FATAL from the server
+  well and does not act on "my writes keep failing". Those are the same event to an operator.
+- **Why S11 had to exist.** S4 cannot see this (the node is never *departed*), S1/S2/S3 cannot (the
+  lock and the row agree — they both name a node that is not there), and L1 cannot (one holder,
+  everything placed, nothing dangling: a stalled cluster satisfies every clause of convergence).
+  Before S11 this run produced a fully green report over a three-minute leaderless stall.
+- **Artifact:** the victim's pod restarting during the hold. It comes back on a new IP, outside
+  every rule, and has escaped the cut for the rest of the run; the script counts restarts before
+  and after and prints `*** SUSPECT RUN ***`.
+- **The bounce arm (`BOUNCE=1`), and the question it answers.** A stall on a CP-flavoured system is
+  defensible behaviour rather than a bug; what is not obvious is what happens on the *heal*, after
+  the roster moved while nobody could act. So this arm restarts a non-isolated peer at the midpoint
+  of the hold. The peer stops gracefully, deletes its node row, and `ON DELETE CASCADE` takes its
+  assignment rows with it — so its agents are unassigned AND not running, and only the isolated
+  leader could place them. **Measured 2026-09-19:** `placed` dropped 500 → 333 and stayed there for
+  the rest of the cut, then recovered to 500 in **24 s** after the heal, with **no duplicates**
+  (S5) and no change of leadership. The heal is clean.
+- **Which instrument answers the duplicate half.** Not `safetylab overlaps` alone — it reads raw
+  pod logs from `post/`, which only holds pods still alive at the end, and the bounced pod is by
+  definition gone. **S5** covers it, because it builds residencies from the capture's harvested
+  AGENT-START/STOP stream, which the monitor's follower collected from the bounced pod while it was
+  still running. `overlaps` stays as a cross-check over the survivors.
+- **Why no duplicates, and the arm that should produce them.** A graceful stop removes the peer's
+  claims before it goes, so the orphans are clean and there is no stale ownership to double up on;
+  leadership never moves either, and handover is where E2's duplicates are made. A **SIGKILLed**
+  peer is the variant to try: its node row survives, so its assignment rows survive, and its agents
+  are left *assigned to a dead node* — the GH-3987 wedge — for the leader to reconcile rather than
+  simply place. Not run.
+- **A third of the workload can be off without any check saying so.** At 333/333 everything placed
+  is running and everything running is placed, so S5/S6/S7 and L1 all pass. Only S11 and the
+  `placed` column of the timeline show it. Worth knowing before reading a green report.
+- **Open, and the obvious next run: the bound.** The 180 s hold was healed deliberately, so the
+  stall is only known to last *at least* as long as the partition. What eventually reaps the
+  server-side session is `tcp_keepalives_idle`, which defaults to 0 = the system default
+  (typically 7200 s), so the stranded lock may outlive the cut by hours. A long-hold run would
+  establish it. The fencing question is also unsettled: 180 s produced no duplicates, but that is
+  a short window for an unfenced believer.
 
 ### E7 — split brain on a RavenDB cluster (`scripts/split-brain.sh`) — **run twice, 2026-09-18/19**
 

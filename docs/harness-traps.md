@@ -121,6 +121,29 @@ handover* from a script built to measure what happens when shutdown never runs.
 to PID 1 from inside its own PID namespace, so it is silently a no-op. The kill must come from
 outside the namespace: `minikube ssh` + `crictl inspect` for the host pid, then `sudo kill -9`.
 
+**An advisory lock cannot be released from another session, so an injector that tries injects
+nothing.** `pg_advisory_unlock(id)` and `pg_advisory_unlock_all()` only ever touch the **calling**
+session's own lock table. Run from psql against the lock a Wolverine leader holds, the lock stays
+exactly where it was: the function returns `f` and emits `WARNING: you don't own a lock of type
+ExclusiveLock` — on **stderr**, which `2>/dev/null` puts out of sight, leaving a run that injected
+no fault and reports success. The only way to take a session-level advisory lock away from outside
+is to end the session: `pg_terminate_backend(pid)`. `pg_cancel_backend` is not it either: the
+server keeps the session, and so the lock, and only the running statement dies (`ERROR: canceling
+statement due to user request`) — which is why that is E8's control arm rather than a second
+treatment. Both functions answer `false` rather than raising when the pid has already gone, and
+**psql still exits 0 under `ON_ERROR_STOP=1`** while printing `WARNING: PID n is not a PostgreSQL
+backend process` to stderr, so the exit code says nothing and the boolean has to be read. (All of
+the above measured 2026-09-19 against PostgreSQL 17.7; the cluster runs 16-alpine and none of it
+is version-dependent.)
+
+**`boolean::text` is `true`, and psql renders the same column as `t`.** A parser that knows one
+spelling silently drops every row the day somebody adds a cast — and for a lock-holder query an
+empty result reads as "the cluster has no leader", which is a refusal rather than a crash and
+therefore quiet. `LockChaos` spells the boolean `'t'`/`'f'` in the SQL itself and accepts both
+forms anyway. `safetylab lock-chaos kill`
+reads it, then reads the lock back from the server, and **K1** repeats the assertion against the
+capture.
+
 **Before handing any pid to `kill -9`, check it is `> 1` and that `/proc/<pid>/cmdline` is the
 process you meant.** A fault injector aimed at the wrong process either destroys the rig or, worse,
 quietly injects nothing and leaves a plausible number behind.
@@ -258,7 +281,7 @@ as dead weight — if you find yourself deleting one, this is what it was for.
 |---|---|
 | Watched advisory lock `9999999`; it is `schemaName.GetDeterministicHashCode()`. S1–S4 passed against a lock nobody held | `RunHistory.LockIdForSchema`, plus S1's sentinel note |
 | Matched `wolverine://leader` without the trailing slash `Uri.ToString()` adds; every leader check found nothing | `RunHistory.IsLeaderUri` matches both forms |
-| Argument parser ignored unrecognised flags, so a typo ran the verb against its default | `System.CommandLine` rejects unknown tokens; contract asserted in `CommandLineTests` |
+| Argument parser ignored unrecognised flags, so a typo ran the verb against its default | `System.CommandLine` rejects unknown tokens outright — the verb no longer runs at all, so there is nothing left for a test to assert |
 | `cut -f2` on the word `none` read it as a node id and reported a 5-minute outage as instant recovery | `LeaderState` makes leaderless a type, not a string |
 | `grep -m1 '"pid"'` on `crictl inspect` matched a namespace descriptor and ran `kill -9 1` on the node's init | `ContainerProbe` parses `.info.pid` and validates before any kill |
 | `-o jsonpath='{.items[0]...}'` picked terminated and completed pods | `PodSelection.IsLive`; `safetylab pick-pod` |
@@ -273,6 +296,7 @@ as dead weight — if you find yourself deleting one, this is what it was for.
 | "I could not measure" and "I measured, and it was clean" were the same outcome | `SKIP-unmeasurable`, from snapshot's exit 2 — refused on no live pod, an unreadable store, or no agent event logged anywhere |
 | The overlap analysis wrote its errors to the same stdout its counts were read from, so a traceback read as `never` — "no duplicate at all" — and heal-test.sh then deleted the raw logs | `safetylab overlaps` exits 0/1/**2**; heal-test.sh branches on the code, and exit 2 is `SKIP-unanalysable` with the evidence kept |
 | The RLS fault was armed and disarmed by two statements a few hundred seconds apart, with no trap. A Ctrl-C or any failing command between them left one node's row permanently invisible to the app role, and every later experiment on that cluster silently measured a crippled node | `safetylab chaos arm/disarm/status`; `disarm` is idempotent and runs from a `trap … EXIT INT TERM`, and a run refuses to start while a previous arm is still in place |
+| An advisory lock was going to be "removed" with `pg_advisory_unlock` from a psql session, which releases nothing, returns `f`, and warns only on stderr — the run would have injected no fault at all | `LockChaos` terminates the session instead, reads the lock back afterwards, and `Verdict` refuses a signal that landed without moving the lock; **K1** asserts the same thing against the capture |
 | The victim query returned an empty string on an unsettled cluster, so the policy became `id <> ''`, which hides nothing. The arm ran its full duration injecting no fault and recorded zero injections — indistinguishable from "the guard prevented it" | `PostgresChaos.TryChooseVictim` refuses with a named reason for every empty case; the summary prints `*** INVALID ARM ***` when the armed phase logged no injections |
 | Pod configuration was checked with `grep … \|\| echo WARNING` and the run carried on | `safetylab verify-config` refuses, checks **every** live pod, and reads `State.Setting`/`State.Value` so "knob absent from this build" is distinct from "set to something else" |
 | `monitor.sh start` followed `.items[0]` for the safetylab pod, straight after a `rollout restart` left the previous one terminating — a near-empty history.jsonl that every S-check passes over | `safetylab pick-pod --label app=safetylab` |

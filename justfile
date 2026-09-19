@@ -108,6 +108,35 @@ leader-kill-graceful seconds="120":
 leader-kill-dry-run:
     DRY_RUN=1 ./scripts/leader-kill.sh
 
+# E8 — take the leader's advisory lock away by killing the backend holding it. PostgreSQL only.
+lock-kill seconds="180":
+    ./scripts/lock-kill.sh {{seconds}}
+
+# The control arm for the above: pg_cancel_backend interrupts the connection and the lock survives.
+lock-kill-cancel seconds="180":
+    MODE=cancel ./scripts/lock-kill.sh {{seconds}}
+
+# Resolve the leader and the backend holding its lock, and stop before signalling.
+lock-kill-dry-run:
+    DRY_RUN=1 ./scripts/lock-kill.sh
+
+# Who holds the leadership advisory lock right now? Exit 1 means nobody does.
+lock-status:
+    {{safetylab}} lock-chaos status
+
+# E9 — cut the leader off from PostgreSQL and watch its lock strand. PostgreSQL only.
+db-partition hold="180" settle="120":
+    ./scripts/db-partition.sh {{hold}} {{settle}}
+
+# E9's bounce arm — restart a peer mid-cut so the roster moves under the isolated leader, then
+# measure the HEAL: does it converge, does it duplicate, for how long.
+db-partition-bounce hold="240" settle="300":
+    BOUNCE=1 ./scripts/db-partition.sh {{hold}} {{settle}}
+
+# Resolve the leader, the store pod and the cut, and stop before arming anything.
+db-partition-dry-run:
+    DRY_RUN=1 ./scripts/db-partition.sh
+
 # E7 — split brain: isolate the leader's store member (and the leader) from the rest, hold past
 # the lock expiry, heal, and check. Needs `just deploy-ravendb-cluster`.
 split-brain hold="420" settle="300":

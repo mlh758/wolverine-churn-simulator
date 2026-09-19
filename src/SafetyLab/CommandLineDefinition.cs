@@ -14,13 +14,13 @@ namespace SafetyLab;
 /// discipline is "no claim without the configuration it was measured under", a configuration
 /// surface that discards what it does not understand is the wrong shape. Unknown tokens are now a
 /// parse error with a non-zero exit, and the help text is generated from these definitions rather
-/// than maintained alongside them.
+/// than maintained alongside them. Both are properties of the parser rather than of this file, so
+/// neither is restated as a test.
 ///
 /// The surface itself is UNCHANGED. Every verb and flag is spelled exactly as the scripts and the
 /// k8s manifests already invoke them — <c>monitor --backend ravendb --tick-ms 1000 --service
 /// churnsim</c> and the rest — because breaking those would be a far bigger cost than the parser
-/// ever was. <see cref="Build"/> is public so the parse rules can be unit-tested without running
-/// anything (tests/SafetyLab.Tests).
+/// ever was.
 /// </summary>
 public static class CommandLineDefinition
 {
@@ -54,6 +54,7 @@ public static class CommandLineDefinition
         root.Subcommands.Add(BuildOverlaps());
         root.Subcommands.Add(BuildTraces());
         root.Subcommands.Add(BuildChaos());
+        root.Subcommands.Add(BuildLockChaos());
         root.Subcommands.Add(BuildVerifyConfig());
         root.Subcommands.Add(BuildCount());
         root.Subcommands.Add(BuildSettle());
@@ -471,6 +472,80 @@ public static class CommandLineDefinition
         command.Subcommands.Add(arm);
         command.Subcommands.Add(disarm);
         command.Subcommands.Add(status);
+
+        return command;
+    }
+
+    // ----------------------------------------------------------- lock-chaos
+
+    /// <summary>
+    /// The lock-session fault (E8), PostgreSQL only. No disarm, because there is nothing to leak:
+    /// a terminated session leaves no state behind. What it has instead is <c>--dry-run</c> and a
+    /// post-read, for the same reason <c>leader-kill.sh</c> has both — a fault injector ought to
+    /// be able to show what it would destroy, and it must prove afterwards that it fired.
+    /// </summary>
+    private static Command BuildLockChaos()
+    {
+        var command = new Command("lock-chaos",
+            "PostgreSQL only, and it MUTATES: take the leadership advisory lock away from the leader " +
+            "by killing the backend holding it.");
+
+        var schema = new Option<string>("--schema")
+        {
+            Description = "PostgreSQL schema, which is what the lock id is derived from",
+            DefaultValueFactory = _ => "wolverine"
+        };
+        var lockId = new Option<long?>("--lock-id")
+        {
+            Description = "override the advisory lock id (default: derived from --schema, exactly as the monitor does)"
+        };
+        var label = new Option<string>("--label")
+        {
+            Description = "label selector for the app pods, used to resolve the leader row to an IP",
+            DefaultValueFactory = _ => "app=churnsim"
+        };
+
+        schema.Recursive = true;
+        lockId.Recursive = true;
+        label.Recursive = true;
+        command.Options.Add(schema);
+        command.Options.Add(lockId);
+        command.Options.Add(label);
+
+        var status = new Command("status",
+            "Print 'pid <TAB> client_addr <TAB> pod' for every backend on the leadership lock. " +
+            "Exit 1 when nothing holds it, 2 when the store could not be read.");
+        status.SetAction(parseResult => LockChaosVerbs.Status(
+            parseResult.GetValue(schema)!, parseResult.GetValue(lockId), parseResult.GetValue(label)!));
+
+        var mode = new Option<string>("--mode")
+        {
+            Description = "terminate kills the session and the lock dies with it; cancel interrupts the " +
+                          "statement and leaves both alive — the control arm",
+            DefaultValueFactory = _ => LockChaos.Terminate
+        };
+        mode.AcceptOnlyFromAmong(LockChaos.Terminate, LockChaos.Cancel);
+
+        var dryRun = new Option<bool>("--dry-run")
+        {
+            Description = "resolve the leader and the backend holding its lock, print them, and stop before signalling"
+        };
+
+        var kill = new Command("kill",
+            "Signal the backend holding the leadership lock, then read the lock back. " +
+            "Exit 0 only if the fault did what the mode claims; 2 on a refusal, and on a signal that " +
+            "landed without moving the lock.");
+        kill.Options.Add(mode);
+        kill.Options.Add(dryRun);
+        kill.SetAction(parseResult => LockChaosVerbs.Kill(
+            parseResult.GetValue(mode)!,
+            parseResult.GetValue(schema)!,
+            parseResult.GetValue(lockId),
+            parseResult.GetValue(label)!,
+            parseResult.GetValue(dryRun)));
+
+        command.Subcommands.Add(status);
+        command.Subcommands.Add(kill);
 
         return command;
     }

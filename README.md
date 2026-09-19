@@ -230,8 +230,11 @@ terminated, its in-process lock list went on reporting "held", and two nodes bot
 | S7 | Every running agent is assigned to the node running it | an orphan runner — the precursor to S5 |
 | S9 | Every store member agrees on assignment ownership | **replicated RavenDB only** — a member holding an agent under a different owner than the primary view, or lacking its document, past the grace window. Assignments are single-member writes with async replication; this is two claims on one agent seen from outside |
 | S10 | No store member reports document conflicts | **replicated RavenDB only** — RavenDB's own `CountOfConflicts` above zero on any member: two members accepted incompatible writes to one document. Zero grace |
+| S11 | The lock is not held by a node that stopped heartbeating | **PostgreSQL only** — a node still *registered* (so S4 cannot see it) whose `health_check` has stopped advancing while its session still holds the lock. The app↔DB partition's whole fingerprint: nothing ejects it and no peer can take the lock, while the store reads as fully placed |
 | L1 | The cluster converges after the last phase marker | one leader, every agent placed once, and it stays that way (on RavenDB a *present but expired* lock is not a leader) |
 | P1 | The partition took | **partition runs only** — between the `partition-start` and `partition-heal` marks at least one member must have reported losing its Raft leader. A run where none did was not partitioned, whatever the firewall said. SKIPs when the marks are absent |
+| K1 | The lock-session signal did what its arm claims | **lock-kill runs only (E8, PostgreSQL)** — on a `lock-kill` mark the backend holding the advisory lock before it must not still hold it afterwards; on a `lock-cancel` mark (the control arm) it must. `pg_terminate_backend` answers `false` rather than throwing when the pid has gone, so "the statement succeeded" is not evidence a leader lost anything. SKIPs when neither mark is present |
+| K2 | The app-to-store cut took | **db-partition runs only (E9)** — between the `db-cut-start` and `db-cut-heal` marks at least one node must have stopped advancing its `health_check`. P1 cannot answer this: there is no Raft in a cut between an app pod and PostgreSQL. SKIPs when the marks are absent |
 | C0 | Observation coverage | sampling gaps, failed samples, monitor↔store clock offset, and — on RavenDB — a query that came back stale or short of its page limit; on the replicated arm, a member the monitor could not read |
 
 S3–S9 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
@@ -288,16 +291,14 @@ all, so a crashed binary cannot satisfy the two fixtures whose expected answer i
 Run it with `just test`. The `LEDGER` array at the top of the script is the list of fixtures and
 what each must trip; add a checker, add a fixture and a ledger row.
 
-The same command also runs **`tests/SafetyLab.Tests`**, which covers the two layers outside the
+The same command also runs **`tests/SafetyLab.Tests`**, which covers the layer outside the
 checkers:
 
 - **cluster decisions** — which pods are live, resolving a container to a host pid, reading leader
   state, and whether a fault injector actually fired. These run against captured fixtures (real
   `kubectl get pods -o json`, real `crictl inspect`), so they need no cluster.
-- **the CLI contract** — every invocation the scripts and `k8s/` manifests issue must parse, and
-  malformed ones must be rejected. Parsing only; nothing is executed.
 
-Both are pure functions and finish in well under a second, so there is no reason not to run them
+These are pure functions and finish in well under a second, so there is no reason not to run them
 before touching a live experiment.
 
 ## Leader failover
@@ -316,6 +317,80 @@ has all three.
 The script asserts its own nemesis fired. `NodeStopped` records are written only on the graceful
 shutdown path, so one appearing during a SIGKILL run means the victim shut down cleanly and the
 run is reported `*** INVALID ***` rather than as a failover measurement.
+
+## The leader's lock session (E8)
+
+`just lock-kill [seconds]`, PostgreSQL only. Where leader failover kills the leader's *process*,
+this leaves the node running, healthy and serving agents, and takes only its **lock** away:
+`pg_terminate_backend` on the backend holding the leadership advisory lock. The node is told
+nothing, because lock-loss detection is a `select 1` liveness ping that deliberately reports the
+last known state when its gate is busy — so what the run measures is the window in which a node
+believes it leads and has no server-side claim to, and what it dispatches (unfenced) while it
+does. That is the GH-2602 shape.
+
+A session-level advisory lock has no expiry and no owner column: the death of its session **is**
+its release. So a timed-out connection, a bounced pooler, an operator killing a session and a
+network blip are all the same server-side event, and this reproduces it on demand. What an
+operator *cannot* do is remove the lock from another connection — `pg_advisory_unlock(id)` only
+touches the calling session's own lock table, releases nothing, and says so in a WARNING on
+stderr. A nemesis built on it injects nothing and reports success.
+
+`MODE=cancel` is the control arm: `pg_cancel_backend` interrupts the connection's current
+statement and leaves the session, and therefore the lock, exactly where it was. An interrupted
+connection is not a lost lock, and the default arm's finding needs that to be a finding against.
+There is a dry run that resolves the target and signals nothing — `just --list` has all three.
+
+The injector refuses rather than guessing: on a lock nobody holds (which usually means the lock id
+is wrong — it is `schemaName.GetDeterministicHashCode()`, not the unused `LeaderLockId = 9999999`
+constant beside it), on a backend merely queued on the lock, on two granted holders at once, and
+on a lock held from an address that is not the leader pod's — that last is the state the
+experiment exists to create, so a cluster already in it cannot be a starting point. Afterwards it
+reads the lock back from the server and reports `*** THE FAULT DID NOT FIRE ***` if it did not
+move.
+
+Read `K1` in the report first: it is the capture's own version of that assertion, and it knows
+which arm ran — the two write different marks, because demanding "the lock moved" of a control arm
+designed to prove it does not is a red run with a backwards explanation. Then `S3` (how long the
+leader row named a node with no lock behind it), `L1` (did the cluster converge again), and
+`safetylab overlaps` over the post-kill pod logs for the fencing question — an old leader that
+keeps dispatching agent commands is what duplicates look like from the pods.
+
+**Both arms were run on 2026-09-19 and the answer was a clean negative:** 6.39.0 notices the
+terminated connection (`Lost advisory-lock connection … clearing held lock ids`), steps down and
+triggers an election, and a peer had the lock inside one 1 s sampling tick. See RESULTS.md — and
+note the leaderless window is bounded by the monitor's tick, not measured at zero.
+
+## The leader loses its database (E9)
+
+`just db-partition [hold] [settle]`, PostgreSQL only, and the complement to E8. Instead of killing
+the lock session, it cuts the **leader's pod off from the `pg` pod** — both directions, `DROP`
+rules in the node's `FORWARD` chain, the same mechanism E7 uses — holds, heals from a trap, and
+checks. The monitor and every psql read sit on the database side of the cut, so the lock stays
+fully visible throughout.
+
+Nothing is terminated, and that changes everything: the server-side session stays alive **holding
+the advisory lock**, so no peer can take it; the node stays registered, so nothing ejects it — and
+the actor that ejects stale registrations is the leader, which is the node that is cut off.
+
+**Run 2026-09-19 and it found something.** Over a 180 s cut the node stopped heartbeating for 179 s,
+the lock never moved off its session, the leader row never changed, `placed` read 500/500
+throughout, and the node logged `Error writing the heartbeat` ten times and **zero** step-downs —
+where E8's terminate arm, on the same cluster, stepped down immediately. The detection path is
+connection-break-shaped: it fires on a FATAL from the server, not on "my writes keep failing".
+See RESULTS.md.
+
+`BOUNCE=1` (`just db-partition-bounce`) restarts a non-isolated peer at the midpoint of the hold,
+so the roster moves while nothing can redistribute, and the measurement becomes the **heal**. The
+peer stops gracefully and `ON DELETE CASCADE` takes its assignment rows with its node row, so its
+agents end up unassigned and not running: `placed` fell 500 → 333 and stayed there for the rest of
+the cut, then recovered to 500 in **24 s** after the heal, with **no duplicates**. Note that a
+cluster missing a third of its agents passes S5, S6, S7 and L1 — at 333/333 everything placed is
+running and everything running is placed — so only S11 and the timeline's `placed` column show it.
+
+Read `K2` first (did the cut take — a node stopped heartbeating), then `S11`, which is the only
+check that can see this: S4 cannot, because the node is never *departed*; S1/S2/S3 cannot, because
+the lock and the row agree — on a node that is not there; and L1 cannot, because a stalled cluster
+satisfies every clause of convergence. Before S11 the run came back fully green.
 
 ## Split brain (E7)
 

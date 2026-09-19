@@ -15,6 +15,148 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
+## 2026-09-19 — E9 app↔DB partition: a PostgreSQL leader cut off from its database keeps the lock, keeps the leader row, and never notices
+
+The complement to E8, same cluster and build, run an hour later. Wolverine **6.39.0**, net10.0,
+`postgres:16-alpine`, 3 replicas, 500 agents, stock knobs. The leader's pod was cut from the `pg`
+pod — both directions, `DROP` rules in the minikube node's `FORWARD` chain keyed on pod IPs — for
+**180 s**, then healed and watched for 120 s. Nothing was terminated and nothing was killed. Run
+directory `runs/db-partition-20260919T150550Z`.
+
+**E8 asked what happens when the lock connection dies visibly. This asks what happens when it dies
+silently, and the answers are opposite.**
+
+| | |
+|---|---|
+| the cut | 180 s, `churnsim-…-kz6rt` (10.244.0.14) ↮ `pg-…-tjw6x` (10.244.0.2). Victim container restarts: 0 → 0, so the pod never came back on a new IP outside the rules |
+| did it take? | **yes** (K2): the node stopped heartbeating for **179 s of the 181 s window** while both peers kept going |
+| the lock | **never moved.** Held by backend pid 841 — the isolated node's session — for the entire outage. The session is alive on the *server*; it is the client that cannot reach it, so there is nothing to release it and no peer can take it |
+| the leader row | never changed. `wolverine://leader/` named the unreachable node throughout |
+| ejection | **never happened.** The node stayed registered for ~3× its silence budget. The actor that ejects a stale registration is the leader, and the leader is the node that is cut off — so the corpse blocks its own cleanup, exactly as on the RavenDB arm, by a different route |
+| what the node concluded | **nothing.** 0 step-downs, 0 `Lost advisory-lock connection`. It logged 10 × `Error writing the heartbeat for node 2`, `Error trying to perform agent health checks`, and a stream of `DatabaseControlListener` / `DurabilityAgent` failures — it knows its writes are failing and does not conclude it has lost leadership |
+| what the store showed | **nothing.** `placed` read 500/500 for the whole outage; S1, S2, S3 and S4 all pass |
+| duplicates | none (S5); `safetylab overlaps`: 0 |
+| recovery | immediate — L1 converged **0.3 s** after the heal mark and held 128 s |
+| checkers | **S11 FAILS** (167 s), K2 passes, everything else green |
+
+**The contrast with E8, in one line each from the same cluster:**
+
+| fault | the victim's own log | the lock |
+|---|---|---|
+| `pg_terminate_backend` (E8) | `Lost advisory-lock connection … clearing held lock ids 832201495` → `stepping down … Triggering a new leadership election` | released; a peer had it inside 1 s |
+| app↔DB partition (E9) | 0 step-downs; 10 × `Error writing the heartbeat` | held by the unreachable node for the full 180 s |
+
+So the detection path 6.39.0 has is **connection-break-shaped**. It fires on a FATAL from the
+server and not on "my writes keep failing" — and those are the same event from the operator's
+point of view. A pooler restart, a `pg_terminate_backend`, an idle-session timeout all hit the
+first path and are handled well. A network partition, a hung database, a saturated link, an
+iptables change all hit the second and are not detected at all.
+
+**S11 is the only check that catches it, and that is the point.** S4 cannot: the node is never
+ejected, so it never becomes "departed". S1/S2/S3 cannot: the lock and the row agree perfectly —
+they just both name a node that is not there. L1 cannot: one holder, 500/500 placed, no dangling
+assignment — a stalled cluster satisfies every clause of convergence. Before S11 this run produced
+a fully green report over a cluster whose leader had been unreachable for three minutes.
+
+### The bounce arm: what the heal looks like after the roster moved underneath
+
+`BOUNCE=1`, 240 s cut, a peer restarted gracefully at t+120 s while nothing could redistribute,
+then 300 s of watching after the heal. Run directory `runs/db-partition-20260919T155256Z`; a
+shorter preview run (`…T154652Z`, hold truncated by a signal — see the caveat) agreed on every
+number that follows.
+
+| | |
+|---|---|
+| at the bounce | `placed` **500 → 333**: exactly one node's share, 167 agents, owned by nobody. The peer shut down gracefully and deleted its node row; `wolverine_node_assignments.node_id` is `ON DELETE CASCADE`, so its assignment rows went with it |
+| for the rest of the cut | **flat at 333 for 120 s.** Those agents were unassigned *and* not running, and the only actor that could place them was the isolated leader. A third of the workload was simply off |
+| the replacement pod | came up and reached Ready during the cut, registered, and sat idle — the leader could not give it anything |
+| on heal | 333 → 383 → 433 → **500** |
+| convergence (L1) | **24.1 s** from the `db-cut-heal` mark, held 284 s (preview run: 18.9 s) |
+| duplicates (S5) | **none**, across 934 harvested agent events including the bounced pod's |
+| leadership | never moved. `kz6rt` held the lock and the leader row from before the cut to after the heal |
+
+**So the heal is clean.** The leader reconnects, finds a third of the agents unowned and a node it
+has never seen, and places them in about 20 s with no duplicates and no thrash. That is the answer
+to "does it converge and do we get duplicates": yes, and no.
+
+**Why no duplicates, and where they would come from instead.** The peer was stopped *gracefully*,
+so it stopped its agents and removed its own claims before going — the orphans were clean, and
+there was no stale ownership for anything to double up on. Leadership never changed hands either,
+and leadership handover is where E2's duplicates are made. The variant that should produce them is
+a **SIGKILLed** peer: its node row survives, so its assignment rows survive with it, and its agents
+are left *assigned to a dead node* — the GH-3987 wedge — which the leader has to reconcile rather
+than simply place. Not run.
+
+**Read this with the stall, not instead of it.** The cluster being down a third of its agents for
+the length of the partition is not a convergence failure and does not show up as one: S5, S6, S7
+and L1 all pass, because at 333/333 everything placed is running and everything running is placed.
+The only checks that say anything are S11 and the `placed` column of the timeline.
+
+**Caveats.** The stall arm is one run at 180 s and the bounce arm one at 240 s (plus one truncated
+preview). The **bound is not measured**: a 180 s cut was healed deliberately, so
+all this shows is that the stall lasts at least as long as the partition. What eventually reaps
+the server-side session is `tcp_keepalives_idle`, which defaults to 0 = the system default
+(typically 7200 s on Linux), so the stranded lock could in principle outlive the partition by
+hours — that needs a long-hold run to establish, and is the obvious follow-up. No duplicate agents
+appeared here, but 180 s with an unfenced believer is a short window; the fencing question (E8's
+fact 1) is not settled by this run either way.
+
+The preview run `…T154652Z` was started by mistake without `DRY_RUN` and then killed by a
+`timeout` at 200 s. Its cut therefore ended on a signal rather than on the hold expiring, which is
+why the full-length `…T155256Z` run exists and is the one to quote. It is kept because its
+sequence was intact and it agreed, and because it exposed a real defect in the script: `trap heal
+EXIT INT TERM` healed the cut and then *carried on running the experiment* against an intact
+cluster, since a trap handler returns rather than exits. INT and TERM now heal and stop. The same
+pattern is still present in `scripts/split-brain.sh`.
+
+## 2026-09-19 — E8 lock-session kill: 6.39.0 detects a terminated lock connection and steps down, in under a second
+
+First run of the lock-session experiment, both arms, on the **PostgreSQL** arm. Wolverine
+**6.39.0**, net10.0, `postgres:16-alpine`, 3 replicas, `SIM_AGENT_COUNT=500`,
+`SIM_START_DELAY_MS=500`, stock knobs — **no** `SIM_BATCH_SIZE` (so `AgentStartBatchSize` is the
+shipping default) and **no** `SIM_STABILITY_WINDOW_SECONDS` (settle gate OFF). Schema dropped and
+pods bounced before the run, because the cluster had been left on `6.33.0-proposal.4`. Run
+directories `runs/lock-kill-20260919T142037Z` (terminate) and `runs/lock-kill-20260919T142756Z`
+(cancel).
+
+The question was the GH-2602 shape: a leader whose lock is taken away server-side while it stays
+alive, healthy and dispatching. On this build that window does not open, because the node notices.
+
+| | |
+|---|---|
+| victim | pid 913, `application_name wolverine-advisory-lock:WolverineEnvelopeStorage`, from 10.244.0.15 — the leader pod, checked against the leader assignment row before firing |
+| lock | advisory `832201495` = `"wolverine".GetDeterministicHashCode()` |
+| the fault | `pg_terminate_backend(913)` → the injector's read-back: **released**, nothing holding it |
+| handover | pid 913 granted at 14:20:58.79, pid 841 (10.244.0.14, a **different pod**) granted at 14:20:59.79 — **under one 1 s sampling tick** (K1) |
+| was a peer queued on the lock? | **no.** No ungranted row for `832201495` in any sample, so this was an election, not a blocked waiter being granted |
+| leaderless window | **< 1 s, and that is the instrument's floor, not a measurement of zero.** The monitor ticks at 1000 ms; resolving this properly needs `--tick-ms 100` |
+| the node's own account | `warn Wolverine.Postgresql.PostgresqlMessageStore: Lost advisory-lock connection for database WolverineEnvelopeStorage; clearing held lock ids 832201495` (at `PostgresqlNodePersistence.cs:529`), then `warn NodeAgentController: Node 3 stepping down from leadership: the leadership advisory lock was released server-side. Triggering a new leadership election.` |
+| checkers | all pass — S1–S7, L1 (converged 0.8 s after the marker, held 187 s), K1. S8/S9/S10/P1 skipped |
+| duplicates | none (S5); `safetylab overlaps`: 0 |
+| placement | 500/500 throughout, including across the handover |
+
+**The control arm.** `pg_cancel_backend` on the then-leader's lock session (pid 841): the statement
+was cancelled, and the lock **did not move for the whole 124 s** — leader unchanged, 500 placed,
+no duplicates, every check green. So the lock that moved in the terminate arm moved because the
+session died, not because its connection was disturbed. Without this the first arm's result would
+be one observation with nothing to be an observation against.
+
+**So: a negative result, and a specific one.** 6.39.0 handles a terminated leadership-lock
+connection deliberately — it detects the broken connection, clears its held lock ids, steps down
+and triggers an election rather than sitting on a stale belief. The lagging-belief window that
+`GH-2602` describes, and that the `select 1` liveness ping still makes possible in principle, did
+not open here at one-second resolution. What this run does **not** cover: a connection that dies
+without the client noticing (a silent network drop, where TCP keepalive decides the timing rather
+than an FATAL from the server) — which is the `tc netem` app↔DB partition in Layer 2, and is
+materially different precisely because the detection path exercised above never fires.
+
+**Caveats.** One run per arm. The `< 1 s` figure is bounded by the 1000 ms monitor tick. And the
+first control-arm attempt (`runs/lock-kill-20260919T142442Z`) failed K1 — that was a **harness**
+defect, not a finding: both arms wrote the same `lock-kill` mark, so K1 demanded the lock move on
+a run designed to prove it does not. The mark now names the arm and the ledger pins all four
+quadrants (`lock-kill`, `lock-kill-noop`, `lock-cancel`, `lock-cancel-moved`). That run is kept
+only as the reason the fix exists.
+
 ## 2026-09-19 — E7 split brain, run 2 (store-tier cut, default client): nothing happened, and that is the result
 
 The control for run 1, below. Same cluster, same build, same 420 s hold; the two differences are

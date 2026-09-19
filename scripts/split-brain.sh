@@ -237,7 +237,25 @@ heal() {
         ./scripts/monitor.sh mark partition-heal >/dev/null 2>&1 || true
     fi
 }
-trap heal EXIT INT TERM
+# EXIT heals on the normal path. INT and TERM heal, STOP THE CAPTURE, and exit.
+#
+# Two separate traps because a handler RETURNS to where it was interrupted: `trap heal EXIT INT
+# TERM` alone means a Ctrl-C (or a `timeout`) lifts the cut and then carries on running the
+# experiment against an intact cluster, which measures the wrong thing and says nothing about it.
+# Found the hard way on db-partition.sh, 2026-09-19.
+#
+# And the capture has to be stopped on that path too. Exiting straight out would leave runs/.active
+# set with the detached follower processes still running -- which is the leaked-follower trap that
+# appended one run's pods into the next one's directory for twenty minutes. The evidence captured
+# so far is kept; only the collectors are shut down.
+abort() {
+    heal
+    ./scripts/monitor.sh stop >/dev/null 2>&1 || true
+    exit "$1"
+}
+trap heal EXIT
+trap 'abort 130' INT
+trap 'abort 143' TERM
 
 ./scripts/monitor.sh mark settled >/dev/null
 row before 0
