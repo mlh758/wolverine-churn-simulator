@@ -29,25 +29,11 @@ to fix them.
 
 ## Backends
 
-The same simulation runs against two stores, because Wolverine's leader election
-is not the same algorithm on both and the difference is the interesting part.
-
-| | PostgreSQL | RavenDB |
-|---|---|---|
-| Leadership lock | session-scoped advisory lock, id `schemaName.GetDeterministicHashCode()` | compare-exchange document `wolverine/leader/<service>` with a **5-minute expiry** |
-| Released by | the holding backend's death, server-side, immediately | **nothing** — a peer must notice the expiry and CAS-replace it |
-| Lock names its owner | no; a `client_addr`, resolved through the pod identity map | yes, a node id in the document |
-| Assignments | one row per agent, PK-enforced | one `AgentAssignments` document per agent, id-enforced |
-| Reading them | `SELECT` | a query, which carries `IsStale` and a page limit |
-| Store clock | `now()` | the HTTP `Date` header, second resolution |
-
-The consequence worth stating plainly: **on RavenDB a leader that dies ungracefully
-leaves the lock behind for up to five minutes, and no actor in the server clears
-it.** The failure mode is not two leaders — it is *no* leader, for as long as
-nobody looks, and it is invisible from inside every node because
-`HasLeadershipLock()` reads a local field and never asks the server who owns the
-key. That is what SafetyLab's **S8** exists to measure, and it has no PostgreSQL
-counterpart at all.
+The same simulation currently supports RavenDB and PostgreSQL. The PG backend
+is built around acquiring an advisory lock with a long lived session. The other
+RDBMS implementations like MySQL and Oracle use a similar mechanism by taking
+a lock on a deterministic row. RavenDB uses a cluster-wide CAS operation to
+place the node ID and claim leadership.
 
 The backend is a **build-time** choice: `ChurnSim.csproj` selects both the message
 store package and the wiring file (`PostgresBackend.cs` / `RavenDbBackend.cs`) from
@@ -60,7 +46,7 @@ just deploy             # postgres (default)
 just deploy-ravendb     # the RavenDB arm
 ```
 
-The Wolverine version under test lives in **[`wolverine-version`](wolverine-version)** — one file,
+The Wolverine version under test lives in **[`wolverine-version`](wolverine-version)**,
 read by `Directory.Build.props`, the Dockerfile and `deploy.sh` alike. Edit it to move the whole
 rig to a new release; pass a version to `just deploy <v>` to override for one run. Every
 `WolverineFx` reference is pinned to an *exact* version (`[6.39.0]`), so a version that does not
@@ -82,22 +68,21 @@ Two constraints specific to the RavenDB arm:
   RavenDB's REST API and takes no Wolverine dependency, so it doubles as the query
   tool rather than needing a second image.
 
-`scripts/synth-guard-*.sh` are PostgreSQL-only and say so: they inject faults with
+`scripts/synth-guard-*.sh` are PostgreSQL-only: they inject faults with
 row-level security, which RavenDB has no equivalent of. They refuse to run on the
 RavenDB arm rather than silently measuring something else.
 
 ### The replicated RavenDB arm
 
 `just deploy-ravendb-cluster` swaps the single RavenDB pod for a **three-member cluster at
-replication factor 3** (`k8s/ravendb-cluster.yaml`), and it exists for one experiment: E7, the
+replication factor 3** (`k8s/ravendb-cluster.yaml`), useful for testing
 network partition (`just split-brain`, [docs/experiments.md](docs/experiments.md)). Nothing measured
 on it is comparable to the single-member RavenDB results, and the results file says which is which.
 
 **It needs a RavenDB license.** An unlicensed server runs one node and refuses to add a second
 (`402 LicenseLimitException`). The free Developer license allows three; request it at
 <https://ravendb.net/license/request>, then `just ravendb-license path/to/license.json` stores it as
-the Secret every member reads. The deploy refuses to start without it. The single-member arm needs
-no license.
+the Secret every member reads. The deploy refuses to start without it.
 
 Three things differ from the single-member arm, and each is there because without it there is no
 split to observe:
@@ -198,15 +183,10 @@ just measure         # churn report
 Use `just deploy-ravendb` (plus `just monitor-deploy`, which the RavenDB arm needs
 before it can be measured) and the other three are unchanged.
 
-The GH-3987 pathology this rig was built for no longer reproduces on a current package — the
-reconcile sweep shipped in **V6.36.0**. What a baseline is for now is a reference shape to compare
-a new release, a branch or an adverse scenario against.
-
 `just measure` reports:
 
 - node-record counts by event type — `AssignmentChanged` is the
-  churn signal the issue reporter counted (24k rows for one 3-pod rollout in
-  their production system);
+  churn signal
 - `AssignmentChanged` rows per minute, to see the churn concentrated in the
   rollout window;
 - current node registrations and per-node agent assignment counts — after the
@@ -427,22 +407,16 @@ wrong answers. Read it before trusting a number.
 
 ## Results
 
-Measured runs live in **[RESULTS.md](RESULTS.md)**, dated newest first — currently the RavenDB
-arm's leaderless-failover finding and the GH-3959 overload collapse-and-recovery.
+Measured runs live in **[RESULTS.md](RESULTS.md)**, dated newest first
 
-Anything measured before **V6.36.0** is in **[ARCHIVED_RESULTS.md](ARCHIVED_RESULTS.md)**. That
-release took the GH-3987 reconcile sweep (#4404) and its GH-4407 hardening, which is exactly the
-behaviour those runs provoked, so they do not reproduce against a current package: the stock
-6.35.0 duplicate-rate and heal-test work, the mechanism trace, the 6.33 stock-versus-proposal
-comparison, and 5.39's original pathology. Kept as provenance, not as results.
+**[ARCHIVED_RESULTS.md](ARCHIVED_RESULTS.md)** holds interesting findings that have since been patched.
 
 Wolverine ships often. This rig measures what is shipping, so the default is the latest released
 package and old arms are archived rather than carried.
 
 ## Bisecting a Wolverine branch
 
-`localfeed/` is gitignored and **empty by default** — the pre-6.36 packages it was created for
-have been deleted, since the fixes shipped and the comparison no longer reproduces. The directory
+`localfeed/` is gitignored and **empty by default**. The directory
 itself must exist (the Dockerfile COPYs it). Populate it only to bisect a branch or a pre-release;
 otherwise pass a released version straight to `deploy.sh`. To pack a branch:
 
@@ -468,10 +442,3 @@ Use `just reset-schema` between different Wolverine builds — leftover rows fro
 schema are not a baseline. [docs/experiments.md](docs/experiments.md) has the scenario recipes
 (churn shape, the GH-3959 overload cascade, the synthetic-self guard) and what each one is
 looking for.
-
-> **ChurnSim targets net10.0, and that is the baseline.** net8 and net9 are both near end of
-> support and net11 is already out, so the rig stays pinned to one current runtime rather than
-> tracking a retired one. The overload scenario was rerun on net10.0 on 2026-09-11 and reproduces
-> the net9.0 shape; that entry in RESULTS.md replaced the older numbers outright. Entries dated
-> before 2026-09-11 were taken on net9.0 unless they say otherwise; compare within a framework,
-> not across.
