@@ -1,4 +1,5 @@
 using ChurnSim;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -13,8 +14,9 @@ var builder = Host.CreateApplicationBuilder(args);
 // SimBackend switch), but SIM_BACKEND on the deployment is what every measurement script reads
 // to pick its query path. If the two disagree, the arm is mislabelled and the run is scrap --
 // and a mislabelled arm has already cost this rig three launches (see duplicate-rate.sh). Die
-// here rather than produce numbers filed under the wrong backend.
-var declaredBackend = Environment.GetEnvironmentVariable("SIM_BACKEND");
+// here rather than produce numbers filed under the wrong backend. Read off the configuration root
+// rather than SimOptions so this is reported ahead of any binder complaint about another knob.
+var declaredBackend = builder.Configuration["SIM_BACKEND"];
 if (!string.IsNullOrWhiteSpace(declaredBackend) &&
     !string.Equals(declaredBackend, SimBackend.Name, StringComparison.OrdinalIgnoreCase))
 {
@@ -24,13 +26,14 @@ if (!string.IsNullOrWhiteSpace(declaredBackend) &&
         ", or fix the deployment's SIM_BACKEND. Refusing to run a mislabelled arm.");
 }
 
+var sim = builder.Configuration.Get<SimOptions>() ?? new SimOptions();
+
 // Startup lines are written before a logger exists, but they must not break the log stream:
 // DuckDB reads the pod log as newline-delimited JSON, and a single bare-text line makes the whole
 // file unparseable. Emit them in the same shape the JSON console formatter uses.
-var jsonLogs = Environment.GetEnvironmentVariable("SIM_JSON_LOGS") == "true";
 void emit(string category, string message, IDictionary<string, object?> state)
 {
-    if (!jsonLogs)
+    if (!sim.JsonLogs)
     {
         Console.WriteLine(message);
         return;
@@ -56,7 +59,7 @@ void emit(string category, string message, IDictionary<string, object?> state)
 // Deliberately NOT in-process OTLP log export: this rig hunts races and timing cadences, and an
 // exporter's batching threads and allocations sit inside the process under measurement. Writing a
 // differently-formatted line to stdout costs the same as writing the old one.
-if (Environment.GetEnvironmentVariable("SIM_JSON_LOGS") == "true")
+if (sim.JsonLogs)
 {
     builder.Logging.ClearProviders();
     builder.Logging.AddJsonConsole(o =>
@@ -75,20 +78,19 @@ if (Environment.GetEnvironmentVariable("SIM_JSON_LOGS") == "true")
 // pipeline, so a trace shows the leader's dispatch, the receiving node's execution, and the gap
 // between the two -- which is what state sampling and log scraping cannot show. Off unless
 // SIM_OTLP_ENDPOINT is set, so a default run stays comparable with earlier results.
-var otlp = Environment.GetEnvironmentVariable("SIM_OTLP_ENDPOINT");
-if (!string.IsNullOrWhiteSpace(otlp))
+if (!string.IsNullOrWhiteSpace(sim.OtlpEndpoint))
 {
     builder.Services.AddOpenTelemetry()
         .ConfigureResource(r => r.AddService(
             serviceName: "churnsim",
-            serviceInstanceId: Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName))
+            serviceInstanceId: sim.PodName))
         .WithTracing(t => t
             .AddSource("Wolverine")
             .SetSampler(new AlwaysOnSampler())
-            .AddOtlpExporter(o => o.Endpoint = new Uri(otlp)));
+            .AddOtlpExporter(o => o.Endpoint = new Uri(sim.OtlpEndpoint)));
 
-    emit("ChurnSim.Startup", $"CONFIG OTLP tracing -> {otlp}",
-        new Dictionary<string, object?> { ["Setting"] = "SIM_OTLP_ENDPOINT", ["Value"] = otlp });
+    emit("ChurnSim.Startup", $"CONFIG OTLP tracing -> {sim.OtlpEndpoint}",
+        new Dictionary<string, object?> { ["Setting"] = "SIM_OTLP_ENDPOINT", ["Value"] = sim.OtlpEndpoint });
 }
 
 builder.UseWolverine(opts =>
@@ -100,15 +102,13 @@ builder.UseWolverine(opts =>
     // this the monitor can see that *a* lock is held and *a* node claims leadership, but not
     // whether they are the same node -- which is the whole question in a split-brain.
     // POD_NAME / POD_IP come from the downward API in k8s/churnsim.yaml.
-    var podName = Environment.GetEnvironmentVariable("POD_NAME") ?? Environment.MachineName;
-    var podIp = Environment.GetEnvironmentVariable("POD_IP") ?? "unknown";
     emit("ChurnSim.Startup",
-        $"SIM-IDENTITY nodeId={opts.UniqueNodeId} podName={podName} podIp={podIp} at {DateTimeOffset.UtcNow:O}",
+        $"SIM-IDENTITY nodeId={opts.UniqueNodeId} podName={sim.PodName} podIp={sim.PodIp} at {DateTimeOffset.UtcNow:O}",
         new Dictionary<string, object?>
         {
             ["NodeId"] = opts.UniqueNodeId.ToString(),
-            ["PodName"] = podName,
-            ["PodIp"] = podIp
+            ["PodName"] = sim.PodName,
+            ["PodIp"] = sim.PodIp
         });
 
     // No message handlers needed -- the point is the agent assignment plane
@@ -117,7 +117,7 @@ builder.UseWolverine(opts =>
     // The one line that differs between arms. Everything below -- the control-plane timers, the
     // proposal knobs, the agent family -- is held constant on purpose, so a difference between a
     // PostgreSQL run and a RavenDB run is the store's semantics and not the simulation's.
-    SimBackend.Configure(opts, emit);
+    SimBackend.Configure(opts, builder.Configuration, emit);
 
     // Tighten the control-plane timers a bit so a short simulated rollout
     // exercises several health-check / assignment cycles. These stay well
@@ -126,10 +126,9 @@ builder.UseWolverine(opts =>
     opts.Durability.CheckAssignmentPeriod = TimeSpan.FromSeconds(5);
 
     // The GH-3987/GH-3959 proposal settings only exist on the patched build
-    // (6.33.0-proposal.*). Set them reflectively from env vars so this same
-    // program runs unchanged against released 5.39, stock main, and the
-    // proposal build -- on builds without the property the knob is just
-    // reported as unavailable.
+    // (6.33.0-proposal.*). Set them reflectively so this same program runs
+    // unchanged against released 5.39, stock main, and the proposal build --
+    // on builds without the property the knob is just reported as unavailable.
     void trySet(string property, object value)
     {
         var prop = opts.Durability.GetType().GetProperty(property);
@@ -146,9 +145,9 @@ builder.UseWolverine(opts =>
         }
     }
 
-    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_BATCH_SIZE"), out var batch) && batch > 0)
+    if (sim.BatchSize > 0)
     {
-        trySet("AgentStartBatchSize", batch);
+        trySet("AgentStartBatchSize", sim.BatchSize.Value);
     }
 
     // The "hold the rebalance until the roster stops moving" idea exists under two names: the
@@ -158,36 +157,38 @@ builder.UseWolverine(opts =>
     //
     // Note both default to zero -- upstream's gate is OFF out of the box, so a run without this
     // variable is measuring stock behaviour, not GH-4367's.
-    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STABILITY_WINDOW_SECONDS"), out var window) && window > 0)
+    if (sim.StabilityWindowSeconds > 0)
     {
-        trySet("AssignmentStabilityWindow", TimeSpan.FromSeconds(window));
-        trySet("AssignmentSettlePeriod", TimeSpan.FromSeconds(window));
+        var window = TimeSpan.FromSeconds(sim.StabilityWindowSeconds.Value);
+        trySet("AssignmentStabilityWindow", window);
+        trySet("AssignmentSettlePeriod", window);
     }
 
     // For the synthetic-self-guard runs: shrink the stale line toward the (2s) heartbeat cadence so
     // that GC pauses / start storms make peers eject live nodes' rows, opening the read-miss window
     // where a node's own snapshot omits its row and the reconcile sweep must sit the tick out.
-    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_STALE_NODE_TIMEOUT_SECONDS"), out var stale) && stale > 0)
+    if (sim.StaleNodeTimeoutSeconds > 0)
     {
-        trySet("StaleNodeTimeout", TimeSpan.FromSeconds(stale));
+        trySet("StaleNodeTimeout", TimeSpan.FromSeconds(sim.StaleNodeTimeoutSeconds.Value));
     }
 
     // Node-side reconcile sweep threshold (consecutive ticks). Only exists on sweep builds; 0 disables.
-    if (int.TryParse(Environment.GetEnvironmentVariable("SIM_RECONCILE_THRESHOLD"), out var reconcile))
+    if (sim.ReconcileThreshold is { } reconcile)
     {
         trySet("LocalAgentReconciliationThreshold", reconcile);
     }
 
-    if (Environment.GetEnvironmentVariable("SIM_CAPACITY_AWARE") == "true")
+    if (sim.CapacityAware)
     {
         trySet("CapacityAwareAssignment", true);
 
-        if (double.TryParse(Environment.GetEnvironmentVariable("SIM_OVERLOAD_THRESHOLD"), out var threshold) && threshold > 0)
+        if (sim.OverloadThreshold > 0)
         {
-            trySet("NodeOverloadThreshold", threshold);
+            trySet("NodeOverloadThreshold", sim.OverloadThreshold.Value);
         }
     }
 
+    opts.Services.AddSingleton(sim);
     opts.Services.AddSingleton<IAgentFamily, SimAgentFamily>();
 });
 

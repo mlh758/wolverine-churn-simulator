@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations;
@@ -37,34 +38,16 @@ internal static class SimBackend
     /// <summary>Must match the SIM_BACKEND env var the deployment declares; Program.cs asserts it.</summary>
     public const string Name = "ravendb";
 
-    public static void Configure(WolverineOptions opts, SimLog emit)
+    public static void Configure(WolverineOptions opts, IConfiguration config, SimLog emit)
     {
-        var urls = (Environment.GetEnvironmentVariable("RAVENDB_URLS") ?? "http://ravendb:8080")
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        var database = Environment.GetEnvironmentVariable("RAVENDB_DATABASE") ?? "churnsim";
+        var settings = config.Get<RavenDbOptions>() ?? new RavenDbOptions();
+
+        var urls = settings.Urls.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var database = settings.Database;
+        var pinNode = settings.PinNode;
+        var replicationFactor = settings.ReplicationFactor > 0 ? settings.ReplicationFactor : 1;
 
         requireNativeControlQueue();
-
-        // RAVENDB_PIN_NODE=true: this node talks ONLY to the url(s) it was given and never learns
-        // the rest of the cluster. The RavenDB client fetches the database group's topology on
-        // startup and fails over to any member it can reach, which is the right behaviour for an
-        // application and the wrong one for a partition experiment: cut this pod's member off and
-        // the client quietly reroutes to the majority, so there is no minority side to observe and
-        // the run measures client failover instead of a split. The replicated arm pins each pod to
-        // its own store member by StatefulSet ordinal (k8s/churnsim-ravendb-cluster.yaml). Off by
-        // default, so the single-node arm and every earlier result are unchanged.
-        var pinNode = Environment.GetEnvironmentVariable("RAVENDB_PIN_NODE") == "true";
-
-        // RAVENDB_REPLICATION_FACTOR: what ensureDatabaseReady creates the database with when it
-        // finds none. Default 1, which is what every single-node run used. The replicated arm
-        // forms its cluster and creates the database at factor 3 BEFORE any pod starts (deploy.sh
-        // runs `safetylab raven-cluster form`), so this only matters after a `reset-schema` on
-        // that arm — where recreating at factor 1 would silently turn a three-member cluster into
-        // three servers replicating nothing.
-        var replicationFactor =
-            int.TryParse(Environment.GetEnvironmentVariable("RAVENDB_REPLICATION_FACTOR"), out var rf) && rf > 0
-                ? rf
-                : 1;
 
         var store = new DocumentStore
         {
@@ -229,4 +212,38 @@ internal static class SimBackend
             $"RavenDB database '{database}' did not become ready within 60 seconds " +
             $"({attempts} attempts). Last failure is the inner exception.", last);
     }
+}
+
+/// <summary>Separate from <see cref="SimOptions"/>: only one backend file compiles.</summary>
+internal sealed class RavenDbOptions
+{
+    /// <summary>Comma-separated; the replicated arm gives each pod its own store member.</summary>
+    [ConfigurationKeyName("RAVENDB_URLS")]
+    public string Urls { get; set; } = "http://ravendb:8080";
+
+    [ConfigurationKeyName("RAVENDB_DATABASE")]
+    public string Database { get; set; } = "churnsim";
+
+    /// <summary>
+    /// True: this node talks ONLY to the url(s) it was given and never learns the rest of the
+    /// cluster. The RavenDB client fetches the database group's topology on startup and fails over
+    /// to any member it can reach, which is the right behaviour for an application and the wrong
+    /// one for a partition experiment: cut this pod's member off and the client quietly reroutes
+    /// to the majority, so there is no minority side to observe and the run measures client
+    /// failover instead of a split. The replicated arm pins each pod to its own store member by
+    /// StatefulSet ordinal (k8s/churnsim-ravendb-cluster.yaml). Off by default, so the single-node
+    /// arm and every earlier result are unchanged.
+    /// </summary>
+    [ConfigurationKeyName("RAVENDB_PIN_NODE")]
+    public bool PinNode { get; set; }
+
+    /// <summary>
+    /// What ensureDatabaseReady creates the database with when it finds none. Default 1, which is
+    /// what every single-node run used. The replicated arm forms its cluster and creates the
+    /// database at factor 3 BEFORE any pod starts (deploy.sh runs `safetylab raven-cluster form`),
+    /// so this only matters after a `reset-schema` on that arm — where recreating at factor 1
+    /// would silently turn a three-member cluster into three servers replicating nothing.
+    /// </summary>
+    [ConfigurationKeyName("RAVENDB_REPLICATION_FACTOR")]
+    public int ReplicationFactor { get; set; } = 1;
 }

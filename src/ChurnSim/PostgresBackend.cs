@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Wolverine;
 using Wolverine.Postgresql;
 
@@ -17,14 +18,21 @@ internal static class SimBackend
     /// <summary>Must match the SIM_BACKEND env var the deployment declares; Program.cs asserts it.</summary>
     public const string Name = "postgres";
 
-    public static void Configure(WolverineOptions opts, SimLog emit)
+    public static void Configure(WolverineOptions opts, IConfiguration config, SimLog emit)
     {
-        var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
-                               ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
+        var settings = config.Get<PostgresOptions>() ?? new PostgresOptions();
 
-        opts.PersistMessagesWithPostgresql(connectionString, "wolverine");
+        opts.PersistMessagesWithPostgresql(settings.ConnectionString, "wolverine");
 
         emit("ChurnSim.Startup", "CONFIG backend=postgres schema=wolverine",
             new Dictionary<string, object?> { ["Setting"] = "SIM_BACKEND", ["Value"] = Name });
     }
+}
+
+/// <summary>Separate from <see cref="SimOptions"/>: only one backend file compiles.</summary>
+internal sealed class PostgresOptions
+{
+    [ConfigurationKeyName("POSTGRES_CONNECTION")]
+    public string ConnectionString { get; set; } =
+        "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
 }

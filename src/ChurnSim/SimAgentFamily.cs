@@ -19,19 +19,12 @@ public class SimAgentFamily : IStaticAgentFamily
     private readonly int _agentMb;
     private readonly int _startDelay;
 
-    public SimAgentFamily(ILogger<SimAgentFamily> logger)
+    public SimAgentFamily(ILogger<SimAgentFamily> logger, SimOptions options)
     {
         _logger = logger;
-        _count = int.TryParse(Environment.GetEnvironmentVariable("SIM_AGENT_COUNT"), out var c) ? c : 20;
-
-        // Optional per-agent memory weight (MB) so overload scenarios (GH-3959)
-        // can be simulated later by giving each running agent a real footprint
-        _agentMb = int.TryParse(Environment.GetEnvironmentVariable("SIM_AGENT_MB"), out var mb) ? mb : 0;
-
-        // Optional startup delay per agent, mimicking projection agents that need
-        // to catch up before they're "running" -- the slow starts that stretch
-        // GH-3987's rollout overlap windows
-        _startDelay = int.TryParse(Environment.GetEnvironmentVariable("SIM_START_DELAY_MS"), out var d) ? d : 0;
+        _count = options.AgentCount;
+        _agentMb = options.AgentMb;
+        _startDelay = options.StartDelayMs;
     }
 
     public string Scheme => SchemeName;
