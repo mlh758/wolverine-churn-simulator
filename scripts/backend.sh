@@ -3,6 +3,8 @@
 #
 # DEPENDS ON  a deployed store. The RavenDB path additionally needs a live safetylab pod
 #             (./scripts/monitor.sh deploy) and returns 2 with that instruction when there is none.
+#             The PostgreSQL and MySQL paths exec a client that ships in the store's own image, so
+#             they need nothing but the store.
 # REQUIRES    nothing; every function reports rather than assumes.
 # PRODUCES    tab-separated text on stdout. db_reset_metrics and db_drop MUTATE; the rest read.
 #
@@ -16,7 +18,7 @@
 # came through them, so there was no comparability to protect.
 #
 #   source scripts/backend.sh
-#   sim_backend            -> postgres | ravendb
+#   sim_backend            -> postgres | mysql | ravendb
 #   sim_topology           -> single | cluster   (cluster = the replicated RavenDB store, E7)
 #   sim_workload           -> deployment/churnsim | statefulset/churnsim
 #   bounce_workload        -> restart every churnsim pod and wait, on either workload kind
@@ -75,10 +77,12 @@ sim_backend() {
 
     # No workload declares it. On the replicated arm the monitor is deployed BEFORE churnsim
     # (the cluster is formed through it), so fall back to the store that is present. A cluster
-    # with neither workload nor a RavenDB store, or a deployment predating the RavenDB arm, was
-    # PostgreSQL.
+    # with no workload and no non-PostgreSQL store, or a deployment predating the RavenDB arm,
+    # was PostgreSQL.
     if $K get statefulset ravendb >/dev/null 2>&1 || $K get deployment ravendb >/dev/null 2>&1; then
         echo "ravendb"
+    elif $K get deployment mysql >/dev/null 2>&1; then
+        echo "mysql"
     else
         echo "postgres"
     fi
@@ -155,6 +159,27 @@ _psql() {
     $K exec "$pod" -- psql -U postgres -d churnsim -qAt -c "$1"
 }
 
+# A LIVE mysql pod, for the same reason as _pgpod.
+_mysqlpod() { "$SAFETYLAB" pick-pod --label app=mysql; }
+
+# The mysql client inside the store pod. Three things here are load-bearing:
+#
+#   -N -B   batch mode with no column names: tab-separated rows, which is the same shape psql -qAt
+#           with an explicit chr(9) produces, so every caller parses one format. It also escapes a
+#           tab inside a value rather than emitting it raw.
+#   MYSQL_PWD, not -p  -- `-p<pass>` makes the client warn "Using a password on the command line
+#           interface can be insecure" on stderr, and stderr is NOT discarded here (see _psql).
+#           The password is read from the container's own MYSQL_ROOT_PASSWORD, so this file holds
+#           no second copy of it.
+#   "$1"    the SQL is a positional argument to sh, never interpolated into the -c string. A query
+#           containing a quote would otherwise be reassembled into a different query.
+_mysql() {
+    local pod
+    pod=$(_mysqlpod) || { echo "backend.sh: no live MySQL pod to query" >&2; return 2; }
+    $K exec "$pod" -- sh -c 'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"; exec mysql -u root -N -B -e "$1"' \
+        backend.sh "$1"
+}
+
 # `safetylab query` inside the monitor pod -- the only container that can talk to RavenDB in these
 # terms, so the RavenDB arm needs `./scripts/monitor.sh deploy` before it can be measured at all.
 _raven() {
@@ -175,6 +200,8 @@ _raven() {
 db_placed() {
     case "$(sim_backend)" in
         ravendb) _raven query placed | tr -d '[:space:]' ;;
+        mysql) _mysql "select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';" \
+               | tr -d '[:space:]' ;;
         *) _psql "select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';" \
                | tr -d '[:space:]' ;;
     esac
@@ -183,6 +210,8 @@ db_placed() {
 db_nodes() {
     case "$(sim_backend)" in
         ravendb) _raven query nodes ;;
+        mysql) _mysql "select node_number, description
+                    from wolverine.wolverine_nodes order by node_number;" ;;
         *) _psql "select node_number || chr(9) || description
                     from wolverine.wolverine_nodes order by node_number;" ;;
     esac
@@ -191,6 +220,8 @@ db_nodes() {
 db_per_node() {
     case "$(sim_backend)" in
         ravendb) _raven query per-node ;;
+        mysql) _mysql "select node_id, count(*)
+                    from wolverine.wolverine_node_assignments group by node_id;" ;;
         *) _psql "select node_id || chr(9) || count(*)
                     from wolverine.wolverine_node_assignments group by node_id;" ;;
     esac
@@ -199,6 +230,8 @@ db_per_node() {
 db_records() {
     case "$(sim_backend)" in
         ravendb) _raven query records ;;
+        mysql) _mysql "select event_name, count(*)
+                    from wolverine.wolverine_node_records group by event_name order by count(*) desc;" ;;
         *) _psql "select event_name || chr(9) || count(*)
                     from wolverine.wolverine_node_records group by event_name order by count(*) desc;" ;;
     esac
@@ -208,6 +241,12 @@ db_per_minute() {
     local event="${1:-AssignmentChanged}"
     case "$(sim_backend)" in
         ravendb) _raven query per-minute --event "$event" ;;
+        # `timestamp` is backticked: it is a non-reserved keyword in MySQL and parses bare today,
+        # but a column named after a type is exactly the thing a server version bump reclassifies.
+        mysql) _mysql "select date_format(\`timestamp\`, '%Y-%m-%d %H:%i'), count(*)
+                    from wolverine.wolverine_node_records
+                   where event_name = '$event'
+                   group by 1 order by 1;" ;;
         *) _psql "select to_char(date_trunc('minute', timestamp), 'YYYY-MM-DD HH24:MI') || chr(9) || count(*)
                     from wolverine.wolverine_node_records
                    where event_name = '$event'
@@ -218,6 +257,7 @@ db_per_minute() {
 db_reset_metrics() {
     case "$(sim_backend)" in
         ravendb) _raven admin reset-metrics ;;
+        mysql) _mysql "truncate table wolverine.wolverine_node_records;" ;;
         *) _psql "truncate wolverine.wolverine_node_records;" ;;
     esac
 }
@@ -225,6 +265,11 @@ db_reset_metrics() {
 db_drop() {
     case "$(sim_backend)" in
         ravendb) _raven admin drop-database ;;
+        # On MySQL the schema IS a database, so the PostgreSQL `drop schema ... cascade` is a
+        # `drop database`. The app connects to `churnsim`, NOT to this one (see
+        # src/ChurnSim/MySqlBackend.cs), which is what makes dropping it survivable: the bounced
+        # pods reconnect and Weasel recreates it.
+        mysql) _mysql "drop database if exists wolverine;" ;;
         *) _psql "drop schema if exists wolverine cascade;" ;;
     esac
 }

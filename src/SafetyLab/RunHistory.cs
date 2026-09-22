@@ -5,9 +5,10 @@ namespace SafetyLab;
 /// <summary>
 /// One holder of the leadership lock, normalised across backends.
 /// <paramref name="Where"/> is the server-side evidence in the backend's own vocabulary (a
-/// Postgres pid and client address, or a RavenDB compare-exchange key and Raft index) and goes
-/// straight into violation text, so a report still says where to go and look.
-/// <paramref name="ExpiresAt"/> is RavenDB-only and null on PostgreSQL, where a lock has no
+/// Postgres pid or MySQL connection id with its client address, or a RavenDB compare-exchange key
+/// and Raft index) and goes straight into violation text, so a report still says where to go and
+/// look.
+/// <paramref name="ExpiresAt"/> is RavenDB-only and null on both RDBMS arms, where a lock has no
 /// expiry because the death of its session <em>is</em> its release.
 /// </summary>
 public sealed record LeaderHolder(string Where, Guid? NodeId, DateTimeOffset? ExpiresAt);
@@ -81,6 +82,34 @@ public sealed class RunHistory
     public string Backend => Meta?.BackendName ?? Backends.Postgres;
 
     public bool IsRavenDb => Backend == Backends.RavenDb;
+
+    public bool IsMySql => Backend == Backends.MySql;
+
+    /// <summary>
+    /// Whether this run's leadership lock belongs to a SESSION — true on both RDBMS arms, false on
+    /// RavenDB. Checkers branch on this rather than on the product name wherever the question is
+    /// about the protocol (S8 has nothing to describe when a lock cannot outlive its holder);
+    /// <see cref="IsRavenDb"/> stays for the places where the question really is "is this RavenDB".
+    /// </summary>
+    public bool IsSessionLock => Backends.IsSessionLock(Backend);
+
+    /// <summary>The store's name as a reader would write it, for report prose.</summary>
+    public string StoreName => Backend switch
+    {
+        Backends.MySql => "MySQL",
+        Backends.RavenDb => "RavenDB",
+        _ => "PostgreSQL"
+    };
+
+    /// <summary>
+    /// What this store calls its session-scoped lock, and what it calls the thing that holds one.
+    /// PostgreSQL: an advisory lock held by a backend. MySQL: a named lock held by a connection.
+    /// Same mechanism, and a report that used one store's words for the other sends a reader to
+    /// a catalog view that does not exist.
+    /// </summary>
+    public string SessionLockNoun => IsMySql ? "named lock" : "advisory lock";
+
+    public string SessionHolderNoun => IsMySql ? "connection" : "backend";
 
     /// <summary>
     /// RavenDB's leadership compare-exchange key. Matches both the suffixed form the store settles
@@ -204,9 +233,11 @@ public sealed class RunHistory
         => Identities.LastOrDefault(x => x.NodeId == nodeId)?.PodName;
 
     /// <summary>
-    /// The leader lock's granted holders in a sample. More than one would be a Postgres bug.
-    /// <c>pg_locks.objid</c> is an unsigned <c>oid</c>, so a schema whose hash is negative appears
-    /// as the 2^32 complement — compare on the low 32 bits rather than the signed value.
+    /// The leader lock's granted holders in a sample. More than one would be a store bug on either
+    /// RDBMS arm. <c>pg_locks.objid</c> is an unsigned <c>oid</c>, so a schema whose hash is
+    /// negative appears as the 2^32 complement — compare on the low 32 bits rather than the signed
+    /// value. (MySQL carries the id as the signed integer in the lock's name, so the mask is a
+    /// no-op there; one comparison serves both.)
     /// </summary>
     public IEnumerable<LockRow> LeaderLockHolders(Sample sample)
     {
@@ -220,12 +251,13 @@ public sealed class RunHistory
     /// copy of them: the properties ("at most one holder", "the holder and the row agree", "the
     /// holder is still a registered node") are about the protocol, not about the store.
     ///
-    /// The two backends differ in what they can answer, and the difference is real rather than
-    /// cosmetic. PostgreSQL knows a <c>client_addr</c>, so <see cref="LeaderHolder.NodeId"/> is
-    /// null whenever the identity map cannot place that address — a case S4 exists to report. On
-    /// RavenDB the lock document names its owner, so the node id is always known and never needs
-    /// pod logs; what RavenDB adds instead is <see cref="LeaderHolder.ExpiresAt"/>, which Postgres
-    /// has no equivalent for at all.
+    /// The backends differ in what they can answer, and the difference is real rather than
+    /// cosmetic. The RDBMS arms know only an address (<c>pg_stat_activity.client_addr</c>,
+    /// <c>performance_schema.threads.PROCESSLIST_HOST</c>), so <see cref="LeaderHolder.NodeId"/>
+    /// is null whenever the identity map cannot place it — a case S4 exists to report. On RavenDB
+    /// the lock document names its owner, so the node id is always known and never needs pod logs;
+    /// what RavenDB adds instead is <see cref="LeaderHolder.ExpiresAt"/>, which a session lock has
+    /// no equivalent for at all.
     /// </summary>
     public IReadOnlyList<LeaderHolder> LeaderHolders(Sample sample)
     {
@@ -250,9 +282,13 @@ public sealed class RunHistory
                 .ToList();
         }
 
+        // "pid" on PostgreSQL, "connection" on MySQL -- the number means the same thing (it is
+        // what you would terminate) but naming it wrong sends a reader to the wrong catalog view.
+        var holderNoun = IsMySql ? "connection" : "pid";
+
         return LeaderLockHolders(sample)
-            .Select(x => new LeaderHolder($"pid {x.Pid} ({x.ClientAddr})", NodeForAddress(x.ClientAddr, sample.Ts),
-                null))
+            .Select(x => new LeaderHolder($"{holderNoun} {x.Pid} ({x.ClientAddr})",
+                NodeForAddress(x.ClientAddr, sample.Ts), null))
             .ToList();
     }
 
@@ -285,9 +321,15 @@ public sealed class RunHistory
     }
 
     /// <summary>How the leader lock is named in a report line, for the header of a run.</summary>
-    public string LeaderLockDescription => IsRavenDb
-        ? $"compare-exchange '{Meta?.LockKey ?? "wolverine/leader/*"}'"
-        : $"advisory lock {LeaderLockId}";
+    public string LeaderLockDescription => Backend switch
+    {
+        Backends.RavenDb => $"compare-exchange '{Meta?.LockKey ?? "wolverine/leader/*"}'",
+        // The id is carried too, not just the name: it is the only thing that ties the lock back
+        // to the schema it was derived from, and a wrong one is the failure S1 exists to catch.
+        Backends.MySql => $"named lock '{Meta?.LockKey ?? MySqlClusterMonitor.LockName(LeaderLockId)}' " +
+                          $"(id {LeaderLockId})",
+        _ => $"advisory lock {LeaderLockId}"
+    };
 
     public static AssignmentRow? LeaderRow(Sample sample)
         => sample.Assignments.FirstOrDefault(x => IsLeaderUri(x.Id));

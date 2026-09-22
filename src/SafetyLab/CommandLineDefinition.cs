@@ -75,7 +75,7 @@ public static class CommandLineDefinition
         };
         // The old code checked this by hand and fell through to an error message. Declaring it
         // means an unknown backend is rejected by the parser, with the valid values listed.
-        backend.AcceptOnlyFromAmong(Backends.Postgres, Backends.RavenDb);
+        backend.AcceptOnlyFromAmong(Backends.All);
 
         var tick = new Option<int>("--tick-ms")
         {
@@ -85,12 +85,16 @@ public static class CommandLineDefinition
 
         var schema = new Option<string>("--schema")
         {
-            Description = "PostgreSQL schema", DefaultValueFactory = _ => "wolverine"
+            // On MySQL the schema IS a database; the flag stays spelled the same because it names
+            // the same thing to Wolverine (DatabaseSettings.SchemaName) and derives the same lock
+            // id on both RDBMS arms.
+            Description = "PostgreSQL schema / MySQL database holding the Wolverine tables",
+            DefaultValueFactory = _ => "wolverine"
         };
 
         var lockId = new Option<long?>("--lock-id")
         {
-            Description = "override the advisory lock id (default: derived from --schema)"
+            Description = "override the leadership lock id (default: derived from --schema)"
         };
 
         var service = new Option<string>("--service")

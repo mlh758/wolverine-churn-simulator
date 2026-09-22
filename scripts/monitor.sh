@@ -87,10 +87,10 @@ cmd_deploy() {
     minikube image load /tmp/safetylab-local.tar
     rm -f /tmp/safetylab-local.tar
 
-    # One image, two manifests. The monitor binary speaks both stores; which one it watches is
-    # an argument, and it must match the arm that is deployed -- a monitor pointed at an empty
-    # Postgres while the cluster runs on RavenDB would produce a history full of nothing and
-    # every safety check would pass over it.
+    # One image, one manifest per arm. The monitor binary speaks all three stores; which one it
+    # watches is an argument, and it must match the arm that is deployed -- a monitor pointed at
+    # an empty Postgres while the cluster runs on RavenDB would produce a history full of nothing
+    # and every safety check would pass over it.
     # The RavenDB arm has two topologies and the difference is the monitor's whole job on the
     # replicated one: it must read every member, not the Service, or a partition is invisible.
     # Read off the STORE, not the app workload: on the replicated arm the monitor is deployed
@@ -101,6 +101,7 @@ cmd_deploy() {
     case "$backend/$topology" in
         ravendb/cluster) manifest="k8s/safetylab-ravendb-cluster.yaml" ;;
         ravendb/*) manifest="k8s/safetylab-ravendb.yaml" ;;
+        mysql/*) manifest="k8s/safetylab-mysql.yaml" ;;
         *) manifest="k8s/safetylab.yaml" ;;
     esac
 

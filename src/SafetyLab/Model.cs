@@ -22,7 +22,27 @@ public static class Json
 public static class Backends
 {
     public const string Postgres = "postgres";
+
+    /// <summary>
+    /// The second RDBMS arm. Structurally the same as <see cref="Postgres"/> from out here — a
+    /// session-scoped lock whose holder is a server-side connection, so a sample carries
+    /// <see cref="LockRow"/>s and not compare-exchange values — which is the whole reason it
+    /// needed no second copy of any checker.
+    /// </summary>
+    public const string MySql = "mysql";
+
     public const string RavenDb = "ravendb";
+
+    /// <summary>Every value <c>SIM_BACKEND</c> and <c>--backend</c> accept.</summary>
+    public static readonly string[] All = [Postgres, MySql, RavenDb];
+
+    /// <summary>
+    /// Backends whose leadership lock belongs to a SESSION, so that the death of the session is
+    /// the release and the lock can never outlive its holder. The distinction the checkers care
+    /// about is this one and not the product name: S8 (an expired-but-unclaimed lock) is
+    /// meaningless here, and S11 (a holder that stopped heartbeating) only means anything here.
+    /// </summary>
+    public static bool IsSessionLock(string backend) => backend is Postgres or MySql;
 }
 
 /// <summary>
@@ -51,9 +71,37 @@ public record MetaRecord(
 }
 
 /// <summary>
-/// One row of <c>pg_locks</c> for an advisory lock, joined to its backend. Advisory locks
-/// other than the leader lock are captured too — Wolverine takes them for durability agents
-/// and for schema migration, and a run where those pile up is worth seeing.
+/// One session-scoped lock held on the store, with whatever the server knows about its holder.
+/// Locks other than the leader lock are captured too — Wolverine takes them for durability
+/// agents and for schema migration, and a run where those pile up is worth seeing.
+///
+/// On PostgreSQL this is a row of <c>pg_locks</c> where <c>locktype = 'advisory'</c>, joined to
+/// <c>pg_stat_activity</c>. On MySQL it is a <c>GET_LOCK</c> named lock, which the server models
+/// differently enough to be worth spelling out field by field:
+///
+/// <list type="bullet">
+///   <item><paramref name="Pid"/> — the MySQL connection id, i.e. what <c>KILL</c> takes.</item>
+///   <item>
+///     <paramref name="ObjId"/> — the integer parsed out of the lock's name. Wolverine names its
+///     named locks <c>wolverine_&lt;schemaName.GetDeterministicHashCode()&gt;</c>, the same id
+///     PostgreSQL passes to <c>pg_try_advisory_lock</c>, so
+///     <c>RunHistory.LeaderLockHolders</c> matches on this column on both and needs no branch.
+///   </item>
+///   <item>
+///     <paramref name="ApplicationName"/> — the lock's NAME (<c>wolverine_-1234567</c>). MySQL has
+///     no <c>application_name</c>; the name is the better thing to carry in this column, because
+///     it is what a reader would go and query for.
+///   </item>
+///   <item><paramref name="ClientAddr"/> — <c>PROCESSLIST_HOST</c>, which is the pod IP so long as
+///     the server runs with <c>--skip-name-resolve</c> (k8s/mysql.yaml says why).</item>
+///   <item><paramref name="BackendState"/> — the connection's command and state.</item>
+///   <item>
+///     <paramref name="ClassId"/> and <paramref name="ObjSubId"/> are PostgreSQL's two-part
+///     advisory key and stay 0 here; <paramref name="BackendStart"/> is derived from
+///     <c>PROCESSLIST_TIME</c>, which counts seconds in the current state rather than since the
+///     connection opened, so treat it as "not older than".
+///   </item>
+/// </list>
 /// </summary>
 public record LockRow(
     int Pid,
@@ -145,15 +193,19 @@ public record AssignmentRow(string Id, Guid NodeId, DateTimeOffset Started);
 /// failed: a hole in the history has to be visible, because "no violation observed" across a
 /// silent 30-second gap is not a result.
 ///
-/// Leadership evidence is backend-shaped: PostgreSQL fills <paramref name="Locks"/> from
-/// <c>pg_locks</c>, RavenDB fills <paramref name="Cmpxchg"/> from the compare-exchange store.
+/// Leadership evidence is backend-shaped: the two RDBMS arms fill <paramref name="Locks"/> from
+/// <c>pg_locks</c> / <c>performance_schema.metadata_locks</c>, RavenDB fills
+/// <paramref name="Cmpxchg"/> from the compare-exchange store.
 /// Both are optional and both arrive as empty on the other backend; read them through
 /// <c>RunHistory.LeaderHolders</c> rather than directly, so a checker does not have to know.
 ///
 /// <paramref name="Warnings"/> is for a tick that <em>succeeded but is not fully trustworthy</em>
 /// — a RavenDB query whose result set hit the monitor's page limit, or one the server reported as
-/// served from a stale index. Neither is an <paramref name="Error"/> (there is real data here) and
-/// neither may be silent (the data may be short). The coverage check reports them.
+/// served from a stale index, or a MySQL tick where <c>IS_USED_LOCK</c> found the leadership lock
+/// held and <c>performance_schema.metadata_locks</c> listed no such lock (the mdl instrument is
+/// off, so this sample's view of every OTHER lock is blind). None is an <paramref name="Error"/>
+/// (there is real data here) and none may be silent (the data may be short). The coverage check
+/// reports them.
 ///
 /// <paramref name="Replicas"/> is present only on a replicated RavenDB capture: one
 /// <see cref="ReplicaView"/> per cluster member, including the primary. Null on every earlier

@@ -5,7 +5,8 @@ namespace SafetyLab.Cluster;
 /// <summary>
 /// The store side of a measurement: which arm is deployed, and what the assignment table says.
 ///
-/// psql inside the pg pod, or <c>safetylab query</c> inside the monitor pod.
+/// psql inside the pg pod, the mysql client inside the mysql pod, or <c>safetylab query</c> inside
+/// the monitor pod.
 ///
 /// The query text is FROZEN and asserted so: every number in RESULTS.md was taken through it, and
 /// rewording one breaks comparability with the whole existing record for no gain.
@@ -24,6 +25,45 @@ public static class StoreQueries
     /// <summary>Frozen, same rule as <see cref="AssignedSql"/>.</summary>
     public const string PlacedSql =
         @"select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';";
+
+    /// <summary>
+    /// The MySQL spellings, frozen under the same rule and kept beside their PostgreSQL twins so
+    /// a change to one is visibly a change to only one arm.
+    ///
+    /// Two differences, neither optional. <c>chr(9)</c> is PostgreSQL's; the MySQL client is run
+    /// with <c>-B -N</c> (batch, no column names), which already emits tab-separated columns and
+    /// escapes any tab inside a value — so the columns are selected plainly and the separator is
+    /// the client's, not the query's. And <c>wolverine</c> here is a DATABASE rather than a schema
+    /// within one, which is the same qualified name and a different thing underneath.
+    /// </summary>
+    public const string AssignedMySql =
+        @"select a.id, n.description
+                    from wolverine.wolverine_node_assignments a
+                    join wolverine.wolverine_nodes n on n.id = a.node_id
+                   where a.id like 'sim://%';";
+
+    /// <summary>Frozen, same rule as <see cref="AssignedMySql"/>.</summary>
+    public const string PlacedMySql =
+        @"select count(*) from wolverine.wolverine_node_assignments where id like 'sim://%';";
+
+    /// <summary>
+    /// How the mysql client is invoked inside the store pod. The root password is read from the
+    /// container's OWN <c>MYSQL_ROOT_PASSWORD</c> rather than carried here, so this tool holds no
+    /// copy of a credential that lives in k8s/mysql.yaml — and it goes in through
+    /// <c>MYSQL_PWD</c> rather than <c>-p</c>, because <c>-p</c> makes the client print "Using a
+    /// password on the command line interface can be insecure" to stderr and every caller here
+    /// reads a non-empty stderr as the store having failed.
+    ///
+    /// The SQL arrives as <c>$1</c>, a positional argument, and is never interpolated into this
+    /// string: the whole point of going through ProcessRunner's ArgumentList is that nothing in
+    /// the query text can be read as shell.
+    /// </summary>
+    public const string MySqlShell =
+        "export MYSQL_PWD=\"$MYSQL_ROOT_PASSWORD\"; exec mysql -u root -N -B -e \"$1\"";
+
+    /// <summary>The kubectl argv that runs one statement in the store pod. See <see cref="MySqlShell"/>.</summary>
+    public static string[] MySqlExec(string pod, string sql)
+        => ["exec", pod, "--", "sh", "-c", MySqlShell, "safetylab-mysql", sql];
 
     public sealed record Outcome<T>(T? Value, string Problem)
     {
@@ -49,11 +89,11 @@ public static class StoreQueries
         if (!string.IsNullOrWhiteSpace(environment))
         {
             var value = environment.Trim();
-            return value is Backends.Postgres or Backends.RavenDb
+            return Backends.All.Contains(value)
                 ? Outcome<string>.Good(value)
                 : Outcome<string>.Bad(
-                    $"SIM_BACKEND is set to '{value}', which is neither " +
-                    $"'{Backends.Postgres}' nor '{Backends.RavenDb}'");
+                    $"SIM_BACKEND is set to '{value}', which is not one of " +
+                    string.Join(", ", Backends.All.Select(x => $"'{x}'")));
         }
 
         var result = Workload();
@@ -161,34 +201,12 @@ public static class StoreQueries
     /// <summary>Count of placed sim:// agents, on whichever arm is deployed.</summary>
     public static Outcome<int> Placed(string backend)
     {
-        Outcome<string> raw;
-
-        if (backend == Backends.RavenDb)
+        var raw = backend switch
         {
-            var pod = LivePod("app=safetylab");
-            if (!pod.Ok)
-            {
-                return Outcome<int>.Bad(
-                    "the RavenDB arm reads the store through the safetylab pod, and there is none " +
-                    $"({pod.Problem}). Run ./scripts/monitor.sh deploy first.");
-            }
-
-            var result = ProcessRunner.Kubectl("exec", pod.Value!, "--", "dotnet", "safetylab.dll", "query", "placed");
-            raw = result.Ok
-                ? Outcome<string>.Good(result.StdOut)
-                : Outcome<string>.Bad($"safetylab query failed in {pod.Value}: {Summarise(result.StdErr)}");
-        }
-        else
-        {
-            var pod = LivePod("app=pg");
-            if (!pod.Ok) return Outcome<int>.Bad($"no live PostgreSQL pod: {pod.Problem}");
-
-            var result = ProcessRunner.Kubectl(
-                "exec", pod.Value!, "--", "psql", "-U", "postgres", "-d", "churnsim", "-qAt", "-c", PlacedSql);
-            raw = result.Ok
-                ? Outcome<string>.Good(result.StdOut)
-                : Outcome<string>.Bad($"psql failed in {pod.Value}: {Summarise(result.StdErr)}");
-        }
+            Backends.RavenDb => PlacedFromRavenDb(),
+            Backends.MySql => PlacedFromMySql(),
+            _ => PlacedFromPostgres()
+        };
 
         if (!raw.Ok) return Outcome<int>.Bad(raw.Problem);
 
@@ -208,26 +226,62 @@ public static class StoreQueries
     /// </summary>
     public static Outcome<IReadOnlyList<(string Agent, string Pod)>> Assigned(string backend)
     {
-        var raw = backend == Backends.RavenDb ? AssignedFromRavenDb() : AssignedFromPostgres();
+        var raw = backend switch
+        {
+            Backends.RavenDb => AssignedFromRavenDb(),
+            Backends.MySql => AssignedFromMySql(),
+            _ => AssignedFromPostgres()
+        };
+
         if (!raw.Ok) return Outcome<IReadOnlyList<(string, string)>>.Bad(raw.Problem);
 
         return Outcome<IReadOnlyList<(string, string)>>.Good(ParseTsv(raw.Value!));
     }
 
-    private static Outcome<string> AssignedFromPostgres()
+    private static Outcome<string> PlacedFromPostgres() => Psql(PlacedSql);
+
+    private static Outcome<string> AssignedFromPostgres() => Psql(AssignedSql);
+
+    private static Outcome<string> Psql(string sql)
     {
         var pod = LivePod("app=pg");
         if (!pod.Ok) return Outcome<string>.Bad($"no live PostgreSQL pod: {pod.Problem}");
 
         var result = ProcessRunner.Kubectl(
-            "exec", pod.Value!, "--", "psql", "-U", "postgres", "-d", "churnsim", "-qAt", "-c", AssignedSql);
+            "exec", pod.Value!, "--", "psql", "-U", "postgres", "-d", "churnsim", "-qAt", "-c", sql);
 
         return result.Ok
             ? Outcome<string>.Good(result.StdOut)
             : Outcome<string>.Bad($"psql failed in {pod.Value}: {Summarise(result.StdErr)}");
     }
 
-    private static Outcome<string> AssignedFromRavenDb()
+    private static Outcome<string> PlacedFromMySql() => Mysql(PlacedMySql);
+
+    private static Outcome<string> AssignedFromMySql() => Mysql(AssignedMySql);
+
+    /// <summary>
+    /// The mysql client inside the store pod — the direct counterpart of <see cref="Psql"/>, and
+    /// deliberately NOT routed through the safetylab pod the way RavenDB has to be: the MySQL
+    /// image ships a client, so this arm is measurable with nothing deployed but the store, and a
+    /// missing monitor cannot silently become a missing measurement.
+    /// </summary>
+    private static Outcome<string> Mysql(string sql)
+    {
+        var pod = LivePod("app=mysql");
+        if (!pod.Ok) return Outcome<string>.Bad($"no live MySQL pod: {pod.Problem}");
+
+        var result = ProcessRunner.Kubectl(MySqlExec(pod.Value!, sql));
+
+        return result.Ok
+            ? Outcome<string>.Good(result.StdOut)
+            : Outcome<string>.Bad($"mysql failed in {pod.Value}: {Summarise(result.StdErr)}");
+    }
+
+    private static Outcome<string> PlacedFromRavenDb() => RavenQuery("placed");
+
+    private static Outcome<string> AssignedFromRavenDb() => RavenQuery("assigned");
+
+    private static Outcome<string> RavenQuery(string kind)
     {
         // RavenDB has no psql and its container ships no client worth depending on, so the
         // equivalent is `safetylab query` inside the already-deployed monitor pod. Worth saying
@@ -240,7 +294,7 @@ public static class StoreQueries
                 $"({pod.Problem}). Run ./scripts/monitor.sh deploy first.");
         }
 
-        var result = ProcessRunner.Kubectl("exec", pod.Value!, "--", "dotnet", "safetylab.dll", "query", "assigned");
+        var result = ProcessRunner.Kubectl("exec", pod.Value!, "--", "dotnet", "safetylab.dll", "query", kind);
 
         return result.Ok
             ? Outcome<string>.Good(result.StdOut)

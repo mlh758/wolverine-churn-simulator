@@ -16,50 +16,86 @@ internal static partial class Verbs
     public static async Task<int> MonitorAsync(string backend, TimeSpan tick, string schema, long? lockId,
         string service, int pageSize, string? url, string? database)
     {
-        using var cancellation = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
+        var cancellation = new CancellationTokenSource();
+
+        void onProcessExit(object? sender, EventArgs e) => cancellation.Cancel();
+
+        void onCancelKey(object? sender, ConsoleCancelEventArgs e)
         {
             e.Cancel = true;
             cancellation.Cancel();
-        };
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => cancellation.Cancel();
+        }
 
-        MonitorLoop monitor;
+        Console.CancelKeyPress += onCancelKey;
+        AppDomain.CurrentDomain.ProcessExit += onProcessExit;
+
         IReadOnlyList<RavenClient> raven = [];
-
-        if (backend == Backends.RavenDb)
-        {
-            // One client per member. `--url` (or RAVENDB_URL) may be comma-separated; the first is
-            // the primary view and the rest are read alongside it every tick. A single url is
-            // the single-node arm, unchanged.
-            raven = RavenQueries.ConnectAll(url, database);
-            monitor = new RavenClusterMonitor(raven, service, pageSize, tick, Console.Out);
-        }
-        else
-        {
-            var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
-                                   ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
-            // Derived from the schema, because that is what Wolverine actually locks on
-            // (PostgresqlNodePersistence._lockId = schemaName.GetDeterministicHashCode()). The
-            // LeaderLockId = 9999999 constant in that same class is not used by the leadership path.
-            monitor = new ClusterMonitor(connectionString, schema, lockId ?? RunHistory.LockIdForSchema(schema),
-                tick, Console.Out);
-        }
 
         try
         {
-            await monitor.RunAsync(cancellation.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // Normal shutdown.
+            MonitorLoop monitor;
+
+            // Derived from the schema on both RDBMS arms, because that is what Wolverine actually
+            // locks on -- PostgresqlNodePersistence._lockId and MySqlNodePersistence._lockId are
+            // the same `schemaName.GetDeterministicHashCode()`, and MySQL merely spells the
+            // resulting lock `wolverine_<id>` instead of passing the integer to
+            // pg_try_advisory_lock. The LeaderLockId = 9999999 constant that sits in both classes
+            // is not used by the leadership path on either.
+            var leaderLockId = lockId ?? RunHistory.LockIdForSchema(schema);
+
+            if (backend == Backends.RavenDb)
+            {
+                // One client per member. `--url` (or RAVENDB_URL) may be comma-separated; the
+                // first is the primary view and the rest are read alongside it every tick. A
+                // single url is the single-node arm, unchanged.
+                raven = RavenQueries.ConnectAll(url, database);
+                monitor = new RavenClusterMonitor(raven, service, pageSize, tick, Console.Out);
+            }
+            else if (backend == Backends.MySql)
+            {
+                var connectionString = Environment.GetEnvironmentVariable("MYSQL_CONNECTION")
+                                       ?? "Server=localhost;Port=3307;Database=churnsim;User ID=root;Password=churnsim";
+
+                // The monitor refuses a schema that is not a plain identifier, because on MySQL it
+                // is interpolated into the sampling query. That is a CONFIGURATION error and gets
+                // exit 2 with its own message, the way every other "could not measure" outcome in
+                // this tool does -- not a stack trace out of the top of the process.
+                try
+                {
+                    monitor = new MySqlClusterMonitor(connectionString, schema, leaderLockId, tick, Console.Out);
+                }
+                catch (ArgumentException e)
+                {
+                    Console.Error.WriteLine($"monitor: {e.Message}");
+                    return 2;
+                }
+            }
+            else
+            {
+                var connectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION")
+                                       ?? "Host=localhost;Port=5433;Database=churnsim;Username=postgres;Password=postgres";
+                monitor = new ClusterMonitor(connectionString, schema, leaderLockId, tick, Console.Out);
+            }
+
+            try
+            {
+                await monitor.RunAsync(cancellation.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Normal shutdown.
+            }
+
+            return 0;
         }
         finally
         {
             foreach (var client in raven) client.Dispose();
-        }
 
-        return 0;
+            Console.CancelKeyPress -= onCancelKey;
+            AppDomain.CurrentDomain.ProcessExit -= onProcessExit;
+            cancellation.Dispose();
+        }
     }
 
     // ---------------------------------------------------------------- harvest

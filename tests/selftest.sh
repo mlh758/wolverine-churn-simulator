@@ -37,6 +37,13 @@ LEDGER=(
   # the cut that never took, which only K2 can distinguish from a quiet run.
   "db-cut:S11"
   "db-cut-noop:K2"
+  # The MySQL arm. mysql-clean pins that a healthy capture with MySQL-shaped lock rows comes back
+  # clean; mysql-orphan-lock pins that the SAME fault trips the SAME checks as the PostgreSQL
+  # orphan-lock row above. Two claims, and the second is the one that matters: a leader checker
+  # that quietly stopped recognising this arm's evidence would pass everything, which is how the
+  # first live PostgreSQL run passed every leader check.
+  "mysql-clean:"
+  "mysql-orphan-lock:S3 S4 L1"
   # The RavenDB arm. raven-clean pins that the leader-side checkers read compare-exchange
   # evidence rather than only pg_locks -- without it they would pass a RavenDB run vacuously,
   # which is the same way the first live PostgreSQL run passed every leader check.

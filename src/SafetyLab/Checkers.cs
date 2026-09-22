@@ -134,15 +134,15 @@ public static class Checkers
             ? "on RavenDB this is a real check, not a sentinel: the leadership key is renamed from " +
               "'wolverine/leader' to 'wolverine/leader/<service>' once StartScheduledJobs runs, and nothing " +
               "stops the two spellings being held by different nodes"
-            : "two backends holding one advisory lock is impossible in Postgres, so this is a sentinel: if " +
-              "it trips, the lock id is wrong and every leader check below is vacuous");
+            : $"two sessions holding one {history.SessionLockNoun} is impossible in {history.StoreName}, so " +
+              "this is a sentinel: if it trips, the lock id is wrong and every leader check below is vacuous");
 
         return new CheckResult("S1", "At most one holder of the leader lock", violations, notes);
     }
 
     /// <summary>
-    /// Enforced by the store on both backends — a primary key on
-    /// <c>wolverine_node_assignments.id</c> on PostgreSQL, document identity on the
+    /// Enforced by the store on every backend — a primary key on
+    /// <c>wolverine_node_assignments.id</c> on the RDBMS arms, document identity on the
     /// <c>AgentAssignments</c> collection on RavenDB — so likewise a sentinel rather than a
     /// discovery. Kept because it costs nothing and it pins the assumption.
     /// </summary>
@@ -173,8 +173,8 @@ public static class Checkers
         var notes = new List<string>();
 
         // On RavenDB the lock document carries its owner's node id, so attribution needs nothing
-        // from the pod logs. On PostgreSQL it needs the identity map to turn a client_addr into a
-        // node, and without it the 'same node' half cannot run at all.
+        // from the pod logs. On the RDBMS arms it needs the identity map to turn a client address
+        // into a node, and without it the 'same node' half cannot run at all.
         var canAttribute = history.IsRavenDb || history.Identities.Count > 0;
         if (!canAttribute)
         {
@@ -239,8 +239,8 @@ public static class Checkers
     /// </summary>
     private static CheckResult OrphanedLeaderLock(RunHistory history, CheckOptions options)
     {
-        // RavenDB's lock names its own owner, so this runs with no pod logs at all. Postgres
-        // cannot: pg_stat_activity knows a client_addr and nothing more.
+        // RavenDB's lock names its own owner, so this runs with no pod logs at all. The RDBMS
+        // arms cannot: pg_stat_activity / performance_schema.threads know an address, nothing more.
         if (!history.IsRavenDb && history.Identities.Count == 0)
         {
             return new CheckResult("S4", "The leader lock is not held by a departed node", [],
@@ -281,7 +281,7 @@ public static class Checkers
     /// <summary>
     /// RavenDB-only, and the reason the RavenDB arm exists as a separate arm at all.
     ///
-    /// A PostgreSQL leadership lock is released by the death of the session holding it, which is
+    /// An RDBMS leadership lock is released by the death of the session holding it, which is
     /// immediate and needs no actor. A RavenDB leadership lock is a compare-exchange document with
     /// an <c>ExpirationTime</c> five minutes out, and nothing in the server clears it: the only
     /// path back to an elected leader is <c>tryTakeOverIfExpiredAsync</c> — a <em>peer</em>
@@ -298,8 +298,8 @@ public static class Checkers
         {
             return new CheckResult("S8", "The leader lock is not left expired but unclaimed", [],
             [
-                "skipped: PostgreSQL advisory locks have no expiration — the death of the holding session " +
-                "is the release, so there is no window for this to describe"
+                $"skipped: {history.StoreName} {history.SessionLockNoun}s have no expiration — the death of " +
+                "the holding session is the release, so there is no window for this to describe"
             ])
             {
                 Skipped = true
@@ -862,7 +862,9 @@ public static class Checkers
     ///
     /// The fault is <c>pg_terminate_backend</c> on the backend holding the leadership advisory
     /// lock: the session dies, and because a session-level advisory lock has no expiry and no
-    /// owner column, its death <em>is</em> the release. The node is told nothing, which is the
+    /// owner column, its death <em>is</em> the release. (MySQL's <c>KILL</c> is the same fault on
+    /// the same shape of lock, but no script injects it yet, so a MySQL capture simply never
+    /// carries the mark and this check skips.) The node is told nothing, which is the
     /// whole point. But the statement returning true proves only that a signal was delivered, and
     /// there are several ways for the run to be measuring an undisturbed cluster anyway — the
     /// resolved pid belonged to some other connection, the monitor was watching the wrong lock id

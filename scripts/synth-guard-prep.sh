@@ -15,12 +15,18 @@ export PATH="$HOME/.local/bin:$PATH"
 K="minikube kubectl -- --context=minikube"
 
 # PostgreSQL only, and not portably so. The fault injected here is row-level security hiding one
-# node's row from the app role -- a Postgres feature with no RavenDB counterpart at all. Refuse
-# rather than run something that looks like the experiment and is not.
+# node's row from the app role -- a Postgres feature neither other store has a counterpart for
+# (RavenDB has nothing like it; MySQL has no row-level security at all, and its nearest equivalent
+# would be a view swapped under the app's role, which is a different fault). Refuse rather than run
+# something that looks like the experiment and is not.
+#
+# Written as "not postgres" and not as "is ravendb": an arm added later must be refused by default
+# rather than fall through this gate into a run that measures nothing.
 source scripts/backend.sh
-if [ "$(sim_backend)" = "ravendb" ]; then
+if [ "$(sim_backend)" != "postgres" ]; then
     echo "$(basename "$0"): the synthetic-self-guard runs inject faults with Postgres row-level" >&2
-    echo "    security, which RavenDB has no equivalent of. This experiment is PostgreSQL-only." >&2
+    echo "    security, which no other store here has an equivalent of. This experiment is" >&2
+    echo "    PostgreSQL-only, and the deployed arm is '$(sim_backend)'." >&2
     exit 2
 fi
 

@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safetylab
+spec:
+  # Exactly one. A second monitor would double the history with interleaved seq numbers and
+  # make the coverage check meaningless.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: safetylab
+  template:
+    metadata:
+      labels:
+        app: safetylab
+    spec:
+      # The monitor must outlive a rollout of the app it is watching, and must not be drained
+      # at the same moment the interesting thing happens.
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: safetylab
+          image: localhost/safetylab:local
+          imagePullPolicy: Never
+          # Same 1s tick as the other arms, for the same reason: every sample carries the whole
+          # assignment set, the control plane itself only ticks at 2-5s, and the checkers' grace
+          # windows are 15s, so a faster tick buys size and not resolution.
+          #
+          # --schema is load-bearing and not cosmetic. The leadership lock's name is
+          # `wolverine_<schemaName.GetDeterministicHashCode()>`, exactly as on PostgreSQL, so a
+          # monitor given the wrong schema watches a lock nobody takes and every leader check
+          # passes over nothing. S1's sentinel note says so in the report.
+          args:
+            - "monitor"
+            - "--backend"
+            - "mysql"
+            - "--tick-ms"
+            - "1000"
+            - "--schema"
+            - "wolverine"
+          env:
+            - name: MYSQL_CONNECTION
+              # Its own connection, and a small pool: the monitor must never be the reason the
+              # app cannot get one. Connects to the bootstrap database and reads the `wolverine`
+              # schema by qualified name, so a `just reset-schema` between builds does not leave
+              # the monitor unable to connect.
+              value: "Server=mysql;Port=3306;Database=churnsim;User ID=root;Password=churnsim;AllowPublicKeyRetrieval=True;Maximum Pool Size=2"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

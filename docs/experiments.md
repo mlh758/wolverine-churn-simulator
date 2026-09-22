@@ -79,6 +79,43 @@ Two structural facts here too:
    the true app-versus-store skew is, this arm cannot measure it below a second — which is a real
    limit on what a RavenDB stale-node finding can claim.
 
+### The third system under test: MySQL
+
+RavenDB is the *different* store; MySQL is the **control**. It runs the same leader-election
+protocol on the same *kind* of lock as PostgreSQL — session-scoped, released by the death of its
+session, id = `schemaName.GetDeterministicHashCode()` — through a different driver, a different
+server and a different piece of Wolverine code (`MySqlAdvisoryLock`, `GET_LOCK`/`RELEASE_LOCK`).
+
+That is what makes it worth having. With one RDBMS arm, a finding is "Wolverine on PostgreSQL" and
+there is no way to tell that apart from "Wolverine". With two, a finding that reproduces on both is
+the protocol's, and one that reproduces on only one is that store's driver or that server's
+semantics — and both of the structural facts above are exactly the kind of claim that needs the
+distinction:
+
+- Fact (1), the unfenced dispatch, is protocol and should reproduce identically.
+- Fact (2), the two clocks, should *not*: `health_check` is stamped by the server here too, but
+  Weasel maps `DateTimeOffset` to a bare `DATETIME` on MySQL, so the stored value carries whole
+  seconds. The skew is the same; the resolution the rig can see it at is a second, not a
+  microsecond. Any MySQL stale-node finding inherits that floor — the same caveat the RavenDB arm
+  carries for a different reason.
+
+One thing is specific to MySQL and is the reason `MySqlAdvisoryLock` has the shape it does:
+**named locks stack**. `GET_LOCK` on a name the session already holds succeeds and increments a
+hold count that one `RELEASE_LOCK` does not clear, so a lock re-attained once per heartbeat and
+released once on step-down stays held server-side with nothing logged, and failover simply stalls.
+Wolverine's shipped `Bug_advisory_lock_stacking_blocks_failover` pins the guard against it
+(`TryAttainLockAsync` short-circuits on `hasLockUnsafe`). From inside the cluster that failure is
+invisible; from `IS_USED_LOCK` it is obvious, and S4 is the check that would see it. That makes S4
+worth more on this arm than on either other.
+
+Reading the lock back is the one place the monitor had to do something new. `IS_USED_LOCK(name)`
+names the holding connection and needs nothing switched on, so the leadership lock is read from
+it; `performance_schema.metadata_locks` enumerates the *other* Wolverine locks but is populated
+only while the `wait/lock/metadata/sql/mdl` instrument is on. A monitor that assumed the second
+would report "no locks held" on every tick and every leader check would pass over nothing — the
+exact way the first live PostgreSQL run passed every leader check. So the two are cross-checked
+and the disagreement is recorded as a sample warning that C0 prints.
+
 ## The two threads
 
 ### Thread A — duplicate agents under deploy churn
@@ -168,6 +205,20 @@ makes it a good lock and a bad liveness signal. Wolverine uses it as both. Two t
 2. **Nothing in the store shows it.** `placed` read 500/500 for the entire outage while ~126 agents
    were assigned to a dead node and running nowhere. An operator watching the assignment documents,
    or Wolverine watching itself, would have seen a healthy fully-placed cluster for five minutes.
+
+**Layer 1d — the MySQL arm. Built 2026-09-22; not yet run in the cluster.**
+`deploy.sh --backend mysql`, a `GET_LOCK`-reading monitor, and every measurement script routed to
+the `mysql` client in the store pod. No new checker: the leader-side checks read
+`RunHistory.LeaderHolders`, which is about the protocol rather than the store, and the fixture
+ledger pins that (`mysql-clean` must be wholly clean, and `mysql-orphan-lock` must trip exactly the
+same `S3 S4 L1` as the PostgreSQL `orphan-lock` row). If those two ever diverge the arms are not
+comparable and their numbers cannot go side by side in RESULTS.md.
+
+What it cannot do yet: E8 and E9. MySQL's `KILL <connection>` is `pg_terminate_backend` and
+`KILL QUERY` is `pg_cancel_backend`, on a lock of the same shape, so both experiments have a
+faithful MySQL form — but `safetylab lock-chaos` resolves its victim out of `pg_locks`, and an
+injector that cannot prove it fired is worse than none. The scripts refuse on this arm rather than
+measure an undisturbed cluster. That is the obvious next piece of work here.
 
 **Layer 1c — the partition. Built and run once (2026-09-18); see E7 and RESULTS.md. The prediction below did not hold — the isolated leader wrote nothing — and the duplicates came from the majority instead.**
 Everything above is a SINGLE-node RavenDB, so none of RavenDB's replication semantics were

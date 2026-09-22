@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Does the cluster HEAL a duplicated agent, or stay wrong?
 #
-# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, scripts/rollout.sh.
+# DEPENDS ON  a deployed churnsim cluster (any arm), $SAFETYLAB, scripts/rollout.sh.
 # REQUIRES    the cluster settled.
 # PRODUCES    a row per iteration appended to runs/heal-test/results.tsv:
 #               iteration outcome healed persisted longest_heal_s

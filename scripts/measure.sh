@@ -2,7 +2,7 @@
 # Assignment churn, from the store's node-record history and from agent start/stop lines in the
 # live pods' logs.
 #
-# DEPENDS ON  a deployed churnsim cluster (either arm). The RavenDB arm additionally needs
+# DEPENDS ON  a deployed churnsim cluster (any arm). The RavenDB arm additionally needs
 #             ./scripts/monitor.sh deploy.
 # REQUIRES    nothing; reports whatever state the cluster is in.
 # PRODUCES    a report on stdout. Reads only -- nothing is mutated.

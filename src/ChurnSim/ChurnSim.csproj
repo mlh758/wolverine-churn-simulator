@@ -13,9 +13,9 @@
          0.0.0-nope silently built against WolverineFx 0.8.2. This rig measures one specific
          Wolverine build, so anything but an exact match has to be an error. -->
 
-    <!-- Which message store this image is built against: 'postgres' (default) or 'ravendb'.
-         A build-time switch rather than a runtime one because the package references differ:
-         a locally packed WolverineFx.RavenDb only exists if that project was packed, and a
+    <!-- Which message store this image is built against: 'postgres' (default), 'mysql' or
+         'ravendb'. A build-time switch rather than a runtime one because the package references
+         differ: a locally packed WolverineFx.RavenDb only exists if that project was packed, and a
          PostgreSQL run must not be made to depend on it. The deployment declares the same
          value in SIM_BACKEND and Program.cs refuses to start on a mismatch. -->
     <SimBackend Condition="'$(SimBackend)' == ''">postgres</SimBackend>
@@ -28,17 +28,38 @@
                       Condition="$(WolverineVersion.StartsWith('6'))" />
   </ItemGroup>
 
-  <!-- Exactly one backend's package and wiring file compiles. Both files define
+  <!-- Reject an unknown value here rather than let the ItemGroups below silently select the
+       PostgreSQL arm for it. -p:SimBackend=mysq builds a postgres image, the deployment declares
+       SIM_BACKEND=mysql, and the only thing standing between that typo and a mislabelled arm is
+       Program.cs's startup assertion, which fires only after a multi-minute image build and a
+       CrashLoopBackOff. Fail at restore instead. -->
+  <Target Name="RequireKnownSimBackend" BeforeTargets="CollectPackageReferences">
+    <Error Condition="'$(SimBackend)' != 'postgres' And '$(SimBackend)' != 'mysql' And '$(SimBackend)' != 'ravendb'"
+           Text="SimBackend is '$(SimBackend)'; it must be 'postgres', 'mysql' or 'ravendb'." />
+  </Target>
+
+  <!-- Exactly one backend's package and wiring file compiles. All three files define
        `internal static class SimBackend`, so Program.cs calls SimBackend.Configure with no
-       conditional compilation of its own. -->
-  <ItemGroup Condition="'$(SimBackend)' != 'ravendb'">
+       conditional compilation of its own. Each ItemGroup removes the OTHER TWO wiring files;
+       written as one Compile Remove per arm rather than as a `!= mine` condition, because a new
+       arm added with the latter shape compiles alongside every existing one and the error is a
+       duplicate-type build failure with no hint of why. -->
+  <ItemGroup Condition="'$(SimBackend)' == 'postgres'">
     <PackageReference Include="WolverineFx.Postgresql" Version="[$(WolverineVersion)]" />
+    <Compile Remove="MySqlBackend.cs" />
+    <Compile Remove="RavenDbBackend.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SimBackend)' == 'mysql'">
+    <PackageReference Include="WolverineFx.MySql" Version="[$(WolverineVersion)]" />
+    <Compile Remove="PostgresBackend.cs" />
     <Compile Remove="RavenDbBackend.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(SimBackend)' == 'ravendb'">
     <PackageReference Include="WolverineFx.RavenDb" Version="[$(WolverineVersion)]" />
     <Compile Remove="PostgresBackend.cs" />
+    <Compile Remove="MySqlBackend.cs" />
   </ItemGroup>
 
   <!-- OpenTelemetry, so Wolverine's own spans can be read out of Jaeger instead of inferred

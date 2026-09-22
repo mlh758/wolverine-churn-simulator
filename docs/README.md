@@ -13,8 +13,9 @@ The README covers how to *operate* the rig; these docs cover why you would want 
 
 ## The one-paragraph version
 
-Wolverine elects a leader by holding a PostgreSQL session-level advisory lock, and the leader
-assigns agents to nodes through a table. Recent issues cluster around that machinery misbehaving
+Wolverine elects a leader by holding a session-scoped lock in the message store — a PostgreSQL
+advisory lock, a MySQL named lock, or a RavenDB compare-exchange value with an expiry — and the
+leader assigns agents to nodes through a table. Recent issues cluster around that machinery misbehaving
 during Kubernetes rolling deploys. This rig replays those deploys against a real cluster and
 checks safety properties from **outside** the process, because every check Wolverine ships is an
 in-process assertion — it can only confirm what a node *believes*, and the interesting bugs are

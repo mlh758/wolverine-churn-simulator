@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # When a NON-leader dies ungracefully, does the surviving leader re-place its agents?
 #
-# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, minikube ssh + crictl on the
+# DEPENDS ON  a deployed churnsim cluster (any arm), $SAFETYLAB, minikube ssh + crictl on the
 #             node. The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
 # REQUIRES    a settled cluster with a leader that resolves to a live pod, and at least one live
 #             pod that is not the leader. Both are refusals.
@@ -51,6 +51,10 @@ printf 'elapsed_s\tleader_pod\tvictim_restarts\tplaced\n' > "$TSV"
 leader_row() {
     case "$BACKEND" in
         ravendb) _raven query leader 2>/dev/null ;;
+        mysql) _mysql "select coalesce(n.description, 'unknown'), a.node_id
+                    from wolverine.wolverine_node_assignments a
+                    left join wolverine.wolverine_nodes n on n.id = a.node_id
+                   where a.id like 'wolverine://leader%';" ;;
         *) _psql "select coalesce(n.description, 'unknown') || chr(9) || a.node_id
                     from wolverine.wolverine_node_assignments a
                     left join wolverine.wolverine_nodes n on n.id = a.node_id
@@ -63,6 +67,8 @@ leader_row() {
 stopped_count() {
     case "$BACKEND" in
         ravendb) _raven query per-minute --event NodeStopped 2>/dev/null | awk -F'\t' '{s+=$2} END {print s+0}' ;;
+        mysql) _mysql "select count(*) from wolverine.wolverine_node_records where event_name = 'NodeStopped';" \
+               | tr -d '[:space:]' ;;
         *) _psql "select count(*) from wolverine.wolverine_node_records where event_name = 'NodeStopped';" \
                | tr -d '[:space:]' ;;
     esac

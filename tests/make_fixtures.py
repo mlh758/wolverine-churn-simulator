@@ -35,6 +35,8 @@ LEADER_URI = "wolverine://leader/"
 # run -- before that the store's constructor uses the un-suffixed form, which is why the split-key
 # fixture below is a plausible state and not an invented one. The five-minute expiry is
 # RavenDbMessageStore.Locking's DateTimeOffset.UtcNow.AddMinutes(5).
+MYSQL_LOCK_NAME = f"wolverine_{LEADER_LOCK}"
+
 RAVEN_LEADER_KEY = "wolverine/leader/churnsim"
 RAVEN_LEADER_KEY_UNSUFFIXED = "wolverine/leader"
 RAVEN_LOCK_TTL = timedelta(minutes=5)
@@ -141,6 +143,24 @@ def sample(seq, t, w, backend="postgres"):
                 if r["error"] is not None:
                     continue
                 cmpxchg.extend(lock_rows(REPLICA_URLS[i], r["lock_holder_override"]))
+    elif backend == "mysql":
+        if w.lock_holder is not None:
+            # A MySQL named lock, exactly as MySqlClusterMonitor writes one: the "pid" is a
+            # connection id, objId is the integer parsed out of the lock's NAME, applicationName
+            # carries that name because MySQL has no application_name, and classId/objSubId are
+            # PostgreSQL's two-part advisory key and stay 0. Different columns, same evidence --
+            # which is the claim the mysql-* fixtures exist to test.
+            locks.append({
+                "pid": w.lock_holder[4],
+                "classId": 0,
+                "objId": LEADER_LOCK,
+                "objSubId": 0,
+                "granted": True,
+                "applicationName": MYSQL_LOCK_NAME,
+                "clientAddr": w.lock_holder[1],
+                "backendState": "Sleep",
+                "backendStart": iso(T0 - timedelta(seconds=30)),
+            })
     elif w.lock_holder is not None:
         locks.append({
             "pid": w.lock_holder[4],
@@ -228,6 +248,23 @@ def meta_record(backend, replicated=False):
         if replicated:
             record["replicas"] = list(REPLICA_URLS)
         return record
+
+    if backend == "mysql":
+        # Same leaderLockId as PostgreSQL, and that is the point rather than a copy-paste:
+        # MySqlNodePersistence derives it from the SAME schemaName.GetDeterministicHashCode(),
+        # and only the spelling of the lock differs. Keep this identical to
+        # MySqlClusterMonitor.DescribeAsync.
+        return {
+            "kind": "meta",
+            "schemaVersion": 3,
+            "startedUtc": iso(T0),
+            "tickMs": 1000,
+            "leaderLockId": LEADER_LOCK,
+            "schema": "wolverine",
+            "serverVersion": "8.0.39 / mdl instrument YES (fixture)",
+            "backend": "mysql",
+            "lockKey": MYSQL_LOCK_NAME,
+        }
 
     # No "backend" key on purpose: this is what a pre-RavenDB capture looks like, so the
     # fixtures also pin that those still load and still check as PostgreSQL.
@@ -583,6 +620,14 @@ def main():
     build("db-cut", db_cut, marks=DB_CUT_MARKS)
     build("db-cut-noop", db_cut_noop, marks=DB_CUT_MARKS)
     build_dup()
+
+    # The MySQL arm. Same two claims as raven-clean, from the other direction: a healthy MySQL
+    # capture must come back wholly clean (so the leader checks are not firing on the changed
+    # lock-row shape), and the SAME fault must produce the SAME check ids as on PostgreSQL (so
+    # they are not passing vacuously over evidence they no longer recognise). If those two ever
+    # diverge, the arms are not comparable and RESULTS.md cannot put their numbers side by side.
+    build("mysql-clean", clean, backend="mysql")
+    build("mysql-orphan-lock", orphan_lock, backend="mysql")
 
     # The RavenDB arm. `raven-clean` is not filler: it is the evidence that the leader-side
     # checkers read compare-exchange evidence correctly and do not fire on a healthy RavenDB

@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: churnsim
+spec:
+  # Deliberately the SAME deployment name, labels and rolling-update shape as k8s/churnsim.yaml.
+  # The arms are mutually exclusive -- one cluster under test at a time -- and keeping the names
+  # identical means every script's `deployment/churnsim` and `-l app=churnsim` selector works
+  # unchanged on all three. Diff this file against churnsim.yaml: everything except the
+  # backend-specific env block should be identical, and if it is not, the arms are not comparable.
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 15
+  selector:
+    matchLabels:
+      app: churnsim
+  template:
+    metadata:
+      labels:
+        app: churnsim
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: churnsim
+          image: localhost/churnsim:local
+          imagePullPolicy: Never
+          env:
+            # Declares which arm this is. ChurnSim compares it against the backend the image was
+            # BUILT for and refuses to start on a mismatch, so a stale image cannot quietly
+            # produce numbers filed under the wrong store.
+            - name: SIM_BACKEND
+              value: "mysql"
+            # Names the BOOTSTRAP database. Wolverine's tables live in a `wolverine` database
+            # (on MySQL the schema IS a database) that Weasel creates on the first migration --
+            # see src/ChurnSim/MySqlBackend.cs.
+            #
+            # AllowPublicKeyRetrieval: MySQL 8 authenticates with caching_sha2_password, whose
+            # first handshake for a given user needs either a TLS connection or the server's RSA
+            # public key. MySqlConnector's SslMode=Preferred default usually gets TLS from the
+            # image's self-signed certs and this never fires -- but when it does not, the failure
+            # is an auth error at startup that reads like a wrong password. This is a throwaway
+            # minikube store on a pod network; do not copy this into anything that ships.
+            - name: MYSQL_CONNECTION
+              value: "Server=mysql;Port=3306;Database=churnsim;User ID=root;Password=churnsim;AllowPublicKeyRetrieval=True"
+            # Downward API: SafetyLab joins the named lock's holder in
+            # performance_schema.threads.PROCESSLIST_HOST back to a Wolverine node id through the
+            # SIM-IDENTITY line the app logs from these two values. That join is why the store
+            # runs with --skip-name-resolve (k8s/mysql.yaml).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SIM_AGENT_COUNT
+              value: "500"
+            - name: SIM_AGENT_MB
+              value: "0"
+            - name: SIM_START_DELAY_MS
+              value: "500"
+            # ROLLOUT_STAMP is bumped by scripts/rollout.sh to force a new
+            # pod template hash => a genuine rolling deploy with no code change
+            - name: ROLLOUT_STAMP
+              value: "initial"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              # The overload runs' kill line: .NET's default GC heap hard limit is
+              # 75% of this (384Mi), which is what the default load monitor measures
+              # WorkingSet against — so ~380Mi resident is where allocations fail
+              memory: 512Mi

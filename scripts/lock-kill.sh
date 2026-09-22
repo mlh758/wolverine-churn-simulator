@@ -59,7 +59,7 @@ refuse() { echo "lock-kill: REFUSED — $*" >&2; exit 2; }
 
 BACKEND=$(sim_backend)
 [ "$BACKEND" = "postgres" ] \
-    || refuse "this experiment is PostgreSQL only (found $BACKEND). RavenDB's leadership lock is a compare-exchange document with an expiry and no session to terminate — see S8 and E7"
+    || refuse "this experiment is PostgreSQL only (found $BACKEND). RavenDB's leadership lock is a compare-exchange document with an expiry and no session to terminate — see S8 and E7. MySQL's named lock IS session-scoped and KILL <connection> is the same fault, but nothing here injects it yet"
 
 # ------------------------------------------------------------------ dry run
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # How long is the cluster leaderless after its leader dies ungracefully?
 #
-# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, minikube ssh + crictl on the
+# DEPENDS ON  a deployed churnsim cluster (any arm), $SAFETYLAB, minikube ssh + crictl on the
 #             node. The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
 # REQUIRES    a settled cluster with a leader that resolves to a live pod; both are refusals. A
 #             window timed from a cluster already mid-election is not a failover measurement.
@@ -45,13 +45,17 @@ OUT="${OUT:-runs/leader-kill-$BACKEND}"
 mkdir -p "$OUT"
 TSV="$OUT/timeline.tsv"
 
-# The lock columns only exist on RavenDB; on PostgreSQL they stay '-' rather than being dropped,
-# so one parser reads both arms' files.
+# The lock columns only exist on RavenDB; on the RDBMS arms they stay '-' rather than being
+# dropped, so one parser reads every arm's files.
 printf 'elapsed_s\tleader_pod\tleader_node\tlock_holder\tlock_expires_in_s\tplaced\n' > "$TSV"
 
 leader_row() {
     case "$BACKEND" in
         ravendb) _raven query leader 2>/dev/null ;;
+        mysql) _mysql "select coalesce(n.description, 'unknown'), a.node_id
+                    from wolverine.wolverine_node_assignments a
+                    left join wolverine.wolverine_nodes n on n.id = a.node_id
+                   where a.id like 'wolverine://leader%';" ;;
         *) _psql "select coalesce(n.description, 'unknown') || chr(9) || a.node_id
                     from wolverine.wolverine_node_assignments a
                     left join wolverine.wolverine_nodes n on n.id = a.node_id
@@ -93,6 +97,8 @@ fi
 stopped_count() {
     case "$BACKEND" in
         ravendb) _raven query per-minute --event NodeStopped 2>/dev/null | awk -F'\t' '{s+=$2} END {print s+0}' ;;
+        mysql) _mysql "select count(*) from wolverine.wolverine_node_records where event_name = 'NodeStopped';" \
+               | tr -d '[:space:]' ;;
         *) _psql "select count(*) from wolverine.wolverine_node_records where event_name = 'NodeStopped';" \
                | tr -d '[:space:]' ;;
     esac

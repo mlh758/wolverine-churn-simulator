@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # How often does a rolling deploy leave an agent running on two nodes at once?
 #
-# DEPENDS ON  a deployed churnsim cluster (either arm), $SAFETYLAB, scripts/rollout.sh.
+# DEPENDS ON  a deployed churnsim cluster (any arm), $SAFETYLAB, scripts/rollout.sh.
 #             The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
 # REQUIRES    the cluster settled, and $TSV either absent or already holding this backend's rows.
 # PRODUCES    a row per iteration appended to $OUT/results.tsv:

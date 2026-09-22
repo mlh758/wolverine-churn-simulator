@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two mysqld processes cannot share one emptyDir, and a rolling
+  # replacement would have the new pod fail its init while the old one still holds the data
+  # directory. The store is disposable here anyway.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          # 8.0, because that is the image Wolverine's own MySQL test suite runs against
+          # (its docker-compose.yml). A difference found here should be Wolverine's, not a
+          # server-version skew nobody upstream has seen.
+          image: mysql:8.0
+          args:
+            # SafetyLab joins a lock holder back to a Wolverine node id through the pod IP that
+            # ChurnSim announces in its SIM-IDENTITY line. With name resolution ON, MySQL reports
+            # PROCESSLIST_HOST as whatever reverse DNS returns for the pod IP, the join finds
+            # nothing, and S3/S4/S11 report "held by an address that never announced itself" on a
+            # perfectly healthy cluster. The same trap the RavenDB arm hit from the other side.
+            - "--skip-name-resolve"
+            # GET_LOCK / RELEASE_LOCK locks show up in performance_schema.metadata_locks as
+            # OBJECT_TYPE='USER LEVEL LOCK', but only while this instrument is on. It is on by
+            # default in 8.0; declared anyway, because a monitor that silently sees no locks
+            # passes every leader check over nothing, which is this rig's most expensive failure
+            # mode. The monitor cross-checks the leader lock with IS_USED_LOCK() regardless and
+            # warns on the sample when the two disagree.
+            - "--performance-schema-instrument=wait/lock/metadata/sql/mdl=ON"
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: churnsim
+            # The BOOTSTRAP database, not the Wolverine schema. On MySQL the schema IS a database,
+            # so Wolverine's tables live in a `wolverine` database that Weasel creates on first
+            # migration; ChurnSim and the monitor connect to this one, which always exists. That
+            # is what makes `just reset-schema` (drop database wolverine) survivable -- a pod
+            # whose connection string named the schema could not reconnect to rebuild it.
+            - name: MYSQL_DATABASE
+              value: churnsim
+          ports:
+            - containerPort: 3306
+          readinessProbe:
+            exec:
+              # Over TCP on purpose. The image's entrypoint runs a temporary server on the unix
+              # socket only while it initialises the data directory, so a socket ping reports
+              # ready during a window when nothing outside the pod can connect.
+              command:
+                - sh
+                - -c
+                - MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysqladmin ping -h 127.0.0.1 -u root --silent
+            initialDelaySeconds: 10
+            periodSeconds: 3
+            # First boot initialises the data directory, which takes tens of seconds on the
+            # rootless podman driver. 40 * 3s before the pod is declared broken.
+            failureThreshold: 40
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306

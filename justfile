@@ -37,6 +37,11 @@ test:
 deploy version="6.39.0":
     ./scripts/deploy.sh {{version}}
 
+# The MySQL arm. Measurable with no monitor (the store image ships a client); a SafetyLab
+# CAPTURE still needs `just monitor-deploy`.
+deploy-mysql version="6.39.0":
+    ./scripts/deploy.sh {{version}} --backend mysql
+
 # The RavenDB arm. Needs `just monitor-deploy` afterwards to be measurable at all.
 deploy-ravendb version="6.39.0":
     ./scripts/deploy.sh {{version}} --backend ravendb
@@ -70,7 +75,7 @@ snapshot dir:
 overlaps dir:
     {{safetylab}} overlaps {{dir}}
 
-# Assignment churn from the store's own record history, on either arm.
+# Assignment churn from the store's own record history, on any arm.
 measure:
     ./scripts/measure.sh
 
@@ -117,7 +122,8 @@ follower-kill seconds="420":
 follower-kill-dry-run:
     DRY_RUN=1 ./scripts/follower-kill.sh
 
-# E8 — take the leader's advisory lock away by killing the backend holding it. PostgreSQL only.
+# E8 — take the leader's advisory lock away by killing the backend holding it. PostgreSQL only
+# (MySQL's named lock is the same shape and KILL the same fault, but nothing injects it yet).
 lock-kill seconds="180":
     ./scripts/lock-kill.sh {{seconds}}
 

@@ -9,14 +9,14 @@ to fix them.
 ## What it is
 
 - **`src/ChurnSim`** — a .NET 10 console host running Wolverine against one of
-  two message stores (see [Backends](#backends) below). It registers a custom
+  three message stores (see [Backends](#backends) below). It registers a custom
   `IStaticAgentFamily` (`sim://agent1..N`) whose `EvaluateAssignmentsAsync`
   calls `AssignmentGrid.DistributeEvenly` — the same distribution the Marten
   projection/subscription agents use, so the assignment plane behaves exactly
   like a production critter-stack app with N projections. Each agent logs
   `AGENT-START` / `AGENT-STOP`; an optional `SIM_AGENT_MB` knob gives each
   running agent a real memory footprint for overload (GH-3959) scenarios.
-- **`k8s/`** — a single-pod store (PostgreSQL or RavenDB) and a 3-replica
+- **`k8s/`** — a single-pod store (PostgreSQL, MySQL or RavenDB) and a 3-replica
   `churnsim` Deployment with a production-shaped rolling update (`maxSurge: 1`,
   `maxUnavailable: 0`, `minReadySeconds: 15`) so old pods drain while new
   pods have already joined the Wolverine cluster.
@@ -29,22 +29,39 @@ to fix them.
 
 ## Backends
 
-The same simulation currently supports RavenDB and PostgreSQL. The PG backend
-is built around acquiring an advisory lock with a long lived session. The other
-RDBMS implementations like MySQL and Oracle use a similar mechanism by taking
-a lock on a deterministic row. RavenDB uses a cluster-wide CAS operation to
-place the node ID and claim leadership.
+The same simulation currently supports PostgreSQL, MySQL and RavenDB. All three place
+leadership differently, and that is the point of having them:
+
+| arm | how leadership is held | what releases it |
+| --- | --- | --- |
+| PostgreSQL | `pg_try_advisory_lock(<id>)` on a long-lived session | the session dying |
+| MySQL | `GET_LOCK('wolverine_<id>', 0)` on a long-lived connection | the connection dying |
+| RavenDB | a cluster-wide compare-exchange value naming the node | a five-minute expiry, **and** a peer noticing |
+
+`<id>` is `schemaName.GetDeterministicHashCode()` and it is the **same number on both RDBMS
+arms** — `MySqlNodePersistence` and `PostgresqlNodePersistence` derive it identically, and MySQL
+only spells the result differently before handing it to `GET_LOCK`. That is why the MySQL arm
+needed no second copy of any checker: from outside, a named lock and an advisory lock are the
+same animal, and the leader-side checks (S1/S3/S4/S11) are about the protocol rather than the
+product. RavenDB is the one that is genuinely different, and S8 exists only for it.
 
 The backend is a **build-time** choice: `ChurnSim.csproj` selects both the message
-store package and the wiring file (`PostgresBackend.cs` / `RavenDbBackend.cs`) from
-`-p:SimBackend=`, so an image is single-backend by construction. The deployment
+store package and the wiring file (`PostgresBackend.cs` / `MySqlBackend.cs` /
+`RavenDbBackend.cs`) from `-p:SimBackend=`, so an image is single-backend by construction. An
+unknown value fails the restore rather than quietly building the default. The deployment
 declares the same value in `SIM_BACKEND` and ChurnSim **refuses to start on a
 mismatch**, so a stale image cannot file results under the wrong store.
 
 ```bash
 just deploy             # postgres (default)
+just deploy-mysql       # the MySQL arm
 just deploy-ravendb     # the RavenDB arm
 ```
+
+Only one store is deployed at a time, and `deploy.sh` removes the others before it starts: they
+all serve the same `churnsim` workload name, and `sim_backend`'s last-resort fallback reads
+whichever store is *present*, so a store left behind can make an unlabelled cluster report the
+wrong arm.
 
 The Wolverine version under test lives in **[`wolverine-version`](wolverine-version)**,
 read by `Directory.Build.props`, the Dockerfile and `deploy.sh` alike. Edit it to move the whole
@@ -53,8 +70,8 @@ rig to a new release; pass a version to `just deploy <v>` to override for one ru
 exist fails the restore instead of quietly resolving something older.
 
 Everything downstream is arm-agnostic: the backend is read off the deployment and each
-measurement routed to `psql` or to `safetylab query`, so every measurement recipe works unchanged
-on either arm.
+measurement routed to `psql`, to the `mysql` client, or to `safetylab query`, so every measurement
+recipe works unchanged on every arm.
 
 Two constraints specific to the RavenDB arm:
 
@@ -68,9 +85,48 @@ Two constraints specific to the RavenDB arm:
   RavenDB's REST API and takes no Wolverine dependency, so it doubles as the query
   tool rather than needing a second image.
 
-`scripts/synth-guard-*.sh` are PostgreSQL-only: they inject faults with
-row-level security, which RavenDB has no equivalent of. They refuse to run on the
-RavenDB arm rather than silently measuring something else.
+Three things specific to the MySQL arm:
+
+- **The schema is a database.** `PersistMessagesWithMySql(.., "wolverine")` puts every table in a
+  `wolverine` *database*, which Weasel creates on the first migration. So the app connects to
+  `churnsim` and never to the schema it is about to build — which is what makes `just
+  reset-schema` survivable, since a pod whose connection string named the dropped database could
+  not reconnect to rebuild it.
+- **It is measurable with no monitor.** The MySQL image ships a client, so `measure.sh` and the
+  experiment scripts `kubectl exec` into the store the way the PostgreSQL arm does. A SafetyLab
+  *capture* still needs `just monitor-deploy`.
+- **Its timestamps carry whole seconds.** Weasel maps `DateTimeOffset` to a bare `DATETIME` on
+  MySQL, so `health_check` and `started` have one-second resolution where PostgreSQL's
+  `timestamptz` has microseconds. ChurnSim heartbeats every 2 s so S11 still resolves; nothing
+  sub-second should be read off this arm.
+
+The store also runs with two non-default `mysqld` flags, both load-bearing (`k8s/mysql.yaml`):
+
+- `--skip-name-resolve`, so the lock holder's `PROCESSLIST_HOST` is the pod IP the identity map
+  joins on rather than whatever reverse DNS returns for it;
+- `--performance-schema-instrument=wait/lock/metadata/sql/mdl=ON`, so `GET_LOCK` locks appear in
+  `performance_schema.metadata_locks`.
+
+The monitor does not trust the second one. The leadership lock is read with `IS_USED_LOCK()`,
+which needs nothing switched on, and `metadata_locks` is used only to enumerate the *other*
+Wolverine locks — so a tick where `IS_USED_LOCK` names a holder that `metadata_locks` does not
+know about carries a warning, which the coverage check (C0) prints, instead of reporting a lock
+that is held as free.
+
+Which experiments run on which arm:
+
+| | PostgreSQL | MySQL | RavenDB |
+| --- | --- | --- | --- |
+| rollout / duplicate-rate / heal-test / leader-kill / follower-kill | yes | yes | yes |
+| E8 `lock-kill`, E9 `db-partition` | yes | no | no |
+| `synth-guard-*` | yes | no | no |
+| E7 `split-brain` | no | no | replicated arm only |
+
+`scripts/synth-guard-*.sh` are PostgreSQL-only: they inject faults with row-level security, which
+neither other store has an equivalent of. E8 and E9 are PostgreSQL-only for a narrower reason —
+MySQL's named lock *is* session-scoped and `KILL <connection>` is the same fault on the same shape
+of lock, but `safetylab lock-chaos` resolves its victim out of `pg_locks` and nothing injects the
+MySQL form yet. All of them refuse on the wrong arm rather than silently measuring something else.
 
 ### The replicated RavenDB arm
 
@@ -180,8 +236,8 @@ just rollout         # one rolling deploy: 3 pods replaced one at a time
 just measure         # churn report
 ```
 
-Use `just deploy-ravendb` (plus `just monitor-deploy`, which the RavenDB arm needs
-before it can be measured) and the other three are unchanged.
+Use `just deploy-mysql`, or `just deploy-ravendb` (plus `just monitor-deploy`, which the RavenDB
+arm needs before it can be measured), and the other three are unchanged.
 
 `just measure` reports:
 

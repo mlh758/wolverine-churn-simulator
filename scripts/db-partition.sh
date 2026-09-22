@@ -79,7 +79,7 @@ refuse() { echo "db-partition: REFUSED — $*" >&2; exit 2; }
 
 BACKEND=$(sim_backend)
 [ "$BACKEND" = "postgres" ] \
-    || refuse "this experiment is the PostgreSQL one (found $BACKEND). The RavenDB store partition is E7 — ./scripts/split-brain.sh"
+    || refuse "this experiment is the PostgreSQL one (found $BACKEND). The RavenDB store partition is E7 — ./scripts/split-brain.sh. There is no MySQL arm of it: the cut is keyed on the pid holding the leadership lock, which `safetylab lock-chaos` resolves out of pg_locks only"
 
 # The leader, and the backend holding its lock. `lock-chaos status` prints pid, client address and
 # pod for every backend on the leadership lock; the first line is the granted holder. Resolving

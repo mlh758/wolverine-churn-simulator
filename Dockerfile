@@ -4,9 +4,10 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 # that -- a global property cannot be reassigned by the project -- so the flag below is
 # omitted entirely rather than passed empty.
 ARG WOLVERINE_VERSION=
-# 'postgres' or 'ravendb' -- selects the message store package AND the backend wiring file
-# (see ChurnSim.csproj). The image is single-backend by construction; k8s/churnsim*.yaml
-# declares the matching SIM_BACKEND and ChurnSim refuses to start on a mismatch.
+# 'postgres', 'mysql' or 'ravendb' -- selects the message store package AND the backend wiring
+# file (see ChurnSim.csproj, which fails the restore on any other value). The image is
+# single-backend by construction; k8s/churnsim*.yaml declares the matching SIM_BACKEND and
+# ChurnSim refuses to start on a mismatch.
 ARG SIM_BACKEND=postgres
 WORKDIR /src
 COPY Directory.Build.props wolverine-version ./
