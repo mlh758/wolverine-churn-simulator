@@ -15,96 +15,84 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
-## 2026-09-20 — the shortfall is a 21-minute outage, not a permanent one; releasing an ejected node's in-flight commands cuts it to ~1 cycle
+## 2026-09-22 — the shortfall is a 21-minute outage, and releasing a departed node's in-flight commands closes it
 
-Two questions settled in one sitting, on both backends. **First: stock recovers.** The 2026-09-19 entry
-called the shortfall permanent on a 420 s watch; at 1800 s PostgreSQL re-places every missing agent at
-**t=1289 s**. See the correction on that entry. **Second: the fix works.** A build that releases an
-ejected node's in-flight commands settles at 500 in **73 s** on the same arm.
+Two arms, interleaved on one cluster, `reset-schema` between, each gated on an actual `safetylab settle`
+(500 placed) before the nemesis rather than on a fixed delay. PostgreSQL, net10.0, 3 replicas, 500 agents,
+`SIM_START_DELAY_MS=500`, stock knobs, `just leader-kill`. `NodeStopped` 0 → 0 in both, so both exercised
+the ungraceful path.
 
-`6.40.0-ejectrelease.1` is a **local, uncommitted** build of `main` carrying one change: when the leader
-ejects a stale node it abandons that node's command lane, releases the agent claims those commands held,
-and drops the matching pending-assignment ledger entries.
+`6.40.0-rosterrelease.2` is a **local, unreleased** build of `main` carrying one change: the leader
+abandons the command lane of every node absent from the membership it reads each health check, releases
+the agent claims those commands held, and drops the matching pending-assignment ledger entries.
 
-### PostgreSQL leader-kill, 1800 s watch — interleaved, same cluster
-
-Stock first, then the fix, `reset-schema` between, each gated on an actual `safetylab settle` (500 placed,
-30 s both times) before the nemesis. net10.0, 3 replicas, 500 agents, `SIM_START_DELAY_MS=500`, stock knobs.
-`NodeStopped` 0 → 0 in both, so both exercised the ungraceful path.
-
-| t | stock 6.39.1 | `6.40.0-ejectrelease.1` | |
+| t | stock 6.39.1 | `6.40.0-rosterrelease.2` | |
 |---|---|---|---|
 | 1 s | 500 | 500 | pre-kill |
-| ~6–12 s | 458 | 498 | SIGKILL |
-| 12–18 s | 500 | 500 | the corpse's rows are still counted |
-| ~62–68 s | 458 | **404** | ejection |
-| 73 s | 459 | **500** | |
-| **1289 s** | **500** | 500 | the reply window lapses |
-| 1798 s | 500 | 500 | |
-| polls at 500 | 104 / 325 | **322 / 325** | |
+| ~6–7 s | 458 | 446 | SIGKILL |
+| 12–18 s | 500 | 478 → 500 | the corpse's rows are still counted |
+| ~67 s | **459** | **479** | ejection |
+| **73 s** | 459 | **500** | the release lands |
+| **1292 s** | **500** | 500 | the reply window lapses |
+| polls at 500 | 104 / 328 | **161 / 164** | |
 
-Both end at `running=500 assigned=500 duplicated=0 orphaned=0 missing=0`. The fix's dip is *deeper* (404
-against 458) and that is the mechanism showing itself: at ejection the corpse's remaining rows and the
-released chunk all become placeable in the same evaluation, instead of 41 of them being held back.
+Both end at `running=500 assigned=500 duplicated=0 orphaned=0 missing=0`. Stock is short by exactly 41 for
+**20 minutes** with every check green on both sides of the comparison; the fix is short for one
+health-check period.
 
-### The mechanism, measured three independent ways
+### The mechanism, measured three ways
 
 **Timing.** `AgentBatchTimeouts.ReplyWindowFor(41)` = `30 + 41 x 30` = 1260 s, from a dispatch at ~t+28 s,
-predicts recovery at t≈1288 s. Observed: **1289 s**.
+predicts stock recovery at t≈1288 s. Observed: **1292 s**.
 
 **The leader's log**, stock, at that moment:
 
 ```
-warn: Node 4a76a3f0… confirmed stopping 0 of 41 agents being reassigned to node e4d8f66f…;
-      41 remain unconfirmed and will be re-evaluated: sim://agent115/, sim://agent117/, …
+warn: Node ef0ce880… confirmed stopping 0 of 41 agents being reassigned to node d126a179…;
+      41 remain unconfirmed and will be re-evaluated: sim://agent355/, sim://agent356/, …
 ```
 
-**The agent logs.** The restarted pod starts 84 agents at 19:19 and 42 at 19:20, then goes silent for
-twenty-one minutes and starts exactly **41** at 19:41.
-
-On the fix build the same batch resolves at ejection instead, and the release says so:
+**The same batch on the fix build**, resolved at the roster check instead:
 
 ```
-warn: Node f6ee15c3… confirmed stopping 0 of 41 agents being reassigned to node b6a7c2e5…
-info: Released 41 agent(s) held by commands aimed at ejected node f6ee15c3…;
+info: Released 41 agent(s) held by commands aimed at nodes that have left the cluster;
       they will be re-placed on the next assignment evaluation
 ```
 
-41 on PostgreSQL and 42 on RavenDB — the counts the 2026-09-19 arithmetic predicts from
-`held - ceil(500/4)`, with no fitting.
+41 is `held - ceil(500/4)`, with no fitting, and it is the same 41 on every released build from 6.35.0
+forward (2026-09-19 entry).
 
-### RavenDB follower-kill, 1800 s watch
+### Why the release is driven by the roster and not by the ejection
 
-Same build, taken earlier the same day against the 2026-09-19 arm's 458.
+The obvious wiring — release from inside `ejectStaleNodes`, against the node just deleted — **does not
+work, and measures as no fix at all**: 1352 s against the stock 1292 s, twice running
+(`runs/leader-kill-postgres-ejectrelease2{,-run2}/`). Ejecting a stale row is not the leader's privilege;
+`ejectStaleNodes` spares only the *current leader's* row, so once leadership has moved off the corpse any
+node may delete it, and on a three-node cluster a follower won that race in all three runs observed
+(`DormantNodeEjected … Health check on Node 4` / `Node 3` / `Node 1`, leader Node 2 each time). The wedged
+commands exist only on the **leader's** dispatcher, so the release fired on a node holding nothing, logged
+nothing, and left the leader stranded for the full reply window. Asking "is this node still in the
+membership I just read" gives the same answer whoever performs the delete — and in the final run a
+non-leader ejected again, and the leader released anyway.
 
-| | `6.40.0-ejectrelease.1` | 6.39.1 |
-|---|---|---|
-| placed after | **500** | 458 (420 s watch) |
-| recovered at | **t=69 s** | not within that watch |
-| the victim's own agents re-placed | **167 of 167** | 125 of 167 |
-| polls at 500 | 316 / 318 | — |
-
-### An incidental finding: `leader-kill.sh`'s leaderless number is a false positive here
-
-Both PostgreSQL runs printed `leaderless window: STILL LEADERLESS after 1800s`, and neither cluster was
-ever leaderless: `LeadershipAssumed` fired twice, `DormantNodeEjected` once, the rebalance plainly
-happened, and placement recovered. There is simply **no `wolverine://leader` assignment row** in the
-database for the whole run — the only non-sim row is the durability agent. That is the "row absent"
-column already in the version matrix below, but it also means this script's headline measurement cannot
-be trusted on this arm until it reads leadership from something other than that row. It reproduces on
-stock, so it is not caused by the change.
+That failed arm is the reason this entry exists in this shape: an end-state snapshot at 420 s would have
+called both builds identical, and a 73 s recovery is only distinguishable from a 1292 s one if the watch
+outlives the reply window.
 
 ### What this does not establish
 
-- **Not a released package.** A local build of an uncommitted change. Move this entry to the archive if
-  it never merges.
-- **The new long-hold warning never fired**, by design: it triggers at `AgentProgressStallTimeout`
-  (5 min) and the holds here lasted 40–70 s. The release path is measured; the warning is not.
-- **One run per cell.** The counts are deterministic and the timing matched a prediction to within a poll
-  interval, so this is not a noisy measurement — but it is still n=1 per arm.
+- **Not a released package.** A local build of an unmerged branch.
+- **One run per arm.** The counts are deterministic and stock's timing matched a prediction to within a
+  poll interval, so this is not a noisy measurement — but it is still n=1 per arm, and the ejection race
+  above is a reminder that one run can hide a race entirely.
+- **PostgreSQL only.** The 2026-09-19 entry shows the same shortfall on RavenDB via `follower-kill`; the
+  fix has not been re-measured there.
+- **The long-held warning is now measured**, unlike the earlier attempt: both failed-arm runs logged
+  `41 agent assignment(s) have been held pending for longer than 00:05:00 …` naming the oldest agent and
+  its destination. Nothing else in the cluster reports this state.
 
-Run directories: `runs/leader-kill-postgres-{6391-stock1800,ejectrelease}/`,
-`runs/follower-kill-raven-ejectrelease/`.
+Run directories: `runs/leader-kill-postgres-{6391-verify,rosterrelease2}/`, each with `timeline.tsv` and
+the captured pod logs.
 
 ## 2026-09-19 — a surviving leader under-assigns by ~41/500 after an ungraceful node death, on both backends
 
@@ -116,12 +104,12 @@ not on a fixed delay. Reproduces on every released version tested, 6.35.0 throug
 assignment rows go unwritten, the cluster sits there for the length of this watch, and
 `assigned == running` throughout — so no checker, and nothing inside Wolverine, reports a problem.**
 
-> **Correction, 2026-09-20 — "permanently" was wrong.** Every arm below was watched for 420 s. The
+> **Correction, 2026-09-22 — "permanently" was wrong.** Every arm below was watched for 420 s. The
 > agents are held by a batched reassignment whose source is the dead node, and that batch's reply
 > window is `30 + 41 x 30` = **1260 s**, so no watch here could outlive it. Re-run at 1800 s, stock
-> PostgreSQL recovers on its own at **t=1289 s**. The finding is a ~21-minute silent under-placement,
+> PostgreSQL recovers on its own at **t=1292 s**. The finding is a ~21-minute silent under-placement,
 > not a permanent one; everything else below — the count, the determinism, the 2x2, the mechanism —
-> stands as measured. See the 2026-09-20 entry.
+> stands as measured. See the 2026-09-22 entry.
 
 ### The 2×2 that isolates it
 
