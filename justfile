@@ -108,6 +108,15 @@ leader-kill-graceful seconds="120":
 leader-kill-dry-run:
     DRY_RUN=1 ./scripts/leader-kill.sh
 
+# Kill a NON-leader ungracefully, so the leader survives and must rebalance. The nemesis that
+# reproduces the missing-agent shortfall on both backends; leader-kill on RavenDB cannot reach it.
+follower-kill seconds="420":
+    ./scripts/follower-kill.sh {{seconds}}
+
+# Resolve the spared leader, the victim and a validated host pid, and stop before the signal.
+follower-kill-dry-run:
+    DRY_RUN=1 ./scripts/follower-kill.sh
+
 # E8 — take the leader's advisory lock away by killing the backend holding it. PostgreSQL only.
 lock-kill seconds="180":
     ./scripts/lock-kill.sh {{seconds}}

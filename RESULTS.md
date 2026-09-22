@@ -15,6 +15,183 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
+## 2026-09-20 — the shortfall is a 21-minute outage, not a permanent one; releasing an ejected node's in-flight commands cuts it to ~1 cycle
+
+Two questions settled in one sitting, on both backends. **First: stock recovers.** The 2026-09-19 entry
+called the shortfall permanent on a 420 s watch; at 1800 s PostgreSQL re-places every missing agent at
+**t=1289 s**. See the correction on that entry. **Second: the fix works.** A build that releases an
+ejected node's in-flight commands settles at 500 in **73 s** on the same arm.
+
+`6.40.0-ejectrelease.1` is a **local, uncommitted** build of `main` carrying one change: when the leader
+ejects a stale node it abandons that node's command lane, releases the agent claims those commands held,
+and drops the matching pending-assignment ledger entries.
+
+### PostgreSQL leader-kill, 1800 s watch — interleaved, same cluster
+
+Stock first, then the fix, `reset-schema` between, each gated on an actual `safetylab settle` (500 placed,
+30 s both times) before the nemesis. net10.0, 3 replicas, 500 agents, `SIM_START_DELAY_MS=500`, stock knobs.
+`NodeStopped` 0 → 0 in both, so both exercised the ungraceful path.
+
+| t | stock 6.39.1 | `6.40.0-ejectrelease.1` | |
+|---|---|---|---|
+| 1 s | 500 | 500 | pre-kill |
+| ~6–12 s | 458 | 498 | SIGKILL |
+| 12–18 s | 500 | 500 | the corpse's rows are still counted |
+| ~62–68 s | 458 | **404** | ejection |
+| 73 s | 459 | **500** | |
+| **1289 s** | **500** | 500 | the reply window lapses |
+| 1798 s | 500 | 500 | |
+| polls at 500 | 104 / 325 | **322 / 325** | |
+
+Both end at `running=500 assigned=500 duplicated=0 orphaned=0 missing=0`. The fix's dip is *deeper* (404
+against 458) and that is the mechanism showing itself: at ejection the corpse's remaining rows and the
+released chunk all become placeable in the same evaluation, instead of 41 of them being held back.
+
+### The mechanism, measured three independent ways
+
+**Timing.** `AgentBatchTimeouts.ReplyWindowFor(41)` = `30 + 41 x 30` = 1260 s, from a dispatch at ~t+28 s,
+predicts recovery at t≈1288 s. Observed: **1289 s**.
+
+**The leader's log**, stock, at that moment:
+
+```
+warn: Node 4a76a3f0… confirmed stopping 0 of 41 agents being reassigned to node e4d8f66f…;
+      41 remain unconfirmed and will be re-evaluated: sim://agent115/, sim://agent117/, …
+```
+
+**The agent logs.** The restarted pod starts 84 agents at 19:19 and 42 at 19:20, then goes silent for
+twenty-one minutes and starts exactly **41** at 19:41.
+
+On the fix build the same batch resolves at ejection instead, and the release says so:
+
+```
+warn: Node f6ee15c3… confirmed stopping 0 of 41 agents being reassigned to node b6a7c2e5…
+info: Released 41 agent(s) held by commands aimed at ejected node f6ee15c3…;
+      they will be re-placed on the next assignment evaluation
+```
+
+41 on PostgreSQL and 42 on RavenDB — the counts the 2026-09-19 arithmetic predicts from
+`held - ceil(500/4)`, with no fitting.
+
+### RavenDB follower-kill, 1800 s watch
+
+Same build, taken earlier the same day against the 2026-09-19 arm's 458.
+
+| | `6.40.0-ejectrelease.1` | 6.39.1 |
+|---|---|---|
+| placed after | **500** | 458 (420 s watch) |
+| recovered at | **t=69 s** | not within that watch |
+| the victim's own agents re-placed | **167 of 167** | 125 of 167 |
+| polls at 500 | 316 / 318 | — |
+
+### An incidental finding: `leader-kill.sh`'s leaderless number is a false positive here
+
+Both PostgreSQL runs printed `leaderless window: STILL LEADERLESS after 1800s`, and neither cluster was
+ever leaderless: `LeadershipAssumed` fired twice, `DormantNodeEjected` once, the rebalance plainly
+happened, and placement recovered. There is simply **no `wolverine://leader` assignment row** in the
+database for the whole run — the only non-sim row is the durability agent. That is the "row absent"
+column already in the version matrix below, but it also means this script's headline measurement cannot
+be trusted on this arm until it reads leadership from something other than that row. It reproduces on
+stock, so it is not caused by the change.
+
+### What this does not establish
+
+- **Not a released package.** A local build of an uncommitted change. Move this entry to the archive if
+  it never merges.
+- **The new long-hold warning never fired**, by design: it triggers at `AgentProgressStallTimeout`
+  (5 min) and the holds here lasted 40–70 s. The release path is measured; the warning is not.
+- **One run per cell.** The counts are deterministic and the timing matched a prediction to within a poll
+  interval, so this is not a noisy measurement — but it is still n=1 per arm.
+
+Run directories: `runs/leader-kill-postgres-{6391-stock1800,ejectrelease}/`,
+`runs/follower-kill-raven-ejectrelease/`.
+
+## 2026-09-19 — a surviving leader under-assigns by ~41/500 after an ungraceful node death, on both backends
+
+net10.0, 3 replicas, 500 agents, stock knobs unless stated. `just reset-schema` between every
+build; each arm gated on an actual `running=500 assigned=500` snapshot before the nemesis fired,
+not on a fixed delay. Reproduces on every released version tested, 6.35.0 through 6.39.1.
+
+**A leader that survives a node's ungraceful death does not re-place all of its agents. ~41 of 500
+assignment rows go unwritten, the cluster sits there for the length of this watch, and
+`assigned == running` throughout — so no checker, and nothing inside Wolverine, reports a problem.**
+
+> **Correction, 2026-09-20 — "permanently" was wrong.** Every arm below was watched for 420 s. The
+> agents are held by a batched reassignment whose source is the dead node, and that batch's reply
+> window is `30 + 41 x 30` = **1260 s**, so no watch here could outlive it. Re-run at 1800 s, stock
+> PostgreSQL recovers on its own at **t=1289 s**. The finding is a ~21-minute silent under-placement,
+> not a permanent one; everything else below — the count, the determinism, the 2x2, the mechanism —
+> stands as measured. See the 2026-09-20 entry.
+
+### The 2×2 that isolates it
+
+| nemesis | backend | leadership changes? | leader rebalances? | settles at |
+|---|---|---|---|---|
+| leader-kill | PostgreSQL | yes, a peer takes over in ~6 s | yes — victim rejoins as a new node at ~t+60 s | **459** |
+| leader-kill | RavenDB | no for 303 s, then the victim's own restart reclaims it | **no** | 500 ✅ |
+| **follower-kill** | **RavenDB** | **no — the leader is untouched for the whole watch** | **yes** | **458** |
+
+The RavenDB leader-kill row is the 2026-09-18 entry below (6.39.0); the follower-kill row is 6.39.1.
+
+It is **not** PostgreSQL-specific and it does **not** involve leadership transfer. The RavenDB
+leader-kill looks clean only because nothing ever rebalances in it: the compare-exchange lease has
+to expire before anyone leads again, and by then the victim is back. The single factor common to
+both failing arms is a surviving leader redistributing after an ungraceful death — which is why
+`scripts/follower-kill.sh` exists, and why it is the minimal reproducer rather than leader-kill.
+
+### Version matrix — PostgreSQL leader-kill
+
+| build | start delay | pre-kill | settles | unassigned | `wolverine://leader` row |
+|---|---|---|---|---|---|
+| 6.39.1 | 500 ms | 500 | 459 | 41 | present |
+| 6.39.0 | 500 ms | 500 | 459 | 41 | present |
+| 6.36.0 (the GH-3987 sweep lands) | 500 ms | 500 | 459 | 41 | present |
+| 6.35.0 (pre-sweep) | 500 ms | 500 | 459 | 41 | **absent** |
+| 6.39.1 | **0 ms** | 500 | 459 | 41 | **absent** |
+
+Deterministic: exactly 41, across four versions and both start-delay settings. Not a race.
+Unaffected by #4404 / #4407 — present in 6.35.0, before the sweep existed.
+
+### What it is not
+
+- **Not GH-3987.** That is *divergence* — the row says node A owns the agent and A is not running
+  it. The node-side sweep heals it by comparing local runners against local rows. This is
+  *absence*: `running=459 assigned=459 duplicated=0 orphaned=0 missing=0`, agreed on both sides,
+  and 41 URIs with no row on any node. The sweep is working correctly and has nothing to act on —
+  nothing in the node-side path is responsible for noticing the assignment *set* is short.
+- **Not capability matching or an embargo.** All three surviving nodes advertise 501 capabilities
+  (500 sim + durability) at the end of every run, and the restrictions table is empty.
+- **Not a phantom node in the grid.** Exactly three node rows survive, all heartbeating 0–2 s.
+- **Not slow starts.** `SIM_START_DELAY_MS=0`, verified from each live pod's own `printenv` after
+  both the override rollout and the `reset-schema` bounce, still lands on 459.
+- **Not the graceful path.** E2 (12 rolling deploys, same cluster and build) is 12/12 clean at
+  500/500 with 10 `LeadershipAssumed` events — the handover window was genuinely exercised. Graceful
+  shutdown releases agents cleanly; SIGKILL does not.
+
+The unassigned URIs are scattered rather than contiguous (e.g. 104, 137, 216, 223, 224, 226, 227,
+229, 230, 239, 240, 241 …), which also argues against a truncated batch.
+
+### Scope
+
+The trigger is narrow, which is likely why it is not already known: the node has to die
+*ungracefully* (SIGKILL, or anything that skips Wolverine's shutdown) while a leader survives to
+redistribute its agents. A rolling deploy does not do this — shutdown runs, agents are released
+cleanly, and 12/12 rollouts settle at 500. Nor does losing a lock without losing the process, or
+losing the database connection. A pod OOM-killed or evicted mid-operation does.
+
+### Reproducing
+
+```bash
+just deploy 6.39.1            # or any build from 6.35.0 forward
+just reset-schema
+# wait for a real 500/500 -- `safetylab snapshot`, not a fixed sleep
+just follower-kill 420
+```
+
+Run directories: `runs/leader-kill-postgres-{STOCK,6391,636,635,nodelay2}/` and
+`runs/follower-kill-raven-6391/`. Each carries `db-state.txt`
+(the unassigned URIs, per-node counts, capability counts, node records) and `pods.log`.
+
 ## 2026-09-19 — E9 app↔DB partition: a PostgreSQL leader cut off from its database keeps the lock, keeps the leader row, and never notices
 
 The complement to E8, same cluster and build, run an hour later. Wolverine **6.39.0**, net10.0,
