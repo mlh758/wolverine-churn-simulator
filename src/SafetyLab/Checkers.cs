@@ -16,8 +16,11 @@ public record CheckResult(string Id, string Title, IReadOnlyList<Violation> Viol
 /// <summary>
 /// One runtime residency of an agent on a pod, reconstructed from AGENT-START / AGENT-STOP.
 /// <c>End</c> is null while the agent was still running when the capture ended.
+/// <c>EndedByRestart</c> marks a residency that no AGENT-STOP closed: the pod announced a new node
+/// identity, so the process that held the agent had died, and <c>End</c> is that announcement.
 /// </summary>
-public record Residency(string AgentUri, string PodName, DateTimeOffset Start, DateTimeOffset? End)
+public record Residency(string AgentUri, string PodName, DateTimeOffset Start, DateTimeOffset? End,
+    bool EndedByRestart = false)
 {
     public bool Covers(DateTimeOffset at) => at >= Start && (End is null || at < End);
     public DateTimeOffset EndOr(DateTimeOffset fallback) => End ?? fallback;
@@ -379,7 +382,8 @@ public static class Checkers
         [
             $"AGENT-START/STOP timestamps come from each pod's own clock; overlaps shorter than " +
             $"{options.CrossPodGrace.TotalSeconds:F0}s are treated as skew and ignored",
-            "pods deleted before their logs were captured contribute no residencies — see the coverage check"
+            "pods deleted before their logs were captured contribute no residencies — see the coverage check",
+            ..RestartNote(residencies)
         ]);
     }
 
@@ -469,7 +473,8 @@ public static class Checkers
             return $"{orphans.Count} agent(s) running where not assigned: {shown}{more}";
         });
 
-        return new CheckResult("S7", "Every running agent is assigned to the node running it", violations, []);
+        return new CheckResult("S7", "Every running agent is assigned to the node running it", violations,
+            RestartNote(residencies));
     }
 
     /// <summary>
@@ -1381,26 +1386,76 @@ public static class Checkers
     // --------------------------------------------------------------- helpers
 
     /// <summary>
+    /// Says when residencies were closed by a container restart rather than by the log, because
+    /// the close time is then an upper bound: the process died somewhere before its replacement
+    /// announced itself, and a duplicate shorter than that gap cannot be seen.
+    /// </summary>
+    private static IReadOnlyList<string> RestartNote(IReadOnlyList<Residency> residencies)
+    {
+        var ended = residencies.Where(x => x.EndedByRestart).ToList();
+        if (ended.Count == 0) return [];
+
+        var pods = string.Join(", ", ended.Select(x => x.PodName).Distinct().Order(StringComparer.Ordinal));
+        return
+        [
+            $"{ended.Count} residenc{(ended.Count == 1 ? "y" : "ies")} on {pods} closed at a container restart " +
+            "(the pod announced a new node id; the dead process logged no AGENT-STOP) — the close is the " +
+            "new process's SIM-IDENTITY, so the true end is earlier"
+        ];
+    }
+
+    /// <summary>
     /// Reconstruct per-pod agent residencies from the log stream. An AGENT-START with no matching
     /// AGENT-STOP stays open; an AGENT-STOP with no matching start is dropped, which is what a
     /// capture that began after the agent did looks like.
+    ///
+    /// <para>
+    /// A pod that announces a <b>different</b> node id has a new process in it: a SIGKILL restarts
+    /// the container inside the same pod, the follower keeps appending to the same pods.jsonl, and
+    /// the dead process never logged its AGENT-STOPs. Everything still open on that pod is closed at
+    /// the announcement. Without this, every agent the corpse held and the leader re-placed read as
+    /// running in two places until the capture ended. The same node id again is only the follower
+    /// re-reading the log after re-attaching, and changes nothing.
+    /// </para>
     /// </summary>
     public static IReadOnlyList<Residency> BuildResidencies(RunHistory history)
     {
         var open = new Dictionary<(string Agent, string Pod), DateTimeOffset>();
         var closed = new List<Residency>();
+        var nodeOnPod = new Dictionary<string, Guid>(StringComparer.Ordinal);
 
-        foreach (var e in history.AgentEvents.OrderBy(x => x.Ts))
+        // Identities sort ahead of agent events at the same instant: a new process announces
+        // itself before it starts anything, so a tie belongs to the new process.
+        var timeline = history.Identities.Select(x => (x.Ts, Order: 0, Identity: (IdentityRecord?)x, Agent: (AgentEventRecord?)null))
+            .Concat(history.AgentEvents.Select(x => (x.Ts, Order: 1, Identity: (IdentityRecord?)null, Agent: (AgentEventRecord?)x)))
+            .OrderBy(x => x.Ts).ThenBy(x => x.Order);
+
+        foreach (var (_, _, identity, e) in timeline)
         {
-            var key = (e.AgentUri, e.PodName);
+            if (identity is not null)
+            {
+                if (nodeOnPod.TryGetValue(identity.PodName, out var previous) && previous != identity.NodeId)
+                {
+                    foreach (var key in open.Keys.Where(k => k.Pod == identity.PodName).ToList())
+                    {
+                        open.Remove(key, out var began);
+                        closed.Add(new Residency(key.Agent, key.Pod, began, identity.Ts, EndedByRestart: true));
+                    }
+                }
+
+                nodeOnPod[identity.PodName] = identity.NodeId;
+                continue;
+            }
+
+            var agentKey = (e!.AgentUri, e.PodName);
 
             if (e.Event == "start")
             {
                 // A second start with no intervening stop: keep the earlier one, which is the
                 // conservative reading for an exclusivity check.
-                if (!open.ContainsKey(key)) open[key] = e.Ts;
+                if (!open.ContainsKey(agentKey)) open[agentKey] = e.Ts;
             }
-            else if (open.Remove(key, out var start))
+            else if (open.Remove(agentKey, out var start))
             {
                 closed.Add(new Residency(e.AgentUri, e.PodName, start, e.Ts));
             }

@@ -4,9 +4,8 @@ Ways this harness has produced a confident wrong answer. The common shape: **it 
 adjacent to what it claims**, and the result looks plausible. A crash is cheap; a green run over an
 empty result set costs hours.
 
-Everything above the last section is **still live** — a property of Kubernetes, podman, a store, or
-the shell that will bite again. The last section lists incidents that now have a guard in code:
-they are kept short, and only so nobody removes a guard without knowing what it is for.
+Every entry here is **still live** — a property of Kubernetes, podman, a store, or the shell that
+will bite again. When a trap gets a guard in code, its entry is deleted.
 
 ## Four rules, each bought the hard way
 
@@ -151,14 +150,6 @@ wrote **none** across some twenty graceful shutdowns in the retained window, so 
 a clean stop *and* a SIGKILL both report. Validate a kill from the container instead: exit code
 **137**, `restartCount` up by one on the same pod, and a `--previous` log with no shutdown lines.
 
-**A SIGKILL restarts the container inside the same pod, and the checker does not notice.** The
-killed process never logs its `AGENT-STOP`s, the follower keeps writing the new container to the
-same `pods.<pod>.jsonl`, and S5/S7 read one continuous stream — so every agent the corpse held that
-was re-placed elsewhere reads as running in two places until the capture ends (84 and 83 such S5
-violations on the 2026-09-25 MySQL kills, every one open only in the `--previous` container, while
-`safetylab snapshot` read `duplicated=0`). On a kill capture, S5/S7 are not evidence until
-residencies close on a container restart; S3/S4/S11/L1 are unaffected.
-
 **Before handing any pid to `kill -9`, check it is `> 1` and that `/proc/<pid>/cmdline` is the
 process you meant.** A fault injector aimed at the wrong process either destroys the rig or, worse,
 quietly injects nothing and leaves a plausible number behind.
@@ -179,17 +170,6 @@ chain are not ours to touch.
 
 **`local a="$1" b="x${a}"` dies under `set -u`.** Bash expands every word of a `local` statement
 before performing any of its assignments, so `b` reads an unset `a`. Split the statement.
-
-**Inline `python3 -c '...'` inside a bash function is a quoting minefield.** An f-string with
-nested double quotes died *silently into an empty field*, shifting every later column in a results
-TSV — the first row read plausibly and was wrong. Parsers live in files where they can be tested
-standalone. The measurement path has since gone further and left both shell and Python entirely:
-`safetylab snapshot` takes both sides of the running-vs-assigned comparison and `safetylab
-overlaps` replays the duplicate-healing timeline, each deciding its verdict in the same process
-that computes its counts, and `safetylab traces` does the same for Jaeger's spans. There is no
-text hop left to mis-read and no inline `python3 -c` left anywhere. The only Python remaining is
-two quoted `<<'PY'` heredocs, in `duplicate-rate.sh` and `heal-test.sh`, that total up a finished
-results.tsv — off the measurement path, and quoted, which is the half of this trap that bites.
 
 **A `while :` background loop makes its launcher hang** under any caller that waits for children
 (`bash -c`, a script, CI). Hence `setsid` + `disown` and a re-entry subcommand in `monitor.sh`.
@@ -275,14 +255,6 @@ writes ~200 MB for a ten-minute run with no added resolution over a control plan
 `SIM_*` env vars from a previous experiment are not still set. `AgentStartBatchSize=5` survived
 three sessions this way and materially changed convergence.
 
-**An experiment can depend on instrumentation that only exists in a locally packed build.** The
-synthetic-self-guard runs count a log line that the branch builds emit and no released Wolverine
-does: `strings` on a deployed 6.39.0 `WolverineFx.dll` finds the marker zero times. Everything
-upstream of the count still works — the fault arms, a real node really is blinded, the phases run,
-the snapshots come back clean — so the run looks entirely healthy right up to a summary of zeroes.
-Before trusting an arm, check the marker exists in the build under test; `safetylab count` over the
-`during` phase is the cheapest way, and the run now prints `*** INVALID ARM ***` when it is zero.
-
 **Never pool arms.** A rate averaged across two backends, two Wolverine versions or two knob
 settings is not a result. Results files carry the backend per row and the scripts refuse to append
 across arms.
@@ -318,48 +290,3 @@ RESULTS.md 2026-09-23).
 evaluated against a GH-3959 run. Every cascade number in RESULTS.md before 2026-09-23 comes from
 counting rows in a table, which is why a detached agent that landed nowhere read as "capacity-aware
 holds". If an experiment is worth a result, capture it (`just capture-start`) and check it.
-
-**An agent in NO place used to violate nothing.** S5 is "no agent on two nodes", S6 "assigned
-implies running", S7 "running implies assigned". An agent that is neither assigned nor running
-satisfies all three vacuously — it is not inconsistent, it is consistently absent. S12 exists for
-exactly that dual, and keys on the *transition* (was running, was stopped, was not re-placed) and
-on whether the node stayed in the cluster, because a raw count of unplaced agents cannot separate
-"correctly withheld for lack of headroom" from "shed into nowhere" — on a capacity run the first
-swamps the second.
-
-## Guarded: incidents that can no longer recur
-
-Each of these produced a wrong answer once and now has a guard. Listed so the guard is not removed
-as dead weight — if you find yourself deleting one, this is what it was for.
-
-| incident | guard |
-|---|---|
-| Watched advisory lock `9999999`; it is `schemaName.GetDeterministicHashCode()`. S1–S4 passed against a lock nobody held | `RunHistory.LockIdForSchema`, plus S1's sentinel note |
-| Matched `wolverine://leader` without the trailing slash `Uri.ToString()` adds; every leader check found nothing | `RunHistory.IsLeaderUri` matches both forms |
-| Argument parser ignored unrecognised flags, so a typo ran the verb against its default | `System.CommandLine` rejects unknown tokens outright — the verb no longer runs at all, so there is nothing left for a test to assert |
-| `cut -f2` on the word `none` read it as a node id and reported a 5-minute outage as instant recovery | `LeaderState` makes leaderless a type, not a string |
-| `grep -m1 '"pid"'` on `crictl inspect` matched a namespace descriptor and ran `kill -9 1` on the node's init | `ContainerProbe` parses `.info.pid` and validates before any kill |
-| `-o jsonpath='{.items[0]...}'` picked terminated and completed pods | `PodSelection.IsLive`; `safetylab pick-pod` |
-| A "SIGKILL" run that actually shut down gracefully was reported as a failover measurement | `leader-kill.sh` counts `NodeStopped` and prints `*** INVALID RUN ***` |
-| `.tools/safetylab` cached on existence, so a re-check ran the old checker against the new fix. It recurred while the snapshot/overlaps/traces verbs were being written: `dotnet build` succeeded, `.tools/` still held the previous publish, and the new verb came back "Unrecognized command" | mtime comparison in `monitor.sh`'s `ensure_tool` **and** in `backend.sh`'s `require_safetylab`, which every measurement script calls |
-| Rebuilt monitor image ignored because the tag was unchanged | unconditional `rollout restart` in `monitor.sh deploy` |
-| Host `obj/` leaked into the image, failing publish with `NETSDK1064` that read as a missing package | `.dockerignore` excludes `**/bin` and `**/obj` |
-| `monitor.sh stop` killed pids not process groups; a leaked follower appended the next run's pods for twenty minutes | group kill, then a warning if anything survived |
-| Two of three pods died on every RavenDB cold start racing to create the database | `RavenDbBackend.ensureDatabaseReady` retries on a postcondition |
-| Duplicate-rate results from two backends would have pooled into one rate | backend column per row; the script refuses to append across arms |
-| `sed` read three counters out of a Python differ's summary line; when that line was a traceback all three came back empty, `${x:-0}` made them zero, the iteration was filed `clean` and its raw logs deleted | `safetylab snapshot` computes the counts and the verdict together and exits 0/1/**2**; `duplicate-rate.sh` branches on the code and parses nothing |
-| "I could not measure" and "I measured, and it was clean" were the same outcome | `SKIP-unmeasurable`, from snapshot's exit 2 — refused on no live pod, an unreadable store, or no agent event logged anywhere |
-| The overlap analysis wrote its errors to the same stdout its counts were read from, so a traceback read as `never` — "no duplicate at all" — and heal-test.sh then deleted the raw logs | `safetylab overlaps` exits 0/1/**2**; heal-test.sh branches on the code, and exit 2 is `SKIP-unanalysable` with the evidence kept |
-| The RLS fault was armed and disarmed by two statements a few hundred seconds apart, with no trap. A Ctrl-C or any failing command between them left one node's row permanently invisible to the app role, and every later experiment on that cluster silently measured a crippled node | `safetylab chaos arm/disarm/status`; `disarm` is idempotent and runs from a `trap … EXIT INT TERM`, and a run refuses to start while a previous arm is still in place |
-| An advisory lock was going to be "removed" with `pg_advisory_unlock` from a psql session, which releases nothing, returns `f`, and warns only on stderr — the run would have injected no fault at all | `LockChaos` terminates the session instead, reads the lock back afterwards, and `Verdict` refuses a signal that landed without moving the lock; **K1** asserts the same thing against the capture |
-| The victim query returned an empty string on an unsettled cluster, so the policy became `id <> ''`, which hides nothing. The arm ran its full duration injecting no fault and recorded zero injections — indistinguishable from "the guard prevented it" | `PostgresChaos.TryChooseVictim` refuses with a named reason for every empty case; the summary prints `*** INVALID ARM ***` when the armed phase logged no injections |
-| Pod configuration was checked with `grep … \|\| echo WARNING` and the run carried on | `safetylab verify-config` refuses, checks **every** live pod, and reads `State.Setting`/`State.Value` so "knob absent from this build" is distinct from "set to something else" |
-| `monitor.sh start` followed `.items[0]` for the safetylab pod, straight after a `rollout restart` left the previous one terminating — a near-empty history.jsonl that every S-check passes over | `safetylab pick-pod --label app=safetylab` |
-| One `kubectl logs -f` for the monitor stream: a restarted pod or an API blip left the rest of the run with no server-side history, while `stop` still reported a plausible sample count | a re-attaching `__history` loop, and `stop` warns loudly when history.jsonl is empty |
-| `active_run`'s `exit 2` never stopped anything — it is only ever called inside `$(…)`, so the refusal printed and the caller continued with an empty name. `mark` appended a phase boundary to `runs/marks.jsonl`, outside any run | it `return`s, and every caller is `name=$(active_run) \|\| exit 2` |
-| `.active` outlived its capture and its run directory, so `mark` and `check` pointed at a path that no longer existed | both refuse when `runs/<name>` is missing, and say how to clear the marker |
-| Three copies of `wait_settled` compared the placed count against a literal **500**, against a deployment that declares `SIM_AGENT_COUNT` and a ChurnSim whose default is 20. Any other number could never settle, so every iteration would record SKIP-no-settle — quietly, for as long as it was left running | `safetylab settle` reads the target from the deployment; `--expect` overrides it |
-| `db_placed` sent psql's stderr to `/dev/null`, so an unreachable store returned `""`, `${n:-0}` made it 0 placed, and the loop waited out its full timeout before reporting "never settled" — a store outage filed as a convergence failure | `settle` exits **2** after five consecutive failed reads, and `_psql` no longer discards stderr |
-| `duplicate-rate.sh` checked the settle status on the pre-rollout wait and not on the measured one, so an iteration that never converged still had its snapshot taken and filed as a real result | the measured settle is checked; no-settle is `SKIP-no-settle`, an unreadable store is `SKIP-unmeasurable` |
-| Three of five `backend.sh` store queries — `db_per_node`, `db_records`, `db_per_minute` — had `group by 1` over a select list whose first expression contains an aggregate, or `order by 2` over a one-column list. All three errored on **every call since they were written**; `2>/dev/null` hid it, so `measure.sh` printed empty sections and `total AssignmentChanged: 0` | the queries are fixed, and `_psql` no longer discards stderr — which is the only reason this was ever found |
-| A crashed checker produced no output, so `actual` came back empty — which is exactly what the `clean` rows expect. The two fixtures whose job is to prove the checkers stay quiet passed against a broken binary | `tests/selftest.sh` asserts a non-empty result array, and that every fixture ran the *same* number of checks |

@@ -277,4 +277,66 @@ public class RegressionTests
         Assert.Null(LockState.Parse("none"));
         Assert.Null(LockState.Parse(""));
     }
+
+    // ---------------------------------- defect 5: a SIGKILL restart read as a duplicate forever
+
+    private static RunHistory KilledPodHistory(Guid firstProcess, Guid secondProcess)
+    {
+        var t0 = DateTimeOffset.Parse("2026-09-25T18:13:25Z");
+        return new RunHistory
+        {
+            Directory = "(none)",
+            Meta = null,
+            Samples = [],
+            Marks = [],
+            Identities =
+            [
+                new IdentityRecord(t0, firstProcess, "pod-a", "10.0.0.1"),
+                new IdentityRecord(t0, Guid.NewGuid(), "pod-b", "10.0.0.2"),
+                // The container is SIGKILLed and restarted in the same pod at +145 s.
+                new IdentityRecord(t0.AddSeconds(145), secondProcess, "pod-a", "10.0.0.1")
+            ],
+            AgentEvents =
+            [
+                new AgentEventRecord(t0.AddSeconds(5), "start", "sim://agent1/", "pod-a"),
+                // The leader re-places it on pod-b after the restart; the corpse never logged a stop.
+                new AgentEventRecord(t0.AddSeconds(205), "start", "sim://agent1/", "pod-b"),
+                new AgentEventRecord(t0.AddSeconds(300), "stop", "sim://agent1/", "pod-b")
+            ]
+        };
+    }
+
+    [Fact]
+    public void a_new_process_in_the_same_pod_closes_what_the_dead_one_held()
+    {
+        // 84 S5 violations on the 2026-09-25 MySQL kills, each open only in the --previous
+        // container: the follower wrote the restarted container into the same pods.<pod>.jsonl and
+        // the agent that had been re-placed elsewhere read as running in two places until the end.
+        var history = KilledPodHistory(Guid.NewGuid(), Guid.NewGuid());
+
+        var residencies = Checkers.BuildResidencies(history);
+        var onA = Assert.Single(residencies, x => x.PodName == "pod-a");
+
+        Assert.True(onA.EndedByRestart);
+        Assert.Equal(history.Identities[2].Ts, onA.End);
+
+        var s5 = Checkers.RunAll(history, new CheckOptions()).Single(x => x.Id == "S5");
+        Assert.False(s5.Failed);
+        Assert.Contains(s5.Notes, n => n.Contains("container restart"));
+    }
+
+    [Fact]
+    public void the_same_node_id_again_is_a_reattach_and_closes_nothing()
+    {
+        // The follower re-reads a pod's whole log each time `kubectl logs -f` re-attaches, so the
+        // same SIM-IDENTITY arriving twice is ordinary and must not end any residency.
+        var node = Guid.NewGuid();
+        var history = KilledPodHistory(node, node);
+
+        var onA = Assert.Single(Checkers.BuildResidencies(history), x => x.PodName == "pod-a");
+
+        Assert.Null(onA.End);
+        Assert.False(onA.EndedByRestart);
+        Assert.True(Checkers.RunAll(history, new CheckOptions()).Single(x => x.Id == "S5").Failed);
+    }
 }
