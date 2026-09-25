@@ -144,6 +144,21 @@ forms anyway. `safetylab lock-chaos kill`
 reads it, then reads the lock back from the server, and **K1** repeats the assertion against the
 capture.
 
+**`NodeStopped` is not a graceful-shutdown witness on every store.** `leader-kill.sh` and
+`follower-kill.sh` print `*** INVALID RUN ***` when a `NodeStopped` record appears, which only works
+if a graceful shutdown writes one. RavenDB does (73 records, 2026-09-18). The MySQL arm, on 6.39.0,
+wrote **none** across some twenty graceful shutdowns in the retained window, so there `0 → 0` is what
+a clean stop *and* a SIGKILL both report. Validate a kill from the container instead: exit code
+**137**, `restartCount` up by one on the same pod, and a `--previous` log with no shutdown lines.
+
+**A SIGKILL restarts the container inside the same pod, and the checker does not notice.** The
+killed process never logs its `AGENT-STOP`s, the follower keeps writing the new container to the
+same `pods.<pod>.jsonl`, and S5/S7 read one continuous stream — so every agent the corpse held that
+was re-placed elsewhere reads as running in two places until the capture ends (84 and 83 such S5
+violations on the 2026-09-25 MySQL kills, every one open only in the `--previous` container, while
+`safetylab snapshot` read `duplicated=0`). On a kill capture, S5/S7 are not evidence until
+residencies close on a container restart; S3/S4/S11/L1 are unaffected.
+
 **Before handing any pid to `kill -9`, check it is `> 1` and that `/proc/<pid>/cmdline` is the
 process you meant.** A fault injector aimed at the wrong process either destroys the rig or, worse,
 quietly injects nothing and leaves a plausible number behind.
@@ -271,6 +286,46 @@ Before trusting an arm, check the marker exists in the build under test; `safety
 **Never pool arms.** A rate averaged across two backends, two Wolverine versions or two knob
 settings is not a result. Results files carry the backend per row and the scripts refuse to append
 across arms.
+
+**`deploy.sh` re-applies the manifest, which resets every `kubectl set env` override.** A scenario
+set with `set env` *before* a deploy is gone afterwards, silently, and the pods come back on
+`k8s/churnsim.yaml`'s defaults — 500 agents, no ballast. Those pods then repopulate the store, so
+the next run measures a mix. Observed twice on 2026-09-23 (`max(agent id)` 493, then 342, against
+`SIM_AGENT_COUNT=60`). Set the scenario **after** the deploy, and verify by reading `max(agent id)`
+back out of the assignment table rather than trusting the deployment's env block.
+
+**`just reset-schema` drops the store with the workload still running.** `db_drop` then
+`bounce_workload` means live pods recreate the schema and refill it during the drop, and a pod from
+the outgoing generation writes its agents into the "clean" store. For anything where the agent set
+itself changed, reset **cold**: `scale --replicas=0`, wait for deletion, drop, scale back.
+
+**`observe.sh`'s `RUNNING` column is only usable early in a window.** It counts `AGENT-START` minus
+`AGENT-STOP` over `kubectl logs --since=<window>`, so once a STOP's matching START has aged out of
+the sliding window the difference goes wrong — `-1` and `0` both appear in the 2026-09-23 cascade
+arms while the assignment rows were provably steady. Read `ROWS` for what is placed.
+
+**A capacity-aware arm can advertise nothing and still look like an arm.** Post-GH-4589
+`MemoryPressureLoadMonitor` returns null when it cannot find a memory limit to divide by, and the
+leader reads a node advertising null as *having headroom*. So a run where the monitor found no
+cgroup ceiling is stock placement behaviour wearing the arm's label, with no error anywhere.
+ChurnSim prints a `LOAD-MONITOR` line per pod naming its denominator; `denominator=NONE` voids the
+arm. The same line distinguishes the pre-GH-4589 GC-budget divisor from the cgroup one, which
+matters because **readings on the two scales differ by 0.75 and no threshold carries across** (see
+RESULTS.md 2026-09-23).
+
+**The cascade experiment ran no checker at all, for its whole life.** `runs/*/observe.sh` is raw
+`psql` plus `kubectl logs`; it never wrote a `history.jsonl`, so no SafetyLab check has ever been
+evaluated against a GH-3959 run. Every cascade number in RESULTS.md before 2026-09-23 comes from
+counting rows in a table, which is why a detached agent that landed nowhere read as "capacity-aware
+holds". If an experiment is worth a result, capture it (`just capture-start`) and check it.
+
+**An agent in NO place used to violate nothing.** S5 is "no agent on two nodes", S6 "assigned
+implies running", S7 "running implies assigned". An agent that is neither assigned nor running
+satisfies all three vacuously — it is not inconsistent, it is consistently absent. S12 exists for
+exactly that dual, and keys on the *transition* (was running, was stopped, was not re-placed) and
+on whether the node stayed in the cluster, because a raw count of unplaced agents cannot separate
+"correctly withheld for lack of headroom" from "shed into nowhere" — on a capacity run the first
+swamps the second.
 
 ## Guarded: incidents that can no longer recur
 

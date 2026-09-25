@@ -186,6 +186,55 @@ builder.UseWolverine(opts =>
         {
             trySet("NodeOverloadThreshold", sim.OverloadThreshold.Value);
         }
+
+        // CapacityAwareAssignment needs a NodeLoadMonitor; Wolverine refuses to start with it
+        // on and the monitor null. MemoryPressureLoadMonitor is constructed reflectively, like
+        // trySet, because the type does not exist on 6.39.0 and earlier.
+        //
+        // SIM_NO_LOAD_MONITOR skips this, to observe that startup refusal. On a build without
+        // MemoryPressureLoadMonitor it leaves the build's built-in default in place.
+        if (!sim.NoLoadMonitor)
+        {
+            var monitorType = opts.Durability.GetType().Assembly
+                .GetType("Wolverine.Runtime.Agents.MemoryPressureLoadMonitor");
+
+            if (monitorType == null)
+            {
+                emit("ChurnSim.Startup", "CONFIG NodeLoadMonitor not available on this Wolverine build",
+                    new Dictionary<string, object?> { ["Setting"] = "NodeLoadMonitor", ["Value"] = null });
+            }
+            else
+            {
+                var monitor = Activator.CreateInstance(monitorType)!;
+                trySet("NodeLoadMonitor", monitor);
+
+                // Print the monitor's denominator so a run can be judged on what each node
+                // actually measures. Limit has three outcomes, and they must not be conflated:
+                //
+                //   no Limit property  the monitor divides by the GC budget. Readings are not
+                //                      comparable to cgroup-scaled ones: they differ by 0.75 for
+                //                      the same resident bytes (CALIBRATION.md).
+                //   Limit = bytes      the monitor divides by the cgroup memory limit.
+                //   Limit = null       no memory limit was found. The monitor returns null, the
+                //                      leader reads that as unlimited headroom, and the node
+                //                      advertises no load for the whole run -- which voids a
+                //                      capacity arm.
+                var limitProp = monitorType.GetProperty("Limit");
+                var limit = limitProp?.GetValue(monitor) as long?;
+                var (text, value) = limitProp == null
+                    ? ("LOAD-MONITOR denominator=gc-budget (pre-GH-4589 build, no Limit to read)", "gc-budget")
+                    : limit is { } bytes
+                        ? ($"LOAD-MONITOR denominator=cgroup limit={bytes} bytes ({bytes / 1024 / 1024} MiB)", bytes.ToString())
+                        : ("LOAD-MONITOR denominator=NONE -- *** this node will advertise no load ***", "none");
+
+                emit("ChurnSim.Startup", text,
+                    new Dictionary<string, object?>
+                    {
+                        ["Setting"] = "NodeLoadMonitorLimit",
+                        ["Value"] = value
+                    });
+            }
+        }
     }
 
     opts.Services.AddSingleton(sim);

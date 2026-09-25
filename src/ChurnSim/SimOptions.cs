@@ -32,6 +32,12 @@ public sealed class SimOptions
 
     [ConfigurationKeyName("SIM_OVERLOAD_THRESHOLD")] public double? OverloadThreshold { get; set; }
 
+    /// <summary>
+    /// Skip registering an INodeLoadMonitor even when capacity-aware assignment is on, to observe
+    /// GH-4589's startup refusal. On builds predating it this selects their built-in default.
+    /// </summary>
+    [ConfigurationKeyName("SIM_NO_LOAD_MONITOR")] public bool NoLoadMonitor { get; set; }
+
     // SimAgentFamily.
 
     [ConfigurationKeyName("SIM_AGENT_COUNT")] public int AgentCount { get; set; } = 20;

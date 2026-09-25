@@ -206,7 +206,7 @@ makes it a good lock and a bad liveness signal. Wolverine uses it as both. Two t
    were assigned to a dead node and running nowhere. An operator watching the assignment documents,
    or Wolverine watching itself, would have seen a healthy fully-placed cluster for five minutes.
 
-**Layer 1d — the MySQL arm. Built 2026-09-22; not yet run in the cluster.**
+**Layer 1d — the MySQL arm. Built 2026-09-22; first run in the cluster 2026-09-25 (RESULTS.md) — S3 fired live after a leader SIGKILL.**
 `deploy.sh --backend mysql`, a `GET_LOCK`-reading monitor, and every measurement script routed to
 the `mysql` client in the store pod. No new checker: the leader-side checks read
 `RunHistory.LeaderHolders`, which is about the protocol rather than the store, and the fixture
@@ -381,6 +381,15 @@ have separated the arms anyway.
   floor or thrash forever?
 - **Status:** run against the proposal build. Stock thrashes (655 rows in 5 min, never converges);
   capacity-aware holds (2 rows in 7 min) and recovers on scale-out. See RESULTS.md 2026-09-04.
+- **2026-09-23, PR #4596 vs its merge base.** The shed pass no longer detaches with no destination:
+  pre-fix the survivor crossed its shed line once and lost an agent permanently (rows 20 -> 19),
+  the PR crossed its own line and lost none. **Thresholds do not carry between the two builds** --
+  the monitor's denominator moved from the GC budget to the cgroup limit, a factor of 0.75.
+- **Known limit of this rig for E4:** the unbounded drain (`3 -> 2 -> 1 -> 0`) cannot be produced
+  here. It needs a node held over the shed line by something shedding cannot relieve, and in this
+  sim the agents *are* the load -- each shed returns ~10 MB and cures the condition. A threshold low
+  enough to be unconditional also blocks the initial placement, since placement needs the node below
+  `threshold - 10` and the drain needs it above `threshold`. Only the bounded form is reachable.
 
 ### E8 — the leader's lock session dies under it (`scripts/lock-kill.sh`) — **both arms run, 2026-09-19**
 

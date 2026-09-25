@@ -16,8 +16,17 @@ LEDGER=(
   "dup-agent:S5 S7"
   "orphan-lock:S3 S4 L1"
   "stranded:S6"
-  "no-converge:L1"
+  # Two agents stop on nodes that stay in the cluster and are never placed again. L1 reports the
+  # aggregate ("2 of 6 unplaced"); S12 reports that they were STOPPED rather than never started.
+  "no-converge:L1 S12"
   "split-leader:S3"
+  # GH-4590, and the reason S12 keys on the transition rather than on a count. Nodes B and C leave,
+  # so four agents go unplaced CORRECTLY -- one node left, no headroom, and withholding them is the
+  # feature working. Then the survivor detaches a fifth it was running, with nowhere to put it.
+  # Five of six are unplaced either way and L1 can only say so; S12 names the one that was shed and
+  # stays quiet about the four whose node left. Without this fixture the check could key on the
+  # total and look just as green.
+  "shed-nowhere:L1 S12"
   "gap:C0"
   # E8, the lock-session kill. `lock-kill` is the fault landing: the leader row outlives the lock
   # by 20s, which is S3. `lock-kill-noop` has the mark and a lock that never moved -- the nemesis

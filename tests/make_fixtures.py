@@ -377,6 +377,33 @@ def no_converge(tick, w):
                      if k not in ("sim://agent5/", "sim://agent6/")}
 
 
+def shed_nowhere(tick, w):
+    """GH-4590: the collapse to one node, and the survivor detaches an agent with nowhere to put it.
+
+    At tick 60 nodes B and C leave. Their four agents stop running and go unplaced, and that is
+    CORRECT -- one node is left, it has no headroom, and leaving agents unassigned rather than
+    overloading the survivor is capacity-aware assignment doing precisely its job. None of those
+    four may be a violation.
+
+    At tick 120 the survivor also gives up agent1, which it was running, and nothing re-places it.
+    That one is the bug: the shed pass ran before the "nobody has headroom" early return, so the
+    agent was detached with no destination and stopped for good.
+
+    The whole point of the fixture is that the two are indistinguishable by COUNT -- five of six
+    agents are unplaced at the end either way, and L1 says exactly that and cannot tell you which
+    five. S12 keys on the transition and on whether the node stayed in the cluster, so it names
+    agent1 and stays silent about the other four.
+    """
+    if tick >= 60:
+        for node in (NODES[1], NODES[2]):
+            w.live.discard(node[2])
+        w.placement = {k: v for k, v in w.placement.items() if v == NODES[0][2]}
+        w.running = {k: v for k, v in w.running.items() if v == NODES[0][0]}
+    if tick >= 120:
+        w.placement = {k: v for k, v in w.placement.items() if k != "sim://agent1/"}
+        w.running = {k: v for k, v in w.running.items() if k != "sim://agent1/"}
+
+
 def split_leader(tick, w):
     """The leader row names node A while the advisory lock is held by node B."""
     if tick >= 120:
@@ -601,6 +628,7 @@ def main():
     build("stranded", stranded)
     build("no-converge", no_converge)
     build("split-leader", split_leader)
+    build("shed-nowhere", shed_nowhere)
     build("gap", clean, skip=lambda tick: 150 <= tick < 180)
 
     # E8. `lock-kill` is the fault landing (S3: a leader row with no lock behind it);

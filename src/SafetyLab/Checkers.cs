@@ -59,6 +59,7 @@ public static class Checkers
             RuntimeAgentExclusivity(history, options, residencies),
             AssignedButNotRunning(history, options, residencies),
             RunningButNotAssigned(history, options, residencies),
+            StoppedAndNeverReplaced(history, options, residencies),
             ReplicaAgreement(history, options),
             NoDocumentConflicts(history),
             Convergence(history, options, residencies),
@@ -469,6 +470,110 @@ public static class Checkers
         });
 
         return new CheckResult("S7", "Every running agent is assigned to the node running it", violations, []);
+    }
+
+    /// <summary>
+    /// The third member of the S5/S6/S7 family, and the one that was missing: an agent that was
+    /// running, was stopped, and was then placed nowhere at all.
+    ///
+    /// <para>
+    /// S5 catches an agent running in TWO places, S6 an agent assigned but not running, S7 an agent
+    /// running but not assigned. An agent in NO place violates none of them — it has dropped out of
+    /// both sets the other three quantify over, so it is not inconsistent, it is consistently
+    /// absent. That whole family came out of Thread A, where the failure mode was duplication; the
+    /// dual never had a property written for it, and GH-4590 is exactly the dual.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Why this is not just "every agent is assigned".</b> L1 already computes that in its tail,
+    /// and on a capacity-constrained run it is red by design: when no node has headroom the leader
+    /// is SUPPOSED to leave agents unplaced, and dozens of correctly-withheld agents swamp the one
+    /// that was actually lost. Counting unplaced agents cannot tell the two apart. The transition
+    /// can: an agent that was never running was withheld, and an agent that was running and got
+    /// detached was shed. So this keys on the stop, not on the total.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>And why the node has to still be there.</b> An agent stops running when its node dies,
+    /// too, and re-placing it then may be genuinely impossible — that is the ungraceful-death
+    /// shortfall (2026-09-19), a different property with a different cause, measured separately in
+    /// follower-kill.sh. Restricting this to agents stopped on a node that was STILL in the cluster
+    /// at the end of the run leaves only the case where the leader took the agent off a node that
+    /// could have kept running it. A detach is only ever a move; this is the move that went nowhere.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately conservative in both directions: an agent stopped inside the final convergence
+    /// window is not judged (there was no time to re-place it), and a node that leaves later is not
+    /// judged either, so a real shed followed by a real node death reads as clean. False negatives
+    /// over false positives — a checker nobody believes is worse than one that misses.
+    /// </para>
+    /// </summary>
+    private static CheckResult StoppedAndNeverReplaced(RunHistory history, CheckOptions options,
+        IReadOnlyList<Residency> residencies)
+    {
+        var samples = history.Good.ToArray();
+
+        if (residencies.Count == 0 || history.Identities.Count == 0 || samples.Length == 0)
+        {
+            return new CheckResult("S12", "An agent stopped on a node that stayed in the cluster is placed again", [],
+                ["skipped: needs identity records, AGENT-START/STOP events and at least one good sample"])
+            {
+                Skipped = true
+            };
+        }
+
+        var runEnd = samples[^1].Ts;
+        var tailFrom = runEnd - options.ConvergenceWindow;
+        var tail = samples.Where(x => x.Ts >= tailFrom).ToArray();
+
+        var notes = new List<string>
+        {
+            $"judged over the last {options.ConvergenceWindow.TotalSeconds:F0}s of the run; an agent " +
+            "stopped inside that window had no time to be re-placed and is not counted"
+        };
+
+        if (tail.Length < 2)
+        {
+            notes.Add("the run is shorter than one convergence window, so there is no tail to judge");
+            return new CheckResult("S12", "An agent stopped on a node that stayed in the cluster is placed again", [],
+                notes) { Skipped = true };
+        }
+
+        // Still registered when the run ended. A node that left is the other property.
+        var stillInCluster = samples[^1].Nodes.Select(x => x.Id).ToHashSet();
+
+        // Placed anywhere at any point in the tail — one sample is enough to say it came back.
+        var placedInTail = tail.SelectMany(RunHistory.SimAssignments).Select(x => x.Id).ToHashSet();
+
+        var violations = new List<Violation>();
+
+        foreach (var group in residencies.GroupBy(x => x.AgentUri))
+        {
+            if (placedInTail.Contains(group.Key)) continue;
+
+            // Still running somewhere, or only stopped inside the tail: not judged.
+            if (group.Any(x => x.End is null || x.End.Value > tailFrom)) continue;
+
+            var last = group.OrderBy(x => x.Start).Last();
+
+            var node = history.Identities.LastOrDefault(x => x.PodName == last.PodName)?.NodeId;
+            if (node is null || !stillInCluster.Contains(node.Value)) continue;
+
+            violations.Add(new Violation(last.End!.Value, runEnd,
+                $"{group.Key} was stopped on {last.PodName} at {last.End!.Value:HH:mm:ss}, which was still in " +
+                $"the cluster at the end of the run, and was never placed again " +
+                $"({(runEnd - last.End!.Value).TotalSeconds:F0}s running nowhere)"));
+        }
+
+        if (violations.Count == 0)
+        {
+            notes.Add("agents stopped because their node left the cluster are not counted here — " +
+                      "that is the ungraceful-death shortfall, which follower-kill.sh measures");
+        }
+
+        return new CheckResult("S12", "An agent stopped on a node that stayed in the cluster is placed again",
+            Order(violations), notes);
     }
 
     // ----------------------------------------------------------- replication

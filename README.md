@@ -284,6 +284,7 @@ terminated, its in-process lock list went on reporting "held", and two nodes bot
 | S5 | **No agent runs on two nodes at once** | the user-visible property: a doubled projection daemon or exclusive listener |
 | S6 | Every assigned agent is running on its assigned node | GH-3987's "assigned but not running" wedge |
 | S7 | Every running agent is assigned to the node running it | an orphan runner — the precursor to S5 |
+| S12 | An agent stopped on a node that stayed in the cluster is placed again | a detach that went nowhere: the agent was running, the leader took it off, no node took it up, and the node it left is still in the cluster. The dual of S5 — an agent in *no* place rather than two — which S5/S6/S7 all pass over, because it has dropped out of both sets they quantify over. Judged on the final convergence window only, and agents whose node *left* are excluded (that is the ungraceful-death shortfall, a different property) |
 | S9 | Every store member agrees on assignment ownership | **replicated RavenDB only** — a member holding an agent under a different owner than the primary view, or lacking its document, past the grace window. Assignments are single-member writes with async replication; this is two claims on one agent seen from outside |
 | S10 | No store member reports document conflicts | **replicated RavenDB only** — RavenDB's own `CountOfConflicts` above zero on any member: two members accepted incompatible writes to one document. Zero grace |
 | S11 | The lock is not held by a node that stopped heartbeating | **PostgreSQL only** — a node still *registered* (so S4 cannot see it) whose `health_check` has stopped advancing while its session still holds the lock. The app↔DB partition's whole fingerprint: nothing ejects it and no peer can take the lock, while the store reads as fully placed |
@@ -295,6 +296,14 @@ terminated, its in-process lock list went on reporting "held", and two nodes bot
 
 S3–S9 are grace-windowed (`--grace`, default 15s): handover is not atomic, so a tick or two
 of disagreement is the protocol working. What gets reported is divergence that does not end.
+
+**S12 is deliberately not a count of unplaced agents.** L1 already reports that, and on a
+capacity-constrained run it is red by design — when no node has headroom the leader is *supposed*
+to leave agents unassigned, and dozens of correctly-withheld agents bury the one that was actually
+lost. The two are indistinguishable by total, so S12 keys on the transition instead: an agent that
+was never running was withheld, an agent that was running and got detached was shed. The
+`shed-nowhere` fixture is that distinction in one run — five of six agents unplaced, and only one
+of them a bug.
 
 On the replicated arm S1 is a check **across members**: every member's compare-exchange value is
 read every tick and tagged with its source, members that agree collapse into one holder, and

@@ -15,6 +15,291 @@ other rather than to a retired baseline. Entries dated before 2026-09-11 were ta
 unless they say otherwise; where a net10.0 rerun exists the older numbers were dropped rather than
 kept alongside it — git history has them.
 
+## 2026-09-25 — MySQL arm, first run in the cluster: the protocol behaves as on PostgreSQL, except that a leader SIGKILL can leave no leader row at all
+
+WolverineFx **6.39.0** (`wolverine-version`), `WolverineFx.MySql` 6.39.0, net10.0, 3 replicas, 500
+agents, `SIM_START_DELAY_MS=500`, stock knobs — the cascade's leftover overrides (`SIM_BATCH_SIZE=5`,
+`SIM_CAPACITY_AWARE=true`, 60 agents) were cleared by deleting the deployment before `just deploy-mysql`,
+and `backend=mysql` plus the 6.39.0 assemblies were read back from every pod. `just test` green first
+(160 tests; `mysql-clean` → `[]`, `mysql-orphan-lock` → `[L1 S3 S4]`, identical to PostgreSQL). Every
+experiment below ran **under a SafetyLab capture and was checked** (`runs/mysql-*/check.txt`), which
+none of the PostgreSQL E2/E5/kill entries were — so some rows here have no PostgreSQL counterpart to
+sit beside yet.
+
+| experiment | result | captured checks |
+|---|---|---|
+| E2 `duplicate-rate 12` | **12/12 clean** at 500/500, settle median 30 s / max 40 s | S5 ✗ S7 ✗ (transient, below) — S1–S4, S6, S11, S12, L1, C0 ✓ |
+| E5 `heal-test 8 300` | 6 never, **2 HEALED** (27 and 12 overlaps, longest 5.8 / 6.0 s), **0 persisted** | S5 ✗ (same) — everything else ✓ |
+| leader-kill, graceful | new leader **6 s**, 500 re-placed by 33 s | **all 11 pass** |
+| leader-kill, SIGKILL, 1800 s | lock moved in **44 ms**; **no leader row for 33 min**; 458 until t+1298 s, 500 at t+1304 s | **S3 ✗ 1864 s**, L1 ✗; S5/S7 ✗ are an artifact (below) |
+| follower-kill, SIGKILL, 1800 s | leader spared; 458 from t+66 s, **500 at t+1298 s** | S5/S7 ✗ artifact only — S3, L1 ✓ |
+
+Both SIGKILLs were verified from the container, not from `NodeStopped` (see the traps below): exit
+**137**, restarted in place, previous log ending mid-operation with no shutdown lines.
+
+### What matches PostgreSQL
+
+- **Lock failover is session-death-fast.** The named lock left the SIGKILLed leader's connection
+  and a peer held it, and logged `successfully assumed leadership`, 44 ms after the signal — the
+  same shape as E8's sub-second PostgreSQL step-down. S1 and S4 held through every run: `GET_LOCK`
+  stacking (`Bug_advisory_lock_stacking_blocks_failover`) did not recur, and no departed node ever
+  held the lock.
+- **The ungraceful-death shortfall reproduces, and on the same clock.** 42 agents rather than
+  PostgreSQL's 41 (`confirmed stopping 0 of 42 agents … 42 remain unconfirmed`), and recovery at
+  **1298–1304 s** on both kill arms against PostgreSQL stock's 1292 s — `30 + 42 × 30` = 1290 s from a
+  dispatch at ~t+8–14 s. Three arms now, two stores: this is the protocol, not a driver. The
+  2026-09-22 roster-release fix has not been measured here.
+- **Rolling deploys end clean.** 12/12 and 8/8 at 500/500, 0 persisted, matching PostgreSQL's 12/12.
+
+### What is new: the capture sees handover duplicates the snapshot cannot
+
+Every E2 snapshot was clean, and the capture of the same 78 minutes fails S5 with **108 overlaps
+across 58 agents in 5 of the 12 deploys**, all 3–6 s (51 of them 5 s). E5's capture adds 55 in 4
+episodes. The 6 s ceiling is three 2 s health-check ticks — the GH-3987 reconcile sweep, exactly the
+`longest_heal_s 6.0` of the 2026-09-09 sweep build. S7 shows the same windows from the assignment
+side (26 s and 16 s, 4–5 agents). So these are real, brief, and healed.
+
+**This is not a MySQL regression, as far as anything here can tell** — no PostgreSQL rollout has ever
+been captured, so there is no PostgreSQL number to compare with. The honest statement is that an
+end-state snapshot structurally cannot see a 6 s duplicate, and this is the first run that looked. A
+captured PostgreSQL E2 is the comparison that would settle it.
+
+### What is new: a leader that holds the lock and has no leader row
+
+After the leader SIGKILL, per 1 s monitor sample:
+
+| sample | `wolverine://leader/` row | lock held by | dead node's row |
+|---|---|---|---|
+| 17:39:55.68 | → dead leader `7d85f4d6` | conn 4814 | present |
+| **17:40:00.68** | **none** | **conn 5007** (Node 124) | present |
+| 17:41:00.68 | none | 5007 | ejected |
+| 18:13:24 (+33.4 min) | none | 5007 | — |
+
+Node 124's log, 8 ms after it assumed leadership:
+
+```
+warn: Detected duplicate agent wolverine://leader/ reported running on Node 124 and Node 121 —
+      sending StopRemoteAgent to the older copy to heal split-brain residue.
+```
+
+Node 121 is the corpse. The row went in the same second as that heal and **a minute before the dead
+node was ejected**, so it is not the ejection's cascade delete; nothing rewrote it until a graceful
+rollout forced a fresh election. Meanwhile Node 124 led normally — it rebalanced the cluster back to
+500 — so this is not a leaderless cluster; it is one whose leader is invisible to anything reading
+the table. **S3 caught it for the full 1864 s**, which is the first time S3 has fired live on this
+arm, and exactly the "lock and row disagree" case it exists for.
+
+Knock-on: `leader-kill.sh` resolves the leader from that row, so it reported `STILL LEADERLESS after
+1800s` — wrong about the cluster, right about the table — and `follower-kill.sh` then **refused** to
+run ("no leader") until the rollout. Anything that finds the leader through the row is blind here.
+
+**Not established:** whether this is MySQL-specific. The 2026-09-19 version matrix already records
+the PostgreSQL leader row **absent** after a leader-kill on 6.35.0, and on 6.39.1 with a 0 ms start
+delay — while 6.39.0 at 500 ms had it present. That makes it look timing-dependent rather than
+store-dependent, and n=1 here cannot separate the two. It needs repeats on both arms at the same
+knobs, and the mechanism (which copy "older" selects) needs reading in `NodeAgentController`.
+
+### Two traps this run found in the rig
+
+- **`NodeStopped` proves nothing on MySQL.** The kill scripts' `*** INVALID RUN ***` guard counts
+  `NodeStopped` records, on the premise that only a graceful shutdown writes one. Wolverine trims
+  `wolverine_node_records` to a rolling window (17:12–18:37 by the end), and inside it sit **21
+  `NodeStarted`, 2 `DormantNodeEjected` — exactly the two SIGKILLs — and zero `NodeStopped`**, across
+  the late heal-test rollouts, the graceful leader-kill (which itself reports `0 → 0`) and the 18:13
+  rollout: some twenty graceful shutdowns.
+  The premise was only ever demonstrated on RavenDB (73 records, 2026-09-18). On this arm the guard
+  cannot tell a SIGKILL from a clean stop — both kills above were validated from exit code 137
+  instead. Whether PostgreSQL writes it on graceful shutdown was not checked in this session.
+- **The checker keeps a SIGKILLed container's agents running forever.** A host-side SIGKILL restarts
+  the container *in the same pod*, the dead process never logs its `AGENT-STOP`s, and S5/S7 treat the
+  pod's residencies as one stream — so every agent it held that was re-placed elsewhere reads as a
+  duplicate until the capture ends. Leader-kill: 84 S5 violations; follower-kill: 83. **Every one**
+  was open in the `--previous` container and absent from the live one, and `safetylab snapshot`
+  read `duplicated=0` at the same moment. No PostgreSQL kill run was ever captured, which is why this
+  has not surfaced before. Until residencies close on a container restart, S5/S7 on a kill capture
+  are not evidence; S3/S4/S11/L1 are unaffected.
+
+Also: S9's skip note says "PostgreSQL is a single node" on this arm (`Checkers.cs:601`) — wording only.
+
+`heal-test.sh` wrote to a fixed `runs/heal-test`, whose TSV has no backend column — running it here
+would have pooled MySQL into the PostgreSQL rows and deleted their `iterN/` evidence. It now honours
+`OUT=`, like `duplicate-rate.sh`.
+
+Run directories: `runs/mysql-{e2-duplicate-rate,e5-heal-test,leader-kill-graceful,leader-kill,follower-kill}/`
+(captures + `check.txt`), `runs/{duplicate-rate,heal-test}-mysql/`, `runs/{leader-kill,follower-kill}-mysql/`,
+`runs/leader-kill-mysql-graceful/` (timelines), and `runs/mysql-follower-kill-refused/` — the refused
+attempt, whose capture is the leader row still missing 32 minutes after the kill.
+
+---
+
+## 2026-09-23 — PR #4596 against the cascade: the shed no longer detaches into nowhere, and the load scale moved under it
+
+`6.40.0-pr4596.1` — JasperFx/wolverine#4596 @ `dee0c62c6` (`gh-3959-followup`), against
+`6.40.0-prefix.1` — `origin/main` @ `a7c3297c2`, which is the merge base and already carries
+GH-3959 capacity-aware assignment (#4297). **Both arms are the same ChurnSim image source**, so
+the only difference is Wolverine. Scenario as 2026-09-11: 60 agents × 10 MB ballast, 512 Mi pod
+limit, `SIM_START_DELAY_MS=500`, `SIM_BATCH_SIZE=5`, 3-node steady state, then scale to **one**
+replica and hold. PostgreSQL, net10.0.
+
+### Read this before comparing any number here to 2026-09-11
+
+**The PR changes the load monitor's denominator, so no threshold carries across builds.**
+`MemoryPressureLoadMonitor` divided RSS by `GCMemoryInfo.TotalAvailableMemoryBytes` (the GC
+budget); it now divides by the cgroup limit the process actually runs under. Measured from both
+sides rather than assumed — paired `VmRSS` / `load_factor` samples on the survivor:
+
+| build | RSS | advertised | implied denominator |
+|---|---|---|---|
+| pre-fix `a7c3297c2` | 316.1 MiB | 82.29 | **384.1 MiB** — the GC budget |
+| PR #4596 | 326.4 MiB | 63.74 | **512.0 MiB** — `/sys/fs/cgroup/memory.max` |
+
+384.1 / 512.0 = **0.7503**. So a PR-build reading is the pre-fix reading × 0.75, and a threshold
+means the same resident bytes only after the same multiplication. The 2026-09-11 runs used a shed
+line of **85**; its equivalent here is **63.75**, and both arms below are run at their own scale.
+
+Carrying `85` across unchanged would put the shed line at 85/0.75 = **113%** of what the old scale
+could ever report. That arm looks calm because nothing can trip, not because the build is better —
+it is the arm to refuse, not to file. Details in `runs/cascade-pr4596-2026-09-23/CALIBRATION.md`.
+
+### The collapse, 3 → 1, seven minutes each
+
+| | pre-fix @ `a7c3297c2` (thr. 85) | PR #4596 (thr. 63.75) |
+|---|---|---|
+| assignment rows, start → end | 20 → **19** | 20 → **20** |
+| `AssignmentChanged` in window | 62 → 64 | 62 → **63** |
+| survivor load, own scale | 82.6 → 85.1 → 78.4 | 60.9 → **64.0** |
+| crossed its own shed line | yes, once (85.1 ≥ 85) | yes, at the end (64.0 ≥ 63.75) |
+| agents lost to the crossing | **1, never re-placed** | **0** |
+| `OutOfMemoryException` | 0 | 0 |
+| pod restarts | 0 | 0 |
+
+**Pre-fix, the crossing costs an agent permanently.** At 300 s the survivor reached 85.1, the shed
+pass detached one agent, and there was nowhere to put it — rows went 20 → 19 and stayed 19 for the
+remaining two minutes. That is GH-4590's mechanism exactly: the shed ran *before* the "nobody has
+headroom" early return, so a detach happened with no destination and nothing re-placed it. It
+stopped at one only because returning that agent's 10 MB of ballast dropped the node back under
+its line.
+
+**On the PR build the same crossing costs nothing.** The survivor sat at 63.95–63.98 — sustained
+*above* its 63.75 shed line, confirmed over three further store reads after the window closed —
+holding all 20 agents with zero `AssignmentChanged`. Overloaded with nowhere to shed to, it keeps
+running its work, which is what the reordering was for.
+
+### What this run does NOT establish
+
+**The unbounded drain (`3 → 2 → 1 → 0`) was not reproduced, and this rig structurally cannot
+produce it.** That shape needs a node held over the shed line by something shedding cannot
+relieve. Here the agents *are* the load: each shed returns ~10 MB and drops the reading ~2.6
+points, so shedding always cures the condition that triggered it, and the drain self-limits after
+one agent. Choosing a threshold low enough to be unconditional does not work either — initial
+placement requires the node *below* the receive line (`threshold − 10`) while the drain requires
+it *above* the threshold, and the ~116 MB floor with zero agents running cannot satisfy both. The
+unconditional single-node case is covered by the PR's unit tests; this rig reaches only the
+bounded form.
+
+So the honest strength of the comparison is **one crossing each way**: pre-fix crossed and lost an
+agent, PR crossed and lost none. The mechanism is demonstrated, the magnitude is not.
+
+**GH-4591 (pinned agents across the ceiling passes) is out of this rig's reach entirely** —
+`SimAgentFamily` uses `DistributeEvenly` with no pins and no capability restrictions.
+
+### GH-4589's refusal, checked in the cluster
+
+`SIM_CAPACITY_AWARE=true` with no monitor registered: the pod refuses to start, exit 139, with a
+message that names the way out (`runs/cascade-pr4596-2026-09-23/armR-startup-refusal.txt`). It
+lands the safe way round on a production-shaped rollout — `maxUnavailable: 0` kept the **old** pod
+Running and serving while the new one crashlooped, so a bad capacity config stalls a rollout
+rather than taking the cluster down.
+
+The PR's 26 new capacity tests also pass on **net10.0** (the PR verified them on net9.0).
+
+### S12: the check that would have caught this, and the back-test that proves it
+
+The rig had no property for a lost agent. S5 catches an agent running in **two** places, S6 an
+agent assigned but not running, S7 an agent running but not assigned — an agent in **no** place
+violates none of them, because it has dropped out of both sets the other three quantify over. That
+family came out of Thread A, where the failure mode was duplication; the dual never had a property
+written for it, and GH-4590 is exactly the dual. On top of that the cascade experiment runs
+`observe.sh`, which is raw `psql` and calls no checker at all, so nothing was reading anyway.
+
+`S12 — An agent stopped on a node that stayed in the cluster is placed again` now closes it.
+
+**It is deliberately not a count of unplaced agents.** L1 already reports that, and on a
+capacity-constrained run it is red by design: when no node has headroom the leader is *supposed* to
+withhold agents. S12 keys on the transition and on the liveness of the node instead — an agent that
+never ran was withheld, an agent that ran and was detached from a node still in the cluster was
+shed, and a detach is only ever a move.
+
+**Back-tested against a real capture, not only fixtures.** The two earlier cascade runs
+(2026-09-11 and arms A/C above) produced no `history.jsonl` at all, so there was nothing to check;
+`runs/cascade-s12-backtest` is a fresh pre-fix collapse taken under `monitor.sh` for this purpose.
+The capture contains the discrimination case outright — **41 agent stops, of which exactly one is
+a shed**:
+
+| pod | starts | stops | why |
+|---|---|---|---|
+| `…-2zf6v` | 20 | 20 at 21:47:14 | the node left — scaled away |
+| `…-qtc4m` | 20 | 20 at 21:47:14 | the node left — scaled away |
+| `…-424hl` (survivor) | 20 | **1 at 22:01:41** | crossed 84.88 → shed → 78.36, and nothing re-placed it |
+
+Over the full capture (1093 samples), with the blind spot stated in one screen — **the three
+existing agent checks all pass over a run in which an agent was silently lost**:
+
+```
+[PASS] S5   No agent runs on two nodes at once
+[PASS] S6   Every assigned agent is actually running on its assigned node
+[PASS] S7   Every running agent is assigned to the node running it
+[FAIL] S12  An agent stopped on a node that stayed in the cluster is placed again
+       ! 22:01:41–22:05:05 (204.6s) sim://agent21/ was stopped on churnsim-…-424hl at 22:01:41,
+         which was still in the cluster at the end of the run, and was never placed again
+[FAIL] L1   The cluster converges after the last phase marker
+       ! never converged after the last marker; last obstacle was: 41 of 60 sim agents unplaced
+```
+
+L1 gives the aggregate and cannot say which of the 41 is the bug; S12 names `sim://agent21/` and
+stays silent about the 40 whose node left. The `shed-nowhere` fixture pins the same distinction
+offline (five of six unplaced, one of them a violation), and `no-converge` gained S12 alongside L1
+because its two agents genuinely stop on live nodes and never return.
+
+**What S12 does not cover:** an agent whose node *died* and was never re-placed — the
+ungraceful-death shortfall (2026-09-19). Different cause, still measured only by
+`follower-kill.sh`'s own `placed-before − placed-after` counter rather than by a checker.
+
+### What it cost the rig
+
+- **ChurnSim had to change to run this build at all.** It set `CapacityAwareAssignment` and
+  registered no monitor, which is now a startup refusal. It now constructs
+  `MemoryPressureLoadMonitor` reflectively — same reason `trySet` exists, the type does not exist
+  on 6.39.0 and this program still has to run against it — and `SIM_NO_LOAD_MONITOR` skips it to
+  observe the refusal.
+- **Every pod prints a `LOAD-MONITOR` line naming its denominator**, distinguishing three states
+  that must not be conflated: no `Limit` property (pre-GH-4589, GC-budget scale), `Limit` present
+  (cgroup scale), and `Limit` **null** — which means the node advertises nothing all run and the
+  "capacity" arm is stock behaviour wearing the arm's label. Here `memory.max` reads 512 MiB
+  inside the pod, so the monitor finds its ceiling; under a runtime where it did not, this arm
+  would be void.
+
+### Two harness traps this run walked into
+
+- **`deploy.sh` re-applies `k8s/churnsim.yaml`, which resets every `kubectl set env` override**
+  back to the manifest's 500-agent default. Scenario env set *before* a deploy is silently gone
+  afterwards, and the 500-agent pods then repopulate the store. This filed stale rows twice
+  (`max(agent id)` 493, then 342, against `SIM_AGENT_COUNT=60`) before it was caught. Set the
+  scenario **after** the deploy, and check `max(agent id)` against the count you asked for.
+- **`just reset-schema` drops the store with the pods still running**, so a workload mid-rollout
+  recreates the schema and refills it during the drop. For a scenario change, reset cold —
+  `scale --replicas=0`, wait for deletion, drop, scale back.
+- **`safetylab settle` is the wrong gate for this scenario.** Under-placement is the *correct*
+  outcome when every node sits in the hold band, so settle can never reach its target and just
+  burns its timeout. The cascade's own `runs/*/observe.sh` is the instrument.
+- **`observe.sh`'s `RUNNING` column goes negative or to zero spuriously.** It counts
+  `AGENT-START` minus `AGENT-STOP` from `kubectl logs --since=<window>`, so once a STOP's matching
+  START has aged out of the sliding window the difference is wrong (`-1` and `0` appear in both
+  arms above while rows were steady). **`ROWS` is the trustworthy column**; `RUNNING` is only
+  usable early in a window.
+
+---
+
 ## 2026-09-22 — the shortfall is a 21-minute outage, and releasing a departed node's in-flight commands closes it
 
 Two arms, interleaved on one cluster, `reset-schema` between, each gated on an actual `safetylab settle`

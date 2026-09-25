@@ -20,6 +20,7 @@
 #   ./scripts/heal-test.sh [iterations] [watch-seconds]   defaults 8 and 300; watch-seconds is how
 #                                                         long after the rollout to let the cluster
 #                                                         act before capturing
+#   OUT=<dir>                                             results directory; default runs/heal-test
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
@@ -28,7 +29,8 @@ K="minikube kubectl -- --context=minikube"
 ITERS="${1:-8}"
 WATCH="${2:-300}"     # how long after the rollout to let the cluster act before capturing
 
-OUT="runs/heal-test"
+# One results directory per arm: this TSV carries no backend column, so two arms in one file pool.
+OUT="${OUT:-runs/heal-test}"
 TSV="$OUT/results.tsv"
 mkdir -p "$OUT"
 [ -f "$TSV" ] || printf 'iteration\toutcome\thealed\tpersisted\tlongest_heal_s\n' > "$TSV"
