@@ -5,7 +5,9 @@
 #             node. The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
 # REQUIRES    a settled cluster with a leader that resolves to a live pod, and at least one live
 #             pod that is not the leader. Both are refusals.
-# PRODUCES    $OUT/timeline.tsv, one row per 5s poll, and a verdict on stdout. MUTATES the cluster:
+# PRODUCES    $OUT/timeline.tsv, one row per 5s poll; $OUT/post/raw.<pod>.<attempt>.jsonl, every
+#             container log off the node tailer, the victim's pre-kill one included; and a verdict on
+#             stdout. MUTATES the cluster:
 #             it kills a pod. Prints *** INVALID RUN *** if a NodeStopped record appeared, which
 #             means the victim shut down gracefully and the ungraceful path was never exercised.
 #
@@ -117,6 +119,15 @@ if [ -n "${DRY_RUN:-}" ]; then
     exit 0
 fi
 
+# The tailer run this kill's logs go to (see capture-logs.sh). Inside an active SafetyLab capture
+# the capture owns the run and rolling the tailer would split it, so it is only started here when
+# there is none. START comes after: the roll takes seconds and they are not part of the watch.
+if [ -f runs/.active ]; then
+    echo "  (a capture is active; its tailer run collects this kill)"
+else
+    "$SAFETYLAB" podlogs start "$(basename "$OUT")-$(date -u +%Y%m%dT%H%M%SZ)" || exit 2
+fi
+
 START=$(date +%s)
 minikube ssh -- "sudo kill -9 $HOSTPID" 2>&1 | sed 's/^/  /'
 
@@ -154,3 +165,7 @@ if [ "${STOPPED_AFTER:-0}" -gt "${STOPPED_BEFORE:-0}" ]; then
     echo "  path; the numbers above are a clean-handover measurement."
 fi
 echo "  timeline           : $TSV"
+
+# The victim's pre-kill log is the lower attempt (capture-logs.sh).
+echo
+./scripts/capture-logs.sh "$OUT/post"

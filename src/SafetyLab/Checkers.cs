@@ -353,7 +353,16 @@ public static class Checkers
         }
 
         var runEnd = history.Good.LastOrDefault()?.Ts ?? residencies.Max(x => x.EndOr(x.Start));
+
+        // The capture's window opens at its first sample. The pod side is harvested whole -- a
+        // pod alive at capture start contributes its log from its first line, because the replay
+        // needs the AGENT-STARTs from before the run to know what was running when the run
+        // began -- so the logs can carry an overlap from an earlier disturbance, hours old, that
+        // this run's verdict must not be red for. It is not dropped: it is counted in a note.
+        // With no sample at all there is no window, and everything is reported, as `overlaps` does.
+        var runStart = history.Good.FirstOrDefault()?.Ts;
         var violations = new List<Violation>();
+        var before = 0;
 
         foreach (var group in residencies.GroupBy(x => x.AgentUri))
         {
@@ -372,19 +381,35 @@ public static class Checkers
                     var to = Min(a.EndOr(runEnd), b.EndOr(runEnd));
                     if (to - from <= options.CrossPodGrace) continue;
 
+                    if (runStart is { } start && to <= start)
+                    {
+                        before++;
+                        continue;
+                    }
+
                     violations.Add(new Violation(from, to,
                         $"{a.AgentUri} ran on both {a.PodName} and {b.PodName} for {(to - from).TotalSeconds:F1}s"));
                 }
             }
         }
 
-        return new CheckResult("S5", "No agent runs on two nodes at once", Order(violations),
-        [
+        var notes = new List<string>
+        {
             $"AGENT-START/STOP timestamps come from each pod's own clock; overlaps shorter than " +
             $"{options.CrossPodGrace.TotalSeconds:F0}s are treated as skew and ignored",
-            "pods deleted before their logs were captured contribute no residencies — see the coverage check",
-            ..RestartNote(residencies)
-        ]);
+            "pods deleted before their logs were captured contribute no residencies — see the coverage check"
+        };
+
+        if (before > 0)
+        {
+            notes.Add($"{before} overlap(s) ended before this capture's first sample at {runStart:HH:mm:ss} " +
+                      "and are not reported here: the pod logs are harvested whole, so an earlier " +
+                      "disturbance's duplicates are in them, but they are not this run's finding");
+        }
+
+        notes.AddRange(RestartNote(residencies));
+
+        return new CheckResult("S5", "No agent runs on two nodes at once", Order(violations), notes);
     }
 
     /// <summary>
@@ -478,41 +503,14 @@ public static class Checkers
     }
 
     /// <summary>
-    /// The third member of the S5/S6/S7 family, and the one that was missing: an agent that was
-    /// running, was stopped, and was then placed nowhere at all.
-    ///
-    /// <para>
-    /// S5 catches an agent running in TWO places, S6 an agent assigned but not running, S7 an agent
-    /// running but not assigned. An agent in NO place violates none of them — it has dropped out of
-    /// both sets the other three quantify over, so it is not inconsistent, it is consistently
-    /// absent. That whole family came out of Thread A, where the failure mode was duplication; the
-    /// dual never had a property written for it, and GH-4590 is exactly the dual.
-    /// </para>
-    ///
-    /// <para>
-    /// <b>Why this is not just "every agent is assigned".</b> L1 already computes that in its tail,
-    /// and on a capacity-constrained run it is red by design: when no node has headroom the leader
-    /// is SUPPOSED to leave agents unplaced, and dozens of correctly-withheld agents swamp the one
-    /// that was actually lost. Counting unplaced agents cannot tell the two apart. The transition
-    /// can: an agent that was never running was withheld, and an agent that was running and got
-    /// detached was shed. So this keys on the stop, not on the total.
-    /// </para>
-    ///
-    /// <para>
-    /// <b>And why the node has to still be there.</b> An agent stops running when its node dies,
-    /// too, and re-placing it then may be genuinely impossible — that is the ungraceful-death
-    /// shortfall (2026-09-19), a different property with a different cause, measured separately in
-    /// follower-kill.sh. Restricting this to agents stopped on a node that was STILL in the cluster
-    /// at the end of the run leaves only the case where the leader took the agent off a node that
-    /// could have kept running it. A detach is only ever a move; this is the move that went nowhere.
-    /// </para>
-    ///
-    /// <para>
-    /// Deliberately conservative in both directions: an agent stopped inside the final convergence
-    /// window is not judged (there was no time to re-place it), and a node that leaves later is not
-    /// judged either, so a real shed followed by a real node death reads as clean. False negatives
-    /// over false positives — a checker nobody believes is worse than one that misses.
-    /// </para>
+    /// An agent that was running, was stopped, and was then placed nowhere at all — the dual of
+    /// S5/S6/S7 (GH-4590), which none of them can see because the agent has left both sets they
+    /// quantify over. Keyed on the STOP rather than on a count of unplaced agents, because a
+    /// capacity-constrained run withholds agents by design and L1 already counts those; and only
+    /// for a node still in the cluster at the end, because an agent whose node died is the
+    /// ungraceful-death shortfall, which follower-kill.sh measures. Conservative both ways: not
+    /// judged inside the final convergence window, not judged if the node left later. The history
+    /// is the 2026-09-19 and 2026-09-23 entries in RESULTS.md and the shed-nowhere fixture.
     /// </summary>
     private static CheckResult StoppedAndNeverReplaced(RunHistory history, CheckOptions options,
         IReadOnlyList<Residency> residencies)
@@ -562,7 +560,15 @@ public static class Checkers
 
             var last = group.OrderBy(x => x.Start).Last();
 
-            var node = history.Identities.LastOrDefault(x => x.PodName == last.PodName)?.NodeId;
+            // A stint the process's death ended (the pod announced a new node id) is a node that
+            // LEFT, whatever the pod's name still says: the other property. And the node to judge
+            // by is the one in effect when the stint began, not the pod's latest identity, which
+            // after a restart is the survivor -- that read every victim's agent as shed by a node
+            // that stayed, on any capture spanning a kill.
+            if (last.EndedByRestart) continue;
+
+            var node = history.Identities
+                .LastOrDefault(x => x.PodName == last.PodName && x.Ts <= last.Start)?.NodeId;
             if (node is null || !stillInCluster.Contains(node.Value)) continue;
 
             violations.Add(new Violation(last.End!.Value, runEnd,

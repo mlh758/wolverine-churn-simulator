@@ -83,9 +83,28 @@ measure:
 traces minutes="30":
     {{safetylab}} traces --minutes {{minutes}}
 
-# Dump every live pod's raw JSON log into a run directory.
+# Every churnsim container's log of the tailer's current run -- live, replaced or killed -- into a
+# directory, raw.<pod>.<attempt>.jsonl each. Exit 2 if a live pod is not being followed.
 capture dir:
     ./scripts/capture-logs.sh {{dir}}
+
+# Which run the node log tailer is on, and is it following every live churnsim pod? Exit 1 if
+# not, 2 if there is no tailer.
+logtail-status:
+    {{safetylab}} podlogs status
+
+# Begin a tailer run by hand (capture-start and the kill scripts do it themselves): a fresh
+# directory on the node, every live pod re-read from the head.
+logtail-start name:
+    {{safetylab}} podlogs start {{name}}
+
+# Deploy the node log tailer (deploy.sh does this; here for a cluster deployed before it existed).
+logtail-deploy:
+    ./scripts/logtail.sh deploy
+
+# Clear the tailer's node copy between experiments. Everything it held is GONE -- capture first.
+logtail-reset:
+    ./scripts/logtail.sh reset
 
 # SQL over captured pod logs, on the host. `just logq runs/foo "select ..."`.
 logq dir *sql="":
@@ -179,7 +198,7 @@ synth-guard-prep:
 
 # --------------------------------------------------------------------- capturing
 
-# Begin a SafetyLab capture into runs/<name>.
+# Begin a SafetyLab capture into runs/<name>. Also starts a tailer run of that name.
 capture-start name:
     ./scripts/monitor.sh start {{name}}
 
@@ -187,7 +206,7 @@ capture-start name:
 mark label:
     ./scripts/monitor.sh mark {{label}}
 
-# End the active capture.
+# End the active capture: stop sampling, pull every pod's log off the node tailer, harvest it.
 capture-stop:
     ./scripts/monitor.sh stop
 

@@ -58,6 +58,9 @@ spec:
           env:
             - name: SIM_BACKEND
               value: "ravendb"
+            # Structured stdout, always (src/ChurnSim/Program.cs); everything downstream reads it.
+            - name: SIM_JSON_LOGS
+              value: "true"
             # The ordinal, from the label the StatefulSet controller stamps on every pod.
             - name: POD_INDEX
               valueFrom:

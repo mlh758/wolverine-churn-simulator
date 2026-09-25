@@ -1,6 +1,7 @@
-using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+
+using SafetyLab.Cluster;
 
 namespace SafetyLab;
 
@@ -100,97 +101,25 @@ internal static partial class Verbs
 
     // ---------------------------------------------------------------- harvest
 
-    [GeneratedRegex(@"AGENT-(START|STOP)\s+(\S+)\s+at\s+(\S+)")]
-    private static partial Regex AgentLine();
-
-    [GeneratedRegex(@"SIM-IDENTITY\s+nodeId=(\S+)\s+podName=(\S+)\s+podIp=(\S+)\s+at\s+(\S+)")]
-    private static partial Regex IdentityLine();
-
-    /// <summary>The `kubectl logs --timestamps` RFC3339 prefix, if the follower asked for one.</summary>
-    [GeneratedRegex(@"^(\d{4}-\d{2}-\d{2}T\S+?)\s+(.*)$")]
-    private static partial Regex TimestampPrefix();
-
     /// <summary>
-    /// The category line of .NET's two-line console logger, e.g.
-    /// <c>info: Wolverine.Runtime.Agents.NodeAgentController[0]</c>. The message is on the NEXT
-    /// line, indented — which is why this needs a state machine rather than a single match.
-    /// </summary>
-    [GeneratedRegex(@"^(info|warn|fail|dbug|trce|crit)\s*:\s*(Wolverine\.Runtime\.Agents\.[^\[]+|Wolverine\.Runtime\.WolverineRuntime)\[")]
-    private static partial Regex ControlCategoryLine();
-
-    /// <summary>
-    /// Parse pod log text into history records. Timestamps come from the message body, not the log
-    /// prefix, because the default console logger splits a record over two lines and the useful
-    /// clock reading is the one the sim wrote itself.
+    /// Pod log text on stdin to history records on stdout. The parsing is <see cref="LogHarvest"/>,
+    /// which reads both console shapes into the same records; this is only the plumbing.
     /// </summary>
     public static int Harvest(string pod)
     {
-        // Set when the previous line was a Wolverine.Runtime.Agents category header and we are
-        // waiting for its indented message line.
-        (DateTimeOffset Ts, string Level, string Category)? pendingControl = null;
-
-        while (Console.ReadLine() is { } raw)
+        foreach (var record in LogHarvest.Parse(pod, ReadLines()))
         {
-            // `kubectl logs --timestamps` prefixes every line. Strip it, but keep it: the console
-            // logger's own lines carry no clock of their own, so this is the only timestamp a
-            // control-plane line has. (AGENT-START/STOP embed theirs and keep using it.)
-            var line = raw;
-            DateTimeOffset? lineTs = null;
-            var prefix = TimestampPrefix().Match(raw);
-            if (prefix.Success)
-            {
-                lineTs = ParseTs(prefix.Groups[1].Value);
-                line = prefix.Groups[2].Value;
-            }
-
-            if (pendingControl is { } pending)
-            {
-                pendingControl = null;
-                var message = line.Trim();
-                if (message.Length > 0)
-                {
-                    Emit(new ControlEventRecord(pending.Ts, pod, pending.Level, pending.Category, message));
-                }
-            }
-
-            var control = ControlCategoryLine().Match(line);
-            if (control.Success)
-            {
-                pendingControl = (lineTs ?? DateTimeOffset.UtcNow, control.Groups[1].Value,
-                    control.Groups[2].Value.Trim());
-                continue;
-            }
-
-            var identity = IdentityLine().Match(line);
-            if (identity.Success && Guid.TryParse(identity.Groups[1].Value, out var nodeId))
-            {
-                Emit(new IdentityRecord(ParseTs(identity.Groups[4].Value), nodeId, identity.Groups[2].Value,
-                    identity.Groups[3].Value));
-                continue;
-            }
-
-            var agent = AgentLine().Match(line);
-            if (agent.Success)
-            {
-                Emit(new AgentEventRecord(ParseTs(agent.Groups[3].Value),
-                    agent.Groups[1].Value == "START" ? "start" : "stop", agent.Groups[2].Value, pod));
-            }
+            Console.WriteLine(JsonSerializer.Serialize(record, record.GetType(), Json.Options));
+            Console.Out.Flush();
         }
 
         return 0;
 
-        static void Emit<T>(T record)
+        static IEnumerable<string> ReadLines()
         {
-            Console.WriteLine(JsonSerializer.Serialize(record, Json.Options));
-            Console.Out.Flush();
+            while (Console.ReadLine() is { } line) yield return line;
         }
     }
-
-    private static DateTimeOffset ParseTs(string raw)
-        => DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture,
-            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var value)
-            ? value
-            : DateTimeOffset.UtcNow;
 
     // ------------------------------------------------------------------ check
 

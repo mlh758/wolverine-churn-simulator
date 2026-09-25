@@ -19,7 +19,9 @@ to fix them.
 - **`k8s/`** — a single-pod store (PostgreSQL, MySQL or RavenDB) and a 3-replica
   `churnsim` Deployment with a production-shaped rolling update (`maxSurge: 1`,
   `maxUnavailable: 0`, `minReadySeconds: 15`) so old pods drain while new
-  pods have already joined the Wolverine cluster.
+  pods have already joined the Wolverine cluster. Plus `logtail.yaml`, a node-side
+  tailer that keeps every churnsim container's log after the pod is gone — see
+  [Pod logs that outlive the pod](#pod-logs-that-outlive-the-pod).
 - **`src/SafetyLab`** — the measurement and fault-injection tool, and where every
   decision this rig makes lives. It watches the cluster from outside, checks safety
   and liveness properties over a captured run, and carries the verbs the scripts
@@ -249,9 +251,9 @@ arm needs before it can be measured), and the other three are unchanged.
   cluster settles, every `sim://` agent should have exactly one assignment on
   a live node. Discrepancies between the assignment set and what
   pods actually run are the "assigned but not running" symptom;
-- `AGENT-START` / `AGENT-STOP` counts from live pod logs (note: logs of
-  replaced pods are gone, so the durable node-record numbers are the source
-  of truth).
+- `AGENT-START` / `AGENT-STOP` counts from live pod logs (the durable
+  node-record numbers are the source of truth; for a replaced or killed pod's
+  own log, see [Pod logs that outlive the pod](#pod-logs-that-outlive-the-pod)).
 
 To measure a steady-state baseline (no deploy), reset metrics, wait a few
 minutes, and measure again — a healthy cluster should write ~zero
@@ -323,19 +325,20 @@ RavenDB arm existed has no `backend` field — those load and check as PostgreSQ
 nix develop                        # dotnet 10 + kubectl + podman + duckdb + just
 just monitor-deploy                # build + deploy the in-cluster monitor (once per arm)
 
-just capture-start rollout-1       # begin capturing BEFORE the disturbance
+just capture-start rollout-1       # begin sampling; names a run on the node log tailer too
 just rollout
 just mark rollout-end
 sleep 120                          # let it settle, so L1 has a tail to judge
-just capture-stop
+just capture-stop                  # pulls every pod's log off the tailer and harvests it
 just check rollout-1
 ```
 
 A run directory (`runs/<name>/`) is a durable artifact and stays checkable after the cluster
-is gone: `history.jsonl` (server-side samples), `pods.<pod>.jsonl` (node identities,
-`AGENT-START`/`AGENT-STOP` residencies, and `Wolverine.Runtime.Agents.*` control-plane log lines),
-`marks.jsonl` (phase boundaries). `check --json` emits the same results for scripting; exit code
-is 1 if anything failed.
+is gone: `history.jsonl` (server-side samples), `pods.<pod>.<attempt>.jsonl` (node identities,
+`AGENT-START`/`AGENT-STOP` residencies, and `Wolverine.Runtime.Agents.*` control-plane log lines,
+harvested at stop from the node tailer's copy), `logs/raw.<pod>.<attempt>.jsonl` (the logs those
+came from, verbatim, for `just logq runs/<name>/logs`), `marks.jsonl` (phase boundaries).
+`check --json` emits the same results for scripting; exit code is 1 if anything failed.
 
 That the raw samples are kept, rather than just verdicts, is the point: when two identifier bugs
 were found in the checker itself, every affected run was simply re-checked from disk instead of
@@ -343,10 +346,13 @@ re-run against the cluster.
 
 ### Two gotchas
 
-**Start the capture before the rollout.** `kubectl logs` cannot reach a pod once it is gone,
-and during a rolling deploy the pods that matter most are exactly the ones that disappear. A
-pod replaced while nothing was following it contributes no residencies, which silently
-weakens S5/S6/S7. This is why C0 exists and why a skipped check reports SKIP, not PASS.
+**A pod-side check is only as good as the harvest, and C0 says whether it arrived.** The pod side
+comes off the node log tailer at `capture-stop`, whole, and `stop` refuses if the tailer is missing
+a live pod; C0 still reports any pod the store registered that has no identity in the harvest, so
+a skipped check reports SKIP, not PASS. Whole logs also mean a pod alive at capture start brings
+its history, including an earlier rollout's duplicates: S5 replays all of it for state but reports
+only overlaps that reach into the sampled window and counts the earlier ones in a note (the
+`dup-agent-before` fixture). See [Pod logs that outlive the pod](#pod-logs-that-outlive-the-pod).
 
 **A checker that has never been seen to fire is decoration.** `tests/selftest.sh` is the
 mutant ledger: each synthetic fixture injects one fault and asserts which checks must go red —
@@ -482,12 +488,14 @@ behind the design, and the prediction it tests, is E7 in [docs/experiments.md](d
 
 ## Structured logs and SQL
 
-ChurnSim writes JSON logs when `SIM_JSON_LOGS=true` — each line a JSON object whose `State` holds
-the message-template parameters as named fields, so `AgentUri` and `NodeNumber` arrive queryable
-instead of embedded in prose. Capture and query them on the host:
+ChurnSim writes JSON logs — every manifest sets `SIM_JSON_LOGS=true` — each line a JSON object
+whose `State` holds the message-template parameters as named fields, so `AgentUri` and
+`NodeNumber` arrive queryable instead of embedded in prose. (It is .NET's own `AddJsonConsole`;
+the text console is the same cost per line, and every reader here still accepts it for captures
+that predate the switch.) Capture and query them on the host:
 
 ```bash
-just capture runs/foo     # raw.<pod>.jsonl per pod, no transformation
+just capture runs/foo     # raw.<pod>.<attempt>.jsonl per container, no transformation
 just logq runs/foo        # schema + summary
 just logq runs/foo "select json_extract_string(state,'\$.AgentUri') as agent,
                                    count(distinct pod) as pods
@@ -499,6 +507,40 @@ DuckDB reads the files directly, so this is full SQL — window functions, self-
 database to run. An in-cluster ClickHouse was tried and abandoned: it sized itself from the node's
 advertised *host* RAM, which rootless podman does not constrain, and took the machine down. See
 [docs/harness-traps.md](docs/harness-traps.md).
+
+### Pod logs that outlive the pod
+
+`kubectl logs` reads the container's log file on the node, and the kubelet deletes that file
+shortly after the pod (measured: readable for 30–60 s after `kubectl delete pod`, gone by 90 s).
+It also keeps only one dead container per pod, so `--previous` reaches a SIGKILLed container once
+and never a pod a rollout replaced. `k8s/logtail.yaml` fixes the retention, not the transport:
+stdout is already crash-safe (the containerd shim writes each line to the node as it arrives, so a
+SIGKILL loses nothing the process wrote), and a file logger on a shared volume would only move the
+buffering *into* the process under test. Instead a fluent-bit pod tails the node's own files,
+holds each one open so deletion cannot truncate it, and appends a verbatim copy per container
+attempt to `/data/podlogs/<run>` on the node, which nothing deletes. `deploy.sh` deploys it
+before churnsim.
+
+**One directory per run.** `safetylab podlogs start <name>` sets the run name on the DaemonSet
+and rolls it; the new pod starts with no offsets under the new directory and reads every
+container file the kubelet still has from its first line. So a run's directory holds exactly
+every container alive at run start, whole, plus everything created after — and nothing from pods
+the kubelet had already removed. That population is deliberate: a long-lived pod's `AGENT-START`
+lines from before the run are what residency replay needs to know what it was running when the
+run began, which is why the cut is by run and not by time. `capture-start` starts a run of the
+capture's name; the kill scripts start a timestamped one before signalling. A name already used
+on the node is refused. Old runs stay until `just logtail-reset`, and `safetylab podlogs pull
+<dir> --run <name>` pulls one of them later. Note `kubectl apply` of the manifest (every
+`just deploy`) puts the tailer back on the manifest's `unscoped` run; `just logtail-status` says
+which run it is on.
+
+`just capture` pulls the current run: `raw.<pod>.<attempt>.jsonl`, where attempt is the
+container's restart ordinal — after `just follower-kill` the victim's whole log is attempt 0 and
+what came back in the same pod is attempt 1 — and a pod a rollout replaced is there under its
+own name. The decoding of the node's CRI framing (timestamp, stream, and the partial-line records
+a 16 KB line is split into) is `safetylab podlogs pull`, tested in `PodLogsTests`. It refuses
+(exit 2) when the tailer is missing or a live pod has no copy, because a capture that silently
+lacked a pod reads as complete. `just logtail-status` answers the same question without pulling.
 
 ## Tracing (Jaeger)
 

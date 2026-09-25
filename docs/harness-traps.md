@@ -64,21 +64,12 @@ constraint. Do not remove it and do not raise the limits in its place.
 `terminationGracePeriodSeconds`. So `--field-selector=status.phase=Running` straight after a
 rollout returns pods from the *previous* ReplicaSet, with the previous iteration's environment and
 agents. This made correctly-configured arms read as mislabelled — eight of sixteen iterations
-thrown away. Live means phase Running, no `deletionTimestamp`, and Ready.
-
-**But do not filter terminating pods out of the capture.** A terminating pod still holds a node
-row, can still hold the lock, and is still running agents — a duplicate against its replacement is
-*real*. `monitor.sh`'s follower deliberately uses the unfiltered list and streams until each pod is
-genuinely gone. The selector decides *when a measurement is taken*, never *what it can see*;
-duration, via the grace windows, is what separates handover overlap from pathology.
-
-**`kubectl logs` cannot reach a deleted pod.** During a rolling deploy the pods that matter most
-are exactly the ones that disappear, so start the capture *before* the disturbance. A pod replaced
-while nothing followed it contributes no residencies, silently weakening S5/S6/S7 — hence C0's
-per-pod coverage check.
-
-**`kubectl logs -f` fails against a pod still in ContainerCreating**, and a single attempt marks it
-followed forever. That produced a false S4 on a healthy cluster. Retry until the pod is gone.
+thrown away. Live means phase Running, no `deletionTimestamp`, and Ready. But that selector
+decides *when a measurement is taken*, never *what it can see*: a terminating pod still holds a
+node row, can still hold the lock, and is still running agents, and a duplicate against its
+replacement is *real*. The pod side of a capture comes off the node log tailer, which follows the
+node's files and not a pod list, so nothing filters it; duration, via the grace windows, is what
+separates handover overlap from pathology.
 
 **`kubectl set env` is silently undone by `kubectl apply`'s three-way merge.** Env vars added with
 `set env` are not in `last-applied-configuration`, so a later `deploy.sh` resurrects removed ones
@@ -148,7 +139,8 @@ capture.
 if a graceful shutdown writes one. RavenDB does (73 records, 2026-09-18). The MySQL arm, on 6.39.0,
 wrote **none** across some twenty graceful shutdowns in the retained window, so there `0 → 0` is what
 a clean stop *and* a SIGKILL both report. Validate a kill from the container instead: exit code
-**137**, `restartCount` up by one on the same pod, and a `--previous` log with no shutdown lines.
+**137**, `restartCount` up by one on the same pod, and the victim's log — `$OUT/post/raw.<pod>.0.jsonl`,
+the lower attempt — ending with no shutdown lines.
 
 **Before handing any pid to `kill -9`, check it is `> 1` and that `/proc/<pid>/cmdline` is the
 process you meant.** A fault injector aimed at the wrong process either destroys the rig or, worse,
@@ -264,7 +256,10 @@ set with `set env` *before* a deploy is gone afterwards, silently, and the pods 
 `k8s/churnsim.yaml`'s defaults — 500 agents, no ballast. Those pods then repopulate the store, so
 the next run measures a mix. Observed twice on 2026-09-23 (`max(agent id)` 493, then 342, against
 `SIM_AGENT_COUNT=60`). Set the scenario **after** the deploy, and verify by reading `max(agent id)`
-back out of the assignment table rather than trusting the deployment's env block.
+back out of the assignment table rather than trusting the deployment's env block. The node log
+tailer's run name is set the same way and reset to `unscoped` by the same deploy; `safetylab
+podlogs` reads the run back from the live pod for that reason, and `just logtail-status` says
+which run it is on.
 
 **`just reset-schema` drops the store with the workload still running.** `db_drop` then
 `bounce_workload` means live pods recreate the schema and refill it during the drop, and a pod from

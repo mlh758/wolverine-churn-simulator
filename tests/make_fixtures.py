@@ -647,7 +647,15 @@ def main():
     # not take, where K2 is the only thing that can tell the two runs apart.
     build("db-cut", db_cut, marks=DB_CUT_MARKS)
     build("db-cut-noop", db_cut_noop, marks=DB_CUT_MARKS)
-    build_dup()
+    build_dup("dup-agent", pods_from=T0, overlap=(100, 160))
+
+    # The same duplicate, but it happened and healed BEFORE the first sample. The pod logs are
+    # harvested whole from the node tailer, so a pod alive at capture start carries its history
+    # -- including an earlier rollout's duplicates, which are real but are not this run's
+    # finding. S5 must stay green and say in a note that it saw them. Without this fixture a
+    # capture started twenty minutes after a rollout read as a failed run.
+    build_dup("dup-agent-before", pods_from=T0 - timedelta(seconds=600), overlap=(-300, -240))
+    build_restart_shortfall()
 
     # The MySQL arm. Same two claims as raven-clean, from the other direction: a healthy MySQL
     # capture must come back wholly clean (so the leader checks are not firing on the changed
@@ -674,14 +682,16 @@ def main():
     build("raven-partition-noop", raven_partition_noop, backend="ravendb", replicated=True, marks=PARTITION_MARKS)
 
 
-def build_dup():
+def build_dup(name, pods_from, overlap):
     """Built separately: it is the one fixture whose fault lives in the pod stream only.
 
     The assignment table keeps saying agent1 belongs to node A the whole time. Only the
     AGENT-START/STOP logs show pod-b running it too — which is exactly why S5 reads the pod
     stream rather than trusting the table.
+
+    pods_from is when the pods announced themselves and started their agents; overlap is
+    (start, stop) of pod-b's stint on agent1, in seconds relative to T0, the first sample.
     """
-    name = "dup-agent"
     directory = os.path.join(FIXTURES, name)
     shutil.rmtree(directory, ignore_errors=True)
     os.makedirs(directory)
@@ -694,19 +704,76 @@ def build_dup():
     for tick in range(DURATION):
         history.append(sample(tick + 1, T0 + tick * TICK, World()))
 
-    pods = [{"kind": "identity", "ts": iso(T0), "nodeId": n[2], "podName": n[0], "podIp": n[1]}
+    pods = [{"kind": "identity", "ts": iso(pods_from), "nodeId": n[2], "podName": n[0], "podIp": n[1]}
             for n in NODES]
 
     w = World()
     for agent, pod in sorted(w.running.items()):
-        pods.append({"kind": "agent", "ts": iso(T0), "event": "start",
+        pods.append({"kind": "agent", "ts": iso(pods_from), "event": "start",
                      "agentUri": agent, "podName": pod})
 
     # pod-b starts agent1 while pod-a is still running it, and keeps it for 60s.
-    pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=100)), "event": "start",
+    pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=overlap[0])), "event": "start",
                  "agentUri": "sim://agent1/", "podName": "churnsim-b"})
-    pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=160)), "event": "stop",
+    pods.append({"kind": "agent", "ts": iso(T0 + timedelta(seconds=overlap[1])), "event": "stop",
                  "agentUri": "sim://agent1/", "podName": "churnsim-b"})
+
+    write(os.path.join(directory, "history.jsonl"), history)
+    write(os.path.join(directory, "pods.jsonl"), sorted(pods, key=lambda r: r["ts"]))
+    write(os.path.join(directory, "marks.jsonl"),
+          [{"kind": "mark", "ts": iso(T0 + timedelta(seconds=90)), "label": "rollout-end"}])
+    print(f"  {name}")
+
+
+NODE_B_RESTARTED = "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb"
+RESTART_TICK = 100
+
+
+def build_restart_shortfall():
+    """A follower dies ungracefully and comes back in the same pod under a new node id; one of
+    its agents is never placed again.
+
+    That is the ungraceful-death shortfall (RESULTS.md 2026-09-19), and S12 must stay quiet about
+    it: the agent was stopped by its node dying, not shed by a node that stayed. Before this
+    fixture S12 judged by the pod's LATEST identity -- the survivor, which is in the cluster --
+    and so reported every victim's agent on any capture spanning a kill. L1 is what reports the
+    unplaced agent.
+    """
+    name = "restart-shortfall"
+    directory = os.path.join(FIXTURES, name)
+    shutil.rmtree(directory, ignore_errors=True)
+    os.makedirs(directory)
+
+    pod_b, ip_b, node_b, _, _ = NODES[1]
+    t_restart = T0 + RESTART_TICK * TICK
+
+    history = [meta_record("postgres")]
+    for tick in range(DURATION):
+        w = World()
+        if tick >= RESTART_TICK:
+            # agent2 and agent5 were on B. agent5 comes back on B's new process; agent2 never does.
+            del w.placement["sim://agent2/"]
+            del w.running["sim://agent2/"]
+        record = sample(tick + 1, T0 + tick * TICK, w)
+        if tick >= RESTART_TICK:
+            for n in record["nodes"]:
+                if n["id"] == node_b:
+                    n["id"] = NODE_B_RESTARTED
+            for a in record["assignments"]:
+                if a["nodeId"] == node_b:
+                    a["nodeId"] = NODE_B_RESTARTED
+        history.append(record)
+
+    pods = [{"kind": "identity", "ts": iso(T0), "nodeId": n[2], "podName": n[0], "podIp": n[1]}
+            for n in NODES]
+    for agent, pod in sorted(World().running.items()):
+        pods.append({"kind": "agent", "ts": iso(T0), "event": "start", "agentUri": agent, "podName": pod})
+
+    # The new process announces itself; the dead one logged no AGENT-STOP for anything.
+    pods.append({"kind": "identity", "ts": iso(t_restart), "nodeId": NODE_B_RESTARTED,
+                 "podName": pod_b, "podIp": ip_b})
+    pods.append({"kind": "agent", "ts": iso(t_restart + TICK), "event": "start",
+                 "agentUri": "sim://agent5/", "podName": pod_b})
 
     write(os.path.join(directory, "history.jsonl"), history)
     write(os.path.join(directory, "pods.jsonl"), sorted(pods, key=lambda r: r["ts"]))

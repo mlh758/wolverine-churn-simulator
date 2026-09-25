@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
-# Dump every live churnsim pod's raw log into a directory, one file per pod.
+# Pull every churnsim container's log of the tailer's CURRENT run -- live, replaced by a rollout,
+# or killed -- off the node into a directory, one file per container attempt.
 #
-# DEPENDS ON  a deployed churnsim cluster, $SAFETYLAB.
-# REQUIRES    at least one live pod; exits 2 otherwise.
-# PRODUCES    <dir>/raw.<pod>.jsonl, verbatim. Queryable with scripts/logq.sh.
+# DEPENDS ON  the node log tailer (k8s/logtail.yaml, applied by deploy.sh; `just logtail-deploy`
+#             on an older cluster), $SAFETYLAB.
+# REQUIRES    a live tailer pod that is following every live churnsim pod; both are refusals
+#             (exit 2). A capture that silently lacked a live pod would read as complete.
+# PRODUCES    <dir>/raw.<pod>.<attempt>.jsonl, the lines `kubectl logs` would print, decoded from
+#             the node's CRI framing by `safetylab podlogs pull`. Queryable with scripts/logq.sh.
 #
-# CAVEAT      `kubectl logs` cannot reach a pod that is already gone, so a pod replaced before this
-#             runs contributes nothing. Capture before the pods you care about are replaced.
+# THE ATTEMPT IS THE CONTAINER'S RESTART ORDINAL. A pod SIGKILLed by leader-kill or follower-kill
+# comes back in the same pod as attempt 1; its victim's whole log is attempt 0. A pod a rollout
+# replaced is there under its own name, marked `gone`. This is the whole reason the tailer exists:
+# `kubectl logs` cannot reach either, and the kubelet deletes a replaced pod's file within about
+# a minute of the pod.
+#
+# The tailer writes one directory per run (`safetylab podlogs start <name>`; capture-start and the
+# kill scripts do it), holding every container alive at the run's start, whole, and everything
+# after. `safetylab podlogs pull <dir> --run <name>` reaches an earlier run; `just logtail-reset`
+# clears them all.
 #
 # ARGUMENTS
 #
@@ -14,23 +26,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/bin:$PATH"
-K="minikube kubectl -- --context=minikube"
 
-# For $SAFETYLAB and require_safetylab. Live-pod selection is `safetylab pods`, which applies
-# the Running AND Ready AND not-terminating rule that a phase selector alone does not.
 source scripts/backend.sh
 require_safetylab
 
 DIR="${1:?usage: capture-logs.sh <dir>}"
-mkdir -p "$DIR"
 
-n=0
-for pod in $("$SAFETYLAB" pods --label app=churnsim); do
-    $K logs "$pod" > "$DIR/raw.$pod.jsonl" 2>/dev/null
-    lines=$(wc -l < "$DIR/raw.$pod.jsonl")
-    echo "  $pod: $lines lines"
-    n=$(( n + 1 ))
-done
-
-[ "$n" -gt 0 ] || { echo "no live churnsim pods" >&2; exit 2; }
-echo "captured $n pod log(s) into $DIR"
+exec "$SAFETYLAB" podlogs pull "$DIR"

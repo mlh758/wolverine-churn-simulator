@@ -6,7 +6,7 @@
 #             POSTGRES_CONNECTION to the postgres user, and row-level security never applies to a
 #             superuser -- so the fault would silently do nothing.
 # PRODUCES    the churn_app role, a deployment pointed at it with SIM_STALE_NODE_TIMEOUT_SECONDS=4
-#             and SIM_JSON_LOGS=true, and bounced pods. MUTATES the cluster.
+#             and bounced pods. MUTATES the cluster.
 #
 # ARGUMENTS   none.
 set -euo pipefail
@@ -49,7 +49,7 @@ $K exec "$PGPOD" -- psql -U postgres -d churnsim -qAt -c "
 
 $K set env deployment/churnsim \
   POSTGRES_CONNECTION="Host=pg;Database=churnsim;Username=churn_app;Password=churn" \
-  SIM_STALE_NODE_TIMEOUT_SECONDS=4 SIM_JSON_LOGS=true
+  SIM_STALE_NODE_TIMEOUT_SECONDS=4
 # A pod already crash-looping on the old permissions sits in backoff; kick it so the rollout
 # resumes immediately instead of waiting out the backoff window.
 $K delete pod -l app=churnsim --field-selector=status.phase!=Running --ignore-not-found >/dev/null 2>&1 || true

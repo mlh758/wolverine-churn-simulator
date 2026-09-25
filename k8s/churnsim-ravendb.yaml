@@ -34,6 +34,9 @@ spec:
             # produce numbers filed under the wrong store.
             - name: SIM_BACKEND
               value: "ravendb"
+            # Structured stdout, always (src/ChurnSim/Program.cs); everything downstream reads it.
+            - name: SIM_JSON_LOGS
+              value: "true"
             - name: RAVENDB_URLS
               value: "http://ravendb:8080"
             - name: RAVENDB_DATABASE

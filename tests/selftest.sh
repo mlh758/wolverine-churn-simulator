@@ -14,6 +14,9 @@ cd "$(dirname "$0")/.."
 LEDGER=(
   "clean:"
   "dup-agent:S5 S7"
+  # The same duplicate, healed before the first sample. The pod logs come off the node tailer
+  # whole, so an earlier rollout's duplicates are in them; S5 must not make this run red for them.
+  "dup-agent-before:"
   "orphan-lock:S3 S4 L1"
   "stranded:S6"
   # Two agents stop on nodes that stay in the cluster and are never placed again. L1 reports the
@@ -27,6 +30,10 @@ LEDGER=(
   # stays quiet about the four whose node left. Without this fixture the check could key on the
   # total and look just as green.
   "shed-nowhere:L1 S12"
+  # The dual: an agent lost because its node DIED and came back under a new id in the same pod.
+  # L1 counts it; S12 must not, because judging by the pod's latest identity (the survivor, still
+  # in the cluster) once made every victim's agent read as shed by a node that stayed.
+  "restart-shortfall:L1"
   "gap:C0"
   # E8, the lock-session kill. `lock-kill` is the fault landing: the leader row outlives the lock
   # by 20s, which is S3. `lock-kill-noop` has the mark and a lock that never moved -- the nemesis

@@ -506,11 +506,11 @@ have separated the arms anyway.
   leader could place them. **Measured 2026-09-19:** `placed` dropped 500 → 333 and stayed there for
   the rest of the cut, then recovered to 500 in **24 s** after the heal, with **no duplicates**
   (S5) and no change of leadership. The heal is clean.
-- **Which instrument answers the duplicate half.** Not `safetylab overlaps` alone — it reads raw
-  pod logs from `post/`, which only holds pods still alive at the end, and the bounced pod is by
-  definition gone. **S5** covers it, because it builds residencies from the capture's harvested
-  AGENT-START/STOP stream, which the monitor's follower collected from the bounced pod while it was
-  still running. `overlaps` stays as a cross-check over the survivors.
+- **Which instrument answers the duplicate half.** **S5**: it builds residencies from the
+  capture's harvested AGENT-START/STOP stream, which comes off the node log tailer and so includes
+  the bounced pod's whole log even though the pod is gone by the end. `safetylab overlaps` over
+  `post/` is the cross-check; since the tailer, `post/` holds the bounced pod too, so the two
+  should agree.
 - **Why no duplicates, and the arm that should produce them.** A graceful stop removes the peer's
   claims before it goes, so the orphans are clean and there is no stale ownership to double up on;
   leadership never moves either, and handover is where E2's duplicates are made. A **SIGKILLed**

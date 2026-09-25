@@ -1,0 +1,126 @@
+# The node-side log tailer: a verbatim copy of every churnsim container's log that outlives the
+# pod. README "Pod logs that outlive the pod" is the full account; the short version:
+#
+# - The kubelet deletes a pod's log file within about a minute of the pod, and keeps one dead
+#   container per pod. fluent-bit tails the node's own files, holds each open so deletion cannot
+#   truncate it, and appends to /data/podlogs/<run>/<pod>.<attempt>.cri in the node's CRI line
+#   format, unparsed; `safetylab podlogs` decodes it on the host, where that decision is tested.
+# - <run> is LOGTAIL_RUN. `safetylab podlogs start <name>` sets it and rolls the pod, which
+#   re-reads every file the kubelet still has from the head into the new directory. `kubectl
+#   apply` of this file resets it to "unscoped"; `podlogs` reads the live value back.
+# - Not a memory-sizing service (docs/harness-traps.md): buffers are fixed by Mem_Buf_Limit.
+# - The shelf container exists because fluent-bit's image has no shell; `podlogs` reads through it.
+# - A container log the kubelet rotated (10 MiB) before the run began has its head in a rotated
+#   file this tailer does not read; `podlogs harvest` reports such a pod as having no identity.
+#
+#   safetylab podlogs start <name> | status | pull <dir> [--run <name>] | harvest <run-dir> --run <name>
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logtail
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush             1
+        Daemon            off
+        Log_Level         warn
+        HTTP_Server       off
+
+    # Only churnsim (the monitor pod's stream is captured live and is most of the volume). The
+    # glob covers both workload kinds: churnsim-<hash>-<id> and the StatefulSet's churnsim-N.
+    # Read_from_Head + a DB inside the run directory: a fresh run reads every existing file from
+    # the beginning; a restart on the same run copies nothing twice.
+    [INPUT]
+        Name              tail
+        Path              /var/log/pods/default_churnsim-*/churnsim/*.log
+        Tag_Regex         /var/log/pods/default_(?<pod>[^_/]+)_[^/]+/churnsim/(?<attempt>[0-9]+)\.log$
+        Tag               <pod>.<attempt>.cri
+        Read_from_Head    true
+        Refresh_Interval  1
+        Rotate_Wait       60
+        DB                /data/podlogs/${LOGTAIL_RUN}/.tail.db
+        DB.sync           normal
+        Mem_Buf_Limit     32MB
+        Buffer_Chunk_Size 64k
+        Buffer_Max_Size   1MB
+        Skip_Long_Lines   off
+
+    # One file per tag, named by the tag; `{log}` is the whole CRI line exactly as read.
+    [OUTPUT]
+        Name              file
+        Match             *
+        Path              /data/podlogs/${LOGTAIL_RUN}
+        Format            template
+        Template          {log}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: logtail
+spec:
+  selector:
+    matchLabels:
+      app: logtail
+  template:
+    metadata:
+      labels:
+        app: logtail
+    spec:
+      terminationGracePeriodSeconds: 10
+      # fluent-bit creates neither its DB's nor its output's directory.
+      initContainers:
+        - name: mkdir
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "mkdir -p \"/data/podlogs/$LOGTAIL_RUN\""]
+          env:
+            - name: LOGTAIL_RUN
+              value: "unscoped"
+          volumeMounts:
+            - name: podlogs
+              mountPath: /data/podlogs
+      containers:
+        - name: fluent-bit
+          image: docker.io/fluent/fluent-bit:4.0.8
+          args: ["--config=/fluent-bit/etc/conf/fluent-bit.conf"]
+          env:
+            - name: LOGTAIL_RUN
+              value: "unscoped"
+          volumeMounts:
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: podlogs
+              mountPath: /data/podlogs
+            - name: config
+              mountPath: /fluent-bit/etc/conf
+              readOnly: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+        - name: shelf
+          image: docker.io/library/busybox:1.36
+          command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 60 & wait $!; done"]
+          volumeMounts:
+            - name: podlogs
+              mountPath: /data/podlogs
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+      volumes:
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: podlogs
+          hostPath:
+            path: /data/podlogs
+            type: DirectoryOrCreate
+        - name: config
+          configMap:
+            name: logtail

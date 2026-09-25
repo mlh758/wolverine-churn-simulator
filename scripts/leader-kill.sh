@@ -5,7 +5,9 @@
 #             node. The RavenDB arm additionally needs ./scripts/monitor.sh deploy.
 # REQUIRES    a settled cluster with a leader that resolves to a live pod; both are refusals. A
 #             window timed from a cluster already mid-election is not a failover measurement.
-# PRODUCES    $OUT/timeline.tsv, one row per 5s poll, and a verdict on stdout. MUTATES the cluster:
+# PRODUCES    $OUT/timeline.tsv, one row per 5s poll; $OUT/post/raw.<pod>.<attempt>.jsonl, every
+#             container log off the node tailer, the victim's pre-kill one included; and a verdict on
+#             stdout. MUTATES the cluster:
 #             it kills a pod. Prints *** INVALID RUN *** if a NodeStopped record appeared, which
 #             means the victim shut down gracefully and the expiry path was never exercised.
 #
@@ -108,10 +110,23 @@ STOPPED_BEFORE=$(stopped_count)
 
 echo
 MODE="${MODE:-sigkill}"
-START=$(date +%s)
+
+# The tailer run this kill's logs go to (see capture-logs.sh). Inside an active SafetyLab capture
+# the capture owns the run and rolling the tailer would split it, so it is only started here when
+# there is none. START is taken after, right before the signal: the roll takes seconds and they
+# are not part of the leaderless window.
+start_podlogs_run() {
+    if [ -f runs/.active ]; then
+        echo "  (a capture is active; its tailer run collects this kill)"
+    else
+        "$SAFETYLAB" podlogs start "$(basename "$OUT")-$(date -u +%Y%m%dT%H%M%SZ)" || exit 2
+    fi
+}
 
 if [ "$MODE" = "graceful" ]; then
     echo "== control arm: ordinary pod delete (shutdown hooks DO run) =="
+    start_podlogs_run
+    START=$(date +%s)
     $K delete pod "$VICTIM" --wait=false 2>&1 | sed 's/^/  /'
 else
     # SIGKILL the container's host-side process, from the node, outside its PID namespace.
@@ -131,6 +146,8 @@ else
         exit 0
     fi
 
+    start_podlogs_run
+    START=$(date +%s)
     minikube ssh -- "sudo kill -9 $HOSTPID" 2>&1 | sed 's/^/  /'
 fi
 
@@ -183,3 +200,7 @@ if [ "$MODE" != "graceful" ] && [ "${STOPPED_AFTER:-0}" -gt "${STOPPED_BEFORE:-0
     echo "  above is a clean-handover time. Do not report it as a failover measurement."
 fi
 echo "  timeline           : $TSV"
+
+# The victim's pre-kill log is the lower attempt (capture-logs.sh).
+echo
+./scripts/capture-logs.sh "$OUT/post"

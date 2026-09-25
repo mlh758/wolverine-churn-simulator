@@ -34,6 +34,9 @@ spec:
             # produce numbers filed under the wrong store. See k8s/churnsim-ravendb.yaml.
             - name: SIM_BACKEND
               value: "postgres"
+            # Structured stdout, always (src/ChurnSim/Program.cs); everything downstream reads it.
+            - name: SIM_JSON_LOGS
+              value: "true"
             - name: POSTGRES_CONNECTION
               value: "Host=pg;Database=churnsim;Username=postgres;Password=postgres"
             # Downward API: SafetyLab joins pg_stat_activity.client_addr back to a Wolverine

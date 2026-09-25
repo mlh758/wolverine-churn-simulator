@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Capture a SafetyLab run -- the monitor's server-side samples plus every churnsim pod's log --
+# Capture a SafetyLab run -- the monitor's server-side samples plus every churnsim container's log --
 # into runs/<name>/, then check it.
 #
-# DEPENDS ON  a deployed churnsim cluster, podman + minikube for `deploy`, $TOOLS/safetylab
-#             (built here on demand).
-# REQUIRES    for `start`: a live safetylab pod and no capture already active.
+# DEPENDS ON  a deployed churnsim cluster and the node log tailer (k8s/logtail.yaml, which deploy.sh
+#             applies), podman + minikube for `deploy`, $TOOLS/safetylab (built here on demand).
+# REQUIRES    for `start`: a live safetylab pod, a live tailer, and no capture already active.
 #             for `mark`/`stop`/`check`: an active capture whose run directory still exists.
-# PRODUCES    runs/<name>/history.jsonl (server-side samples), pods.<pod>.jsonl per pod,
-#             marks.jsonl (phase boundaries). `check` exits 1 if any checker failed.
+# PRODUCES    runs/<name>/history.jsonl (server-side samples), marks.jsonl (phase boundaries), and at
+#             `stop`: logs/raw.<pod>.<attempt>.jsonl (every container's log, off the node tailer) and
+#             pods.<pod>.<attempt>.jsonl harvested from them. `check` exits 1 if any checker failed.
 #
-# START THE CAPTURE BEFORE THE DISTURBANCE. `kubectl logs` cannot reach a pod once it is gone, and
-# during a rolling deploy the pods that matter most are exactly the ones that disappear. A pod
-# replaced while nothing followed it contributes no agent residencies, which weakens S5/S6/S7 --
-# read the C0 coverage check afterwards.
+# THE POD SIDE IS READ AT STOP, NOT FOLLOWED. `start` names a run on the node tailer (see
+# scripts/capture-logs.sh); `stop` pulls that run and harvests it, so no pod has to be followed
+# from before the disturbance. `stop` refuses (exit 2) if the tailer's copy is missing a live pod
+# or the tailer has moved to another run; C0 reports any registered pod with no identity.
 #
 # ARGUMENTS
 #
@@ -136,15 +137,10 @@ cmd_start() {
     fi
 
     ensure_tool
-    mkdir -p "$dir"
     if [ -s "$dir/history.jsonl" ]; then
         echo "refusing to overwrite a captured run in $dir -- pick another name" >&2
         exit 2
     fi
-
-    : > "$dir/marks.jsonl"
-    echo "$name" > "$ACTIVE"
-    mkdir -p "$dir/.pids"
 
     # A LIVE monitor pod. `deploy` ends in a `rollout restart`, so the previous pod is still
     # listed and still phase Running while it terminates -- and following that one yields a
@@ -154,6 +150,17 @@ cmd_start() {
         echo "no live safetylab pod -- run './scripts/monitor.sh deploy' first" >&2
         exit 2
     }
+
+    # The pod side: a run directory of the same name on the node tailer, which rolls onto it and
+    # re-reads every live pod from the head. Before the run is committed, so a tailer that is not
+    # there leaves nothing behind -- a capture with samples and no pod logs passes every
+    # server-side check over a cluster it could not see.
+    "$TOOLS/safetylab" podlogs start "$name" || exit 2
+
+    mkdir -p "$dir"
+    : > "$dir/marks.jsonl"
+    echo "$name" > "$ACTIVE"
+    mkdir -p "$dir/.pids"
 
     # setsid + disown, not a bare `&`. These outlive `start` on purpose, and the follower loop
     # never exits on its own -- so under any caller that waits for its children (`bash -c`, a
@@ -170,12 +177,7 @@ cmd_start() {
     echo $! > "$dir/.pids/monitor"
     disown 2>/dev/null || true
 
-    # Follow churnsim pods, picking up new ones as a rollout creates them.
-    setsid bash "$0" __followers "$dir" >/dev/null 2>&1 &
-    echo $! > "$dir/.pids/followers"
-    disown 2>/dev/null || true
-
-    echo "capturing into $dir (monitor pod $pod)"
+    echo "capturing into $dir (monitor pod $pod; pod logs on the node tailer, run $name)"
     echo "  ./scripts/monitor.sh mark <label>   to timestamp a phase"
     echo "  ./scripts/monitor.sh stop           when the run is done"
 }
@@ -195,38 +197,6 @@ history_loop() {
     done
 }
 
-followers_loop() {
-    local dir="$1"
-    local followed=" "
-
-    while :; do
-        for pod in $($KUBECTL get pods -l app=churnsim -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-            case "$followed" in
-                *" $pod "*) continue ;;
-            esac
-            followed="$followed$pod "
-
-            # Whole log, not --since: a pod's SIM-IDENTITY line is written at startup and the
-            # identity map is what makes S3/S4/S6/S7 possible at all.
-            #
-            # Retry rather than attach once. A pod shows up in `get pods` while still
-            # ContainerCreating, and `kubectl logs -f` against it fails immediately -- so a
-            # single attempt marks the pod as followed, captures nothing, and leaves that node
-            # invisible to every pod-side check. That is not hypothetical: it produced a false
-            # S4 ("leader lock held by an address that never announced itself") on a healthy
-            # cluster, because the pod holding leadership was one the capture never attached to.
-            # Loop until the pod is actually gone.
-            ( while $KUBECTL get pod "$pod" >/dev/null 2>&1; do
-                  $KUBECTL logs -f --timestamps "$pod" 2>/dev/null \
-                      | "$TOOLS/safetylab" harvest --pod "$pod" >> "$dir/pods.$pod.jsonl"
-                  sleep 2
-              done ) &
-            echo $! >> "$dir/.pids/pods"
-        done
-        sleep 2
-    done
-}
-
 cmd_mark() {
     local label="${1:?usage: monitor.sh mark <label>}"
     local name dir
@@ -241,15 +211,14 @@ cmd_stop() {
     name=$(active_run) || exit 2
     dir="$RUNS/$name"
 
-    # Give the followers a moment to drain whatever the pods logged last.
+    # A moment for the monitor's last sample and the tailer's last flush (Flush 1) to land.
     sleep 3
 
     if [ -d "$dir/.pids" ]; then
-        # Kill process GROUPS, not pids. `start` detaches with setsid, so each recorded pid is a
-        # group leader with children (kubectl | safetylab harvest) that a plain `kill` leaves
-        # running -- and a leaked follower keeps appending the NEXT run's pods into this run's
-        # directory, which is how a finished capture silently grew for another twenty minutes and
-        # picked up a different experiment's pods.
+        # Kill process GROUPS, not pids. `start` detaches with setsid, so the recorded pid is a
+        # group leader with a kubectl child that a plain `kill` leaves running -- and a leaked
+        # follower keeps appending into this run's directory after it is supposedly finished, which
+        # is how a capture once silently grew for another twenty minutes.
         while read -r pid; do
             [ -n "$pid" ] || continue
             kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null
@@ -266,15 +235,16 @@ cmd_stop() {
         rm -rf "$dir/.pids"
     fi
 
-    # Prove it: a stop that did not stop is worse than no stop at all, because the run directory
-    # keeps changing under the checker.
-    local leaked
-    leaked=$(ps ax -o args= 2>/dev/null | grep -c "[s]afetylab harvest" || true)
-    if [ "${leaked:-0}" -gt 0 ]; then
-        echo "WARNING: $leaked harvest process(es) survived the stop; run directory may keep growing" >&2
-    fi
-
     rm -f "$ACTIVE"
+
+    # The pod side, whole, from the node tailer: logs/raw.<pod>.<attempt>.jsonl and the harvested
+    # pods.<pod>.<attempt>.jsonl the checkers read. By this run's NAME: the tailer is refused if it
+    # has moved to another run since `start` (a `just deploy` re-applies the manifest; a kill
+    # script started outside a capture rolls it), because the pods that ran after the move are not
+    # in this run's directory. A refusal is this run's exit code: the samples are kept, but a run
+    # with no pod side passes every server-side check over a cluster it could not see.
+    local harvested=0
+    "$TOOLS/safetylab" podlogs harvest "$dir" --run "$name" || harvested=$?
 
     # Every server-side check reads history.jsonl, so a capture that recorded none of it does not
     # fail them -- it passes all of them, over nothing.
@@ -287,6 +257,13 @@ cmd_stop() {
 
     echo "stopped; captured $samples samples into $dir"
     echo "  ./scripts/monitor.sh check $name"
+    case "$harvested" in
+        0) ;;
+        1) echo "WARNING: the pod side was harvested with defects (see above); read C0 before trusting the pod-side checks" >&2 ;;
+        *) echo "WARNING: the pod side of this run was NOT harvested (podlogs exit $harvested); every pod-side" >&2
+           echo "         check will be blind. Fix the tailer and re-run: $TOOLS/safetylab podlogs harvest $dir --run $name" >&2
+           exit 2 ;;
+    esac
 }
 
 cmd_check() {
@@ -297,8 +274,7 @@ cmd_check() {
 }
 
 case "${1:-}" in
-    # Internal: the detached follower loop re-enters the script here.
-    __followers) shift; followers_loop "$@" ;;
+    # Internal: the detached history loop re-enters the script here.
     __history)   shift; history_loop "$@" ;;
     deploy) shift; cmd_deploy "$@" ;;
     start)  shift; cmd_start "$@" ;;

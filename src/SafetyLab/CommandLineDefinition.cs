@@ -44,6 +44,7 @@ public static class CommandLineDefinition
 
         root.Subcommands.Add(BuildMonitor());
         root.Subcommands.Add(BuildHarvest());
+        root.Subcommands.Add(BuildPodLogs());
         root.Subcommands.Add(BuildCheck());
         root.Subcommands.Add(BuildQuery());
         root.Subcommands.Add(BuildAdmin());
@@ -143,6 +144,63 @@ public static class CommandLineDefinition
             "Read a pod's log text on stdin; write identity, AGENT-START/STOP and control-plane records as JSON.");
         command.Options.Add(pod);
         command.SetAction(parseResult => Verbs.Harvest(parseResult.GetValue(pod)!));
+
+        return command;
+    }
+
+    // ---------------------------------------------------------------- podlogs
+
+    private static Command BuildPodLogs()
+    {
+        var label = new Option<string>("--label")
+        {
+            Description = "the pods the tailer follows", DefaultValueFactory = _ => "app=churnsim"
+        };
+
+        var status = new Command("status",
+            "Which run the tailer is on, and is every live pod being followed? Exit 1 if one is not, 2 if there is no tailer.");
+        status.Options.Add(label);
+        status.SetAction(parseResult => PodLogs.Status(parseResult.GetValue(label)!));
+
+        var name = new Argument<string>("name") { Description = "the run's name; one directory on the node" };
+        var start = new Command("start",
+            "Begin a run: roll the tailer onto a fresh directory, which it fills from the head of every container " +
+            "log the kubelet still has. Exit 2 if the name was already used or a live pod is not followed afterwards.");
+        start.Arguments.Add(name);
+        start.Options.Add(label);
+        start.SetAction(parseResult => PodLogs.Start(parseResult.GetValue(name)!, parseResult.GetValue(label)!));
+
+        var directory = new Argument<string>("directory") { Description = "where raw.<pod>.<attempt>.jsonl go" };
+        var run = new Option<string?>("--run") { Description = "an earlier run on the node (default: the current one)" };
+        var pull = new Command("pull",
+            "Copy every container log of a run off the node -- live, replaced or killed -- and decode it into a " +
+            "directory. Exit 2 if a live pod is missing from the current run's copy.");
+        pull.Arguments.Add(directory);
+        pull.Options.Add(label);
+        pull.Options.Add(run);
+        pull.SetAction(parseResult => PodLogs.Pull(parseResult.GetValue(directory)!, parseResult.GetValue(label)!,
+            parseResult.GetValue(run)));
+
+        var runDirectory = new Argument<string>("run-directory") { Description = "a capture's run directory" };
+        var harvestRun = new Option<string>("--run")
+        {
+            Description = "the capture's run, which the tailer must still be on", Required = true
+        };
+        var harvest = new Command("harvest",
+            "The capture's pod side: pull its run into <run-directory>/logs and write pods.<pod>.<attempt>.jsonl " +
+            "for `check`. Exit 1 if a log carries no identity, 2 if a live pod is missing or the tailer moved on.");
+        harvest.Arguments.Add(runDirectory);
+        harvest.Options.Add(label);
+        harvest.Options.Add(harvestRun);
+        harvest.SetAction(parseResult => PodLogs.Harvest(parseResult.GetValue(runDirectory)!,
+            parseResult.GetValue(label)!, parseResult.GetValue(harvestRun)!));
+
+        var command = new Command("podlogs",
+            "The node log tailer (k8s/logtail.yaml): pod logs that outlive the pod, one directory per run.");
+        command.Subcommands.Add(status);
+        command.Subcommands.Add(start);
+        command.Subcommands.Add(pull);
+        command.Subcommands.Add(harvest);
 
         return command;
     }

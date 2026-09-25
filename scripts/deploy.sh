@@ -166,6 +166,11 @@ else
   $KUBECTL rollout status "deployment/$STORE_LABEL" --timeout=300s
 fi
 
+# The node log tailer, before churnsim, so it is already following when the first pod writes its
+# SIM-IDENTITY line. Idempotent; independent of the arm.
+echo "== Deploying the node log tailer =="
+./scripts/logtail.sh deploy
+
 echo "== Deploying churnsim (3 replicas) on $TAG =="
 $KUBECTL apply -f "$APP_MANIFEST"
 if [ "$TOPOLOGY" = "cluster" ]; then
